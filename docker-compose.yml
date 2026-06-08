@@ -1,0 +1,54 @@
+# Dev compose for the Scion combo server: hub + web + runtime-broker.
+#
+# The runtime-broker launches agents as sibling containers on the HOST
+# Docker daemon (docker-out-of-docker), so this compose:
+#   - mounts the host docker socket,
+#   - bind-mounts the state dir at an IDENTICAL host/container path
+#     (/var/lib/scion) so worktree/home paths the broker passes to
+#     `docker run -v` resolve on the host (path-identity, design §6),
+#   - grants the container access to the docker socket group.
+#
+# One-time host setup (see also .env.example):
+#   sudo mkdir -p /var/lib/scion && sudo chown -R 1000:1000 /var/lib/scion
+#   cp .env.example .env    # then set DOCKER_GID + SCION_IMAGE_REGISTRY
+#
+# Prerequisites:
+#   make all                                   # build host binary (embeds web)
+#   # Build & push agent images (scion-claude, etc.) to your registry:
+#   image-build/scripts/build-images.sh --registry ghcr.io/jvegold --push --target all
+#   # If the ghcr packages are private, log the HOST daemon in so it can pull:
+#   docker login ghcr.io
+#
+# Then (or just `make docker-build && make docker-up`):
+#   docker compose build      # rebuild the image after `make all`
+#   docker compose up -d      # entrypoint applies SCION_IMAGE_REGISTRY at start
+#   docker compose logs -f    # find the dev-auth token here
+#   docker compose down       # stop (state persists in /var/lib/scion)
+#
+# Web UI: http://localhost:8080
+services:
+  scion-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.scion-server
+    image: scion-server:local
+    container_name: scion-server
+    ports:
+      - "8080:8080"
+    environment:
+      # Scion resolves state under $HOME; must match the bind-mount path.
+      HOME: /var/lib/scion
+      # Registry holding the agent images; entrypoint applies it via
+      # `scion config set --global image_registry` on start. Set in .env.
+      SCION_IMAGE_REGISTRY: "${SCION_IMAGE_REGISTRY:-}"
+    volumes:
+      # Host Docker daemon: lets the broker launch sibling agent containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # State dir mounted at the SAME path on host and in the container so
+      # worktree/agent-home paths resolve identically for sibling mounts.
+      - /var/lib/scion:/var/lib/scion
+    # Give the scion user (uid 1000) access to the docker socket group.
+    # Set DOCKER_GID in .env: getent group docker | cut -d: -f3
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID in .env (getent group docker | cut -d: -f3)}"
+    restart: unless-stopped

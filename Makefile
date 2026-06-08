@@ -16,7 +16,7 @@ GOLANGCI_LINT := $(shell command -v golangci-lint 2>/dev/null || echo $(shell go
 
 .DEFAULT_GOAL := help
 
-.PHONY: all build install test test-fast vet lint golangci-lint web web-typecheck fmt fmt-check ci ci-full clean help container-sciontool container-scion container-binaries
+.PHONY: all build install test test-fast vet lint golangci-lint web web-typecheck fmt fmt-check ci ci-full clean help container-sciontool container-scion container-binaries docker-build docker-up docker-down docker-logs
 
 ## all: Build the web frontend, then compile the Go binary with embedded assets
 all: web install
@@ -144,6 +144,25 @@ clean:
 	@rm -rf $(BUILD_DIR) .build
 	@rm -f $(BINARY)
 	@echo "Done."
+
+## docker-build: Rebuild web + binary, then build the combo-server image (see README.docker.md)
+docker-build:
+	@$(MAKE) web
+	@$(MAKE) build
+	@docker compose build
+
+## docker-up: Start the containerized combo server (hub + web + runtime-broker)
+docker-up:
+	@docker compose up -d
+	@echo "Server starting. Follow logs (dev-auth token appears there): make docker-logs"
+
+## docker-down: Stop the containerized combo server (state persists in /var/lib/scion)
+docker-down:
+	@docker compose down
+
+## docker-logs: Follow the containerized server logs
+docker-logs:
+	@docker compose logs -f
 
 ## help: Show this help message
 help:

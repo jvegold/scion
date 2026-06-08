@@ -1,0 +1,70 @@
+# Run the Scion combo server (hub + web + runtime-broker) in a container.
+#
+# This image wraps the `scion` binary built on the host via `make all`
+# (which embeds the web frontend), so no `--web-assets-dir` is needed.
+#
+# Because --enable-runtime-broker makes this process launch agents as
+# *sibling* containers via the host Docker daemon (docker-out-of-docker),
+# the image also needs:
+#   - the docker CLI (talks to the mounted /var/run/docker.sock)
+#   - git >= 2.47 for `git worktree add --relative-paths` (container
+#     path-identity, see .design/worktree-per-agent.md §6). Ubuntu 24.04
+#     ships git 2.43, so we pull a newer git from the git-core PPA;
+#     without it the broker falls back to clone-per-agent with a warning.
+#
+# State (hub sqlite, projects, agent homes, worktrees) lives under
+# HOME=/var/lib/scion, which MUST be bind-mounted from the host at the
+# IDENTICAL path so the paths the broker passes to `docker run -v` resolve
+# correctly on the host. See docker-compose.yml.
+#
+# Build the binary first, then build this image:
+#   make all
+#   docker build -f Dockerfile.scion-server -t scion-server:local .
+FROM ubuntu:24.04
+
+# Tools: ca-certificates, curl/gnupg (for repo keys), docker CLI, recent git.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg software-properties-common \
+    # Docker CE CLI (client only) from Docker's apt repo.
+    && install -m0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    # git >= 2.47 from the git-core PPA (Ubuntu 24.04 ships 2.43).
+    && add-apt-repository -y ppa:git-core/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli git \
+    && rm -rf /var/lib/apt/lists/* \
+    # Scion user (uid 1000) with HOME on the bind-mounted state path.
+    && useradd -u 1000 -m -d /var/lib/scion -s /bin/bash scion \
+    && mkdir -p /var/lib/scion/.scion \
+    && chown -R scion:scion /var/lib/scion
+
+# Host-built binary with embedded web assets (from `make all`).
+COPY build/scion /usr/local/bin/scion
+
+# Entrypoint applies env-driven config (e.g. SCION_IMAGE_REGISTRY) before
+# launching the server command in CMD.
+COPY docker-entrypoint.sh /usr/local/bin/scion-server-entrypoint.sh
+RUN chmod +x /usr/local/bin/scion-server-entrypoint.sh
+
+USER scion
+ENV HOME=/var/lib/scion
+WORKDIR /var/lib/scion
+
+# Web frontend port (matches --web-port below).
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/scion-server-entrypoint.sh"]
+
+# --foreground is required: otherwise the server daemonizes and the
+# container exits immediately. --auto-provide registers this broker as a
+# provider for new projects so dispatched agents have somewhere to run.
+CMD ["scion", "server", "start", "--foreground", \
+     "--host", "0.0.0.0", "--enable-hub", \
+     "--enable-web", "--web-port", "8080", \
+     "--enable-runtime-broker", "--auto-provide", \
+     "--debug", "--dev-auth"]
