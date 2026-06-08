@@ -9,7 +9,8 @@ host directory instead of an NFS/RWX volume.
 Files:
 - `Dockerfile.scion-server` — wraps the host-built `scion` binary (`make all`,
   web embedded) on `ubuntu:24.04`, plus the docker CLI and git ≥ 2.47.
-- `docker-entrypoint.sh` — applies `SCION_IMAGE_REGISTRY` on start.
+- `docker-entrypoint.sh` — runs `scion init --machine` (seeds `~/.scion`,
+  applies `SCION_IMAGE_REGISTRY`) before starting the server.
 - `docker-compose.yml` — socket passthrough, identical-path state mount, docker group.
 - `.env.example` — `DOCKER_GID` and `SCION_IMAGE_REGISTRY`.
 
@@ -64,9 +65,15 @@ make docker-down
 
 ## Notes
 
+- **Machine init is automatic.** The entrypoint runs
+  `scion init --machine --image-registry "$SCION_IMAGE_REGISTRY"` before the
+  server starts — this seeds the global `~/.scion` (settings, templates,
+  harness-configs, broker id) and records the registry. It is idempotent, so
+  restarts are safe. The hub server itself does not need a per-repo
+  `scion init`; that is only for using the `scion` CLI inside a project to
+  create agents locally.
 - **Agent images must be reachable by the host daemon.** The broker pulls
-  `${SCION_IMAGE_REGISTRY}/scion-claude` etc.; the entrypoint sets the
-  `image_registry` setting from `SCION_IMAGE_REGISTRY` on every start.
+  `${SCION_IMAGE_REGISTRY}/scion-claude` etc. from the registry recorded above.
 - **git ≥ 2.47** is installed from the git-core PPA (Ubuntu 24.04 ships 2.43);
   without it the broker falls back to clone-per-agent with a warning.
 - **Security:** the server has full access to the host Docker socket

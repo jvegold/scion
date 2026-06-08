@@ -38,8 +38,8 @@ services:
     environment:
       # Scion resolves state under $HOME; must match the bind-mount path.
       HOME: /var/lib/scion
-      # Registry holding the agent images; entrypoint applies it via
-      # `scion config set --global image_registry` on start. Set in .env.
+      # Registry holding the agent images; the entrypoint passes it to
+      # `scion init --machine --image-registry` on start. Set in .env.
       SCION_IMAGE_REGISTRY: "${SCION_IMAGE_REGISTRY:-}"
     volumes:
       # Host Docker daemon: lets the broker launch sibling agent containers.

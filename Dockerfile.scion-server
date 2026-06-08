@@ -50,8 +50,8 @@ RUN apt-get update \
 # Host-built binary with embedded web assets (from `make all`).
 COPY build/scion /usr/local/bin/scion
 
-# Entrypoint applies env-driven config (e.g. SCION_IMAGE_REGISTRY) before
-# launching the server command in CMD.
+# Entrypoint runs `scion init --machine` (seeds ~/.scion, applies
+# SCION_IMAGE_REGISTRY) before launching the server command in CMD.
 COPY docker-entrypoint.sh /usr/local/bin/scion-server-entrypoint.sh
 RUN chmod +x /usr/local/bin/scion-server-entrypoint.sh
 
