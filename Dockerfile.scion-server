@@ -38,6 +38,10 @@ RUN apt-get update \
     && apt-get update \
     && apt-get install -y --no-install-recommends docker-ce-cli git \
     && rm -rf /var/lib/apt/lists/* \
+    # Ubuntu 24.04 base images ship a default 'ubuntu' user at uid 1000;
+    # remove it so scion can claim uid 1000 (matches the host-chowned
+    # /var/lib/scion and SCION_HOST_UID expectations).
+    && (userdel -r ubuntu 2>/dev/null || true) \
     # Scion user (uid 1000) with HOME on the bind-mounted state path.
     && useradd -u 1000 -m -d /var/lib/scion -s /bin/bash scion \
     && mkdir -p /var/lib/scion/.scion \
