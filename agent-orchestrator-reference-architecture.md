@@ -303,22 +303,53 @@ stateDiagram-v2
 
 ## 11. Что уже есть в scion / что появится скоро
 
-> Правая колонка выведена из **потока коммитов последних дней** и отложенных задач. **Требует сверки с roadmap-board** (github.com/orgs/scion-frontiers/projects/5) - board не удалось снять автоматически, дополню после сверки.
+> Источник: **scion roadmap board** (экспорт `scion-roadmap.tsv`, 2026-07-30, ~190 пунктов). Статусы: In Progress / Todo / Done / Blocked; приоритеты P0-P2. Ниже - курированная выборка архитектурно-значимых пунктов (в основном P0/P1 и In Progress), сгруппированная по заботам документа.
 
-| Уже есть (стабильно) | Появится скоро / в активной разработке |
+### 11.1 Уже есть (стабильно / недавно завершено)
+
+| Способность | Недавно закрытые пункты роадмапа (Done) |
 |---|---|
-| Hub + runtime broker (combo и раздельно) | **Pre-start hooks**: project- и **hub-scoped** + web-UI/CLI (только что заехало) |
-| Многопользовательность, проекты, RBAC | **Durability GitHub-скиллов**: hub-side `gh://`-кэш (фазы 1-3, активация) |
-| Runtime: Docker / K8s / Apple VZ | **`resume --force`**: восстановление упавших агентов из error |
-| Workspace = git worktree + branch | **Платформенные скиллы**: scion-scheduler (само-планирование), git-operations, recovery/shell-safety/model-override |
-| Message broker: in-process + Telegram | **A2A-мост**: per-user auth (hubUAT/hubJWT) - есть код, ждёт развёртывания |
-| OTLP-релей + статус-модель + `/metrics` | **Workspace-mode** прокидывается агентам (`SCION_WORKSPACE_MODE/GIT`) |
-| Heartbeat/reaper, sweep | **Ent ORM**: миграция слоя хранения на Ent (первое использование) |
-| `resume`, фазы жизненного цикла | **Web**: граф происхождения агентов, tree/graph-виды |
-| GCP-identity брокеринг (per-pod) | **Секреты**: корректный приём raw и base64 в хендлерах записи |
-| Шаблоны + harness-config (harness-агностично) | **Модель-алиасы**: резолв до записи в `SCION_MODEL` |
-| Модель-алиасы, каталог харнесов | **Discord**: fail-closed observe-режим |
-| BYOC-брокеры (outbound-ws + HMAC) | **Отложено:** развёртывание A2A-моста; 2-й брокер на AWS |
+| Hub + runtime broker (combo и раздельно) | #411 fix 422 no_runtime_broker при редеплое; #419 не пробовать Docker в hosted-режиме |
+| Многопользовательность, проекты, RBAC | #418 env-маппер camelCase-полей |
+| Runtime: Docker / K8s / Apple VZ; workspace = git worktree | #417 очистка root-owned `__pycache__` после delete |
+| Message broker: in-process + Telegram (+ вложения) | **#78 Telegram-вложения (Done)** |
+| Harness-config (harness-агностично), модель-алиасы | #414 harness/claude `project_instructions` для native-режима |
+| OTLP-релей, статус-модель, heartbeat/reaper, `resume` (+`--force`) | Pre-start hooks (project + hub-scoped), gh://-кэш, платформенные скиллы, Ent ORM - заехали в потоке коммитов |
+| GCP-identity брокеринг (per-pod), BYOC-брокеры (outbound-ws + HMAC) | - |
+
+### 11.2 Появится скоро (по roadmap, сгруппировано по заботам §4-9)
+
+| Забота документа | Пункты роадмапа (issue# · статус/приоритет) |
+|---|---|
+| **§4 Мультитенантность / authz** | #335 инвест в multi-user authz (P1) · #482 tiered agent-роли + наследование scope сабагентов (P1) · #399 OIDC ID-токены для агентов (P1) · #302 rate limiting и квоты на проект/хаб (P1) · #446 single-mutable-store precedence: DB > env/yaml (P1) · #438 layer-aware admin-UI: Layer 0 read-only / Layer 1 editable (P1) |
+| **§5 Message broker / интеграции** | **#342 A2A protocol support (P1)** · #350 hardening A2A-моста для prod (P1) · #405 Discord multi-server · #304 per-agent inbound webhooks · #303 secure port-forwarding через хаб · #304... · #38/#579 управление подписками на нотификации |
+| **§6 Логи / observability / диагностика** | #360/#514 единый diagnostics-дашборд + агрегация логов hub+broker+agent (P1) · **#358 `scion doctor` (P1)** · #336 better health monitoring + alerts (P1) · #333 better telemetry & cost management (P1) · #238 OTel-рекордеры → Cloud Monitoring (**In Progress**) · #241 metrics pipeline health (**In Progress**) · #355 CPU/mem/disk-метрики на страницах агентов · #346 extraction message-delivery + delivery-observability |
+| **§7 Durability / HA / масштаб** | #392 hub-идентификатор вместо hostname для HA (P1) · #291 Cloud Scheduler как HA-бэкенд планировщика (P1) · #362 Telegram PG-стор + HA (P1) · #368 sizing пула соединений для HA (P1) · #367 конфигурируемый интервал/конкурентность планировщика (P1) · **#252 broker capacity limits + live-репортинг для умного планирования (P1)** · #332 Deploy to Cloud Run (P1) · #194 **ephemeral-флаг: авто-очистка агента по завершении (P2)** |
+| **§8 Исполнение / runtime / изоляция** | #158 worktree-per-agent для hub-managed workspace (P1) · #523 in-place конвертация workspace-mode · #86 restricted pod security defaults для k8s-подов · #340/#481 Substrate как runtime-тип · #331 запуск сервера в контейнере · #325 Google Secret Manager для стейджинга секретов · #493 network credential proxy с HTTP-rewrite |
+| **Harness / модели / SDK** | **#338 pluggable harness (umbrella, P1)** · **#24 официальные Python/TS SDK (P1)** · #247 AWS Bedrock для Claude-харнеса · #183 локальные модели (ollama/llama-cpp/vllm) · #42 template-level алиасы размера модели (small/medium/large) · #403 OTel-экспорт для Copilot CLI |
+| **Eval / качество** | **#30 Harness Evaluation Workflow System** (закрывает 🔴 из §6) |
+| **Lifecycle hooks** | #35 / #213 configurable agent lifecycle hooks (P1) - реализуется (pre-start hooks уже заехали) |
+| **Managed agents / платформа** | #339 Managed agents · #371 `/v1beta/agents` endpoint (P1) · #211 авто-регистрация агентов в Gemini Enterprise · #337 agent platform integrations |
+| **Дистрибуция / onboarding** | #31 Homebrew-дистрибуция CLI (**In Progress**, P0) · #327 single-user mode (P1) · #332 Cloud Run · #72 workstation-mode UX (In Progress) · #234 Skill Bank M1 (In Progress, P1) |
+
+### 11.3 Дорожная карта закрывает gap'ы из §10
+
+Прямое подтверждение: почти каждый выявленный пробел уже в плане.
+
+| Gap (§10) | Пункт(ы) роадмапа |
+|---|---|
+| Eval-слой 🔴 | #30 Harness Evaluation Workflow System |
+| Метрики мисматчат имена 🟡 | #238 (In Progress), #241 (In Progress), #333 |
+| Durable/HA-стор 🟡 | #392, #362, #368, #291 (HA-designation, PG-стор, пулы, HA-планировщик) |
+| Idle-стоимость 🟡 | #194 ephemeral-агенты (авто-очистка по завершении) |
+| RBAC затирает UI-грант 🟡 | #446 (DB > env/yaml), #438 (layer-aware UI), #147 (settings теряются при рестарте пода) |
+| Multi-user authz 🟡 | #335, #482, #399 |
+| A2A не развёрнут 🟡 | #342 (support), #350 (prod-hardening) |
+| Сильная изоляция кода 🟡 | #86 restricted pod security defaults |
+| Мониторинг: единый лог-дашборд | #360/#514, #358 `scion doctor`, #336 alerts |
+| Idle/масштаб планирования | #252 broker capacity + live-репортинг |
+
+**Не найдено явно на board:** per-project k8s-namespace изоляция (из §4/§10 - остаётся gap'ом, ближайшее родственное #158 worktree-per-agent и #86 pod-security).
 
 ---
 
@@ -340,13 +371,3 @@ stateDiagram-v2
 - Конфиг как источник истины, затирающий состояние из UI (ловушка reconciliation ролей).
 - Устаревшие out-of-process плагины (дрейф контракта топиков).
 - Неограниченные простаивающие агенты (idle-стоимость).
-
----
-
-## Приложение: источники исследования
-
-- Agent control plane / мультитенантная оркестрация: northflank.com/blog/best-agent-cloud-platforms; xpander.ai/resources/top-agent-orchestration-vendors-2026; augmentcode.com/tools/multi-agent-orchestration-platforms-build-vs-buy
-- Референс-форма API/worker, threads/runs, checkpoints: docs.langchain.com/langsmith/agent-server; deepwiki.com/langchain-ai/langgraph
-- Durable execution: temporal.io; zylos.ai/research (durable execution for AI agents / runtimes)
-- Observability (OTel GenAI semconv): opentelemetry.io/blog/2025/ai-agent-observability; datadoghq.com/blog/llm-otel-semantic-convention
-- Ниша кодинг-агентов (worktree-изоляция, фоновые сэндбоксы): github.com/21st-dev/1code; medium.com/google-cloud (run multiple coding agents with git worktrees); addyosmani.com/blog/code-agent-orchestra
