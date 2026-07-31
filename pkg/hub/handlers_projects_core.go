@@ -333,6 +333,15 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		project.OwnerID = user.ID()
 	}
 
+	// Apply default shared dirs from hub settings.
+	// Only stamp when the project has no shared dirs. Since
+	// CreateProjectRequest has no SharedDirs field, this is always
+	// true for direct-create — but the guard future-proofs against
+	// API evolution.
+	if len(project.SharedDirs) == 0 {
+		project.SharedDirs = s.defaultProjectSharedDirs()
+	}
+
 	if err := s.store.CreateProject(ctx, project); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
@@ -1037,6 +1046,11 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 			project.OwnerID = user.ID()
 		}
 
+		// Apply default shared dirs from hub settings (new projects only).
+		if len(project.SharedDirs) == 0 {
+			project.SharedDirs = s.defaultProjectSharedDirs()
+		}
+
 		if err := s.store.CreateProject(ctx, project); err != nil {
 			writeErrorFromErr(w, err, "")
 			return
@@ -1459,6 +1473,20 @@ func (s *Server) handleProjectRoutes(w http.ResponseWriter, r *http.Request) {
 	// Check for nested /settings path
 	if subPath == "settings" {
 		s.handleProjectSettings(w, r, projectID)
+		return
+	}
+
+	// Check for nested /settings/resolved path. Must be tested separately from
+	// "settings" above rather than as a prefix: this is a distinct read-only
+	// sub-resource with no PUT, not a mode of the settings endpoint.
+	if subPath == "settings/resolved" {
+		s.handleProjectSettingsResolved(w, r, projectID)
+		return
+	}
+
+	// Check for nested /clone path
+	if subPath == "clone" {
+		s.handleProjectClone(w, r, projectID)
 		return
 	}
 
