@@ -34,6 +34,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
@@ -126,6 +128,9 @@ type ServerConfig struct {
 	BrokerAuthConfig BrokerAuthConfig
 	// HubEndpoint is the public endpoint URL for this Hub (used in broker join responses).
 	HubEndpoint string
+	// SlowRequestThreshold is the duration after which an HTTP request is
+	// logged as slow. Zero uses logging.DefaultSlowRequestThreshold.
+	SlowRequestThreshold time.Duration
 	// StalledThreshold is how long an agent can go without activity events
 	// before being marked as stalled (default: 5 minutes). Only applies to
 	// agents with a recent heartbeat (not already offline).
@@ -145,6 +150,9 @@ type ServerConfig struct {
 	// TelemetryDefault is the default telemetry enabled state for new agents.
 	// Exposed via GET /api/v1/settings/public so the web UI can pre-populate the checkbox.
 	TelemetryDefault *bool
+	// AutoExposePortsDefault is the default auto-expose-ports enabled state for new agents.
+	// Exposed via GET /api/v1/settings/public so the web UI can pre-populate the checkbox.
+	AutoExposePortsDefault *bool
 	// TelemetryConfig is the full hub-level telemetry config from settings.yaml.
 	// Used to populate default telemetry config on new agents when no per-agent
 	// or template-level telemetry config is set.
@@ -208,6 +216,16 @@ type ServerConfig struct {
 	// TransportMinter mints transport-layer OIDC tokens for agents.
 	// Nil when TransportMode == "none" or unset.
 	TransportMinter TransportTokenMinter
+	// SchedulerIntervalSeconds is the root ticker interval for the background
+	// scheduler, in seconds. Default: 60. Increasing this reduces DB connection
+	// pressure on small deployments.
+	SchedulerIntervalSeconds int
+	// SchedulerMaxConcurrency limits the number of recurring handlers that may
+	// run simultaneously in a single tick. When nil (unset), the scheduler
+	// uses its built-in default of 2 so the fix for issue #367 is active
+	// out-of-the-box. Pointer-to-0 explicitly means unlimited.
+	SchedulerMaxConcurrency *int
+
 	// Workstation indicates non-production, single-user mode (e.g. local laptop).
 	// When true, /api/v1/system/* and other workstation-only endpoints are enabled.
 	Workstation bool
@@ -590,12 +608,13 @@ type SecretKeyInfo struct {
 }
 
 type RemoteEnvRequirementsResponse struct {
-	AgentID    string                   `json:"agentId"`
-	Required   []string                 `json:"required"`
-	HubHas     []string                 `json:"hubHas"`
-	BrokerHas  []string                 `json:"brokerHas"`
-	Needs      []string                 `json:"needs"`
-	SecretInfo map[string]SecretKeyInfo `json:"secretInfo,omitempty"`
+	AgentID      string                   `json:"agentId"`
+	Required     []string                 `json:"required"`
+	HubHas       []string                 `json:"hubHas"`
+	BrokerHas    []string                 `json:"brokerHas"`
+	Needs        []string                 `json:"needs"`
+	SecretInfo   map[string]SecretKeyInfo `json:"secretInfo,omitempty"`
+	Alternatives map[string][]string      `json:"alternatives,omitempty"` // Maps canonical key in Needs to alternative key names from the same any_of group
 }
 
 // RemoteAgentInfo contains agent information from a remote runtime broker.
@@ -637,6 +656,7 @@ type Server struct {
 	auditLogger            AuditLogger             // Audit logger for security events
 	metrics                MetricsRecorder         // Metrics recorder for broker auth
 	controlChannel         *ControlChannelManager  // WebSocket control channel for runtime brokers
+	portTunnels            *PortTunnelManager      // Agent-held port-forward tunnels
 	authzService           *AuthzService           // Authorization service for policy evaluation
 	events                 EventPublisher          // Event publisher for real-time SSE updates
 	commandBus             CommandBus              // Inter-node dispatch signal bus (nil-safe; nil = no-op)
@@ -724,13 +744,16 @@ type Server struct {
 
 	// Subsystem loggers for handler methods
 	agentLifecycleLog *slog.Logger
-	messageLog        *slog.Logger
 	authLog           *slog.Logger
 	envSecretLog      *slog.Logger
-	templateLog       *slog.Logger
-	resourceLog       *slog.Logger
-	workspaceLog      *slog.Logger
+	groupsLog         *slog.Logger
 	maintenanceLog    *slog.Logger
+	messageLog        *slog.Logger
+	projectsLog       *slog.Logger
+	resourceLog       *slog.Logger
+	templateLog       *slog.Logger
+	workspaceLog      *slog.Logger
+	agentMetricsLog   *slog.Logger
 
 	// Cached rate limit info from the most recent GitHub App API call
 	githubAppRateLimit *githubapp.RateLimitInfo
@@ -765,6 +788,25 @@ type Server struct {
 	ghResolutionStore *GitHubResolutionStore
 }
 
+// groupsLogger returns the groups subsystem logger, falling back to
+// slog.Default() when the field is nil (e.g. in tests that construct Server
+// directly without the constructor).
+func (s *Server) groupsLogger() *slog.Logger {
+	if s.groupsLog != nil {
+		return s.groupsLog
+	}
+	return slog.Default()
+}
+
+// projectsLogger returns the projects subsystem logger, falling back to
+// slog.Default() when the field is nil.
+func (s *Server) projectsLogger() *slog.Logger {
+	if s.projectsLog != nil {
+		return s.projectsLog
+	}
+	return slog.Default()
+}
+
 func newInstanceID() string {
 	if podName := os.Getenv("POD_NAME"); podName != "" {
 		return podName + "-" + uuid.NewString()
@@ -779,7 +821,11 @@ func (s *Server) InstanceID() string { return s.instanceID }
 func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// Apply defaults for zero-value fields that have meaningful defaults.
 	defaults := DefaultServerConfig()
-	if cfg.StalledThreshold == 0 {
+	if cfg.StalledThreshold == 0 || cfg.StalledThreshold < 2*time.Minute {
+		if cfg.StalledThreshold != 0 {
+			slog.Warn("stalled_threshold below minimum 2m, using default",
+				"configured", cfg.StalledThreshold, "default", defaults.StalledThreshold)
+		}
 		cfg.StalledThreshold = defaults.StalledThreshold
 	}
 
@@ -797,16 +843,27 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		workstation: cfg.Workstation,
 		ctx:         srvCtx,
 		ctxCancel:   srvCancel,
+		portTunnels: NewPortTunnelManager(),
 
 		// Subsystem loggers
 		agentLifecycleLog: logging.Subsystem("hub.agent-lifecycle"),
-		messageLog:        logging.Subsystem("hub.messages"),
 		authLog:           logging.Subsystem("hub.auth"),
 		envSecretLog:      logging.Subsystem("hub.env-secrets"),
-		templateLog:       logging.Subsystem("hub.templates"),
-		resourceLog:       logging.Subsystem("hub.resources"),
-		workspaceLog:      logging.Subsystem("hub.workspace"),
+		groupsLog:         logging.Subsystem("hub.groups"),
 		maintenanceLog:    logging.Subsystem("hub.maintenance"),
+		messageLog:        logging.Subsystem("hub.messages"),
+		projectsLog:       logging.Subsystem("hub.projects"),
+		resourceLog:       logging.Subsystem("hub.resources"),
+		templateLog:       logging.Subsystem("hub.templates"),
+		workspaceLog:      logging.Subsystem("hub.workspace"),
+		agentMetricsLog:   logging.Subsystem("hub.agent-metrics"),
+	}
+
+	// Wire tunnel disconnect handler: when an agent's port-forward tunnel
+	// closes (readLoop exits), clear its exposed port registrations so stale
+	// ports are not advertised.
+	srv.portTunnels.onDisconnect = func(agentID string) {
+		srv.clearExposedPortsForAgent(context.Background(), agentID)
 	}
 
 	// Shared federation HTTP client: no redirect following to prevent
@@ -1951,6 +2008,11 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 		slog.Info("Configure via: hub.endpoint in server.yaml or SCION_SERVER_HUB_ENDPOINT env var")
 	}
 
+	// Set Hub name so agent log entries carry the hub label.
+	if s.config.HubName != "" {
+		dispatcher.SetHubName(s.config.HubName)
+	}
+
 	// Pass hub ID and secret backend to dispatcher if configured
 	dispatcher.SetHubID(s.hubID)
 	if s.secretBackend != nil {
@@ -2014,7 +2076,7 @@ func (s *Server) GenerateAgentToken(agentID, projectID string, ancestry []string
 		return "", fmt.Errorf("agent token service not initialized")
 	}
 
-	scopes := []AgentTokenScope{ScopeAgentStatusUpdate, ScopeAgentTokenRefresh, ScopeAgentNotify}
+	scopes := []AgentTokenScope{ScopeAgentStatusUpdate, ScopeAgentTokenRefresh, ScopeAgentNotify, ScopeAgentPortForward}
 
 	// In dev-auth mode, auto-grant agent creation and lifecycle scopes
 	// so agents can create sub-agents without explicit template configuration.
@@ -2262,7 +2324,7 @@ func (s *Server) messageEventHandler() EventHandler {
 		}
 
 		// Reconstruct structured message from payload to preserve traits like Plain.
-		structuredMsg := messages.NewInstruction("scheduler", "agent:"+agent.Slug, payload.Message)
+		structuredMsg := messages.NewSystemMessage("scheduler", "agent:"+agent.Slug, payload.Message, messages.SystemCategoryScheduler)
 		structuredMsg.SenderID = "SCHEDULER"
 		structuredMsg.RecipientID = agent.ID
 		structuredMsg.Plain = payload.Plain
@@ -2600,8 +2662,17 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 	}
 	s.mu.Unlock()
 
-	// Initialize and start the scheduler
-	s.scheduler = NewScheduler(s.store, logging.Subsystem("hub.scheduler"))
+	// Initialize and start the scheduler. Interval and concurrency are
+	// configurable via server.scheduler in settings.yaml to let operators
+	// tune background load to match their DB capacity (see issue #367).
+	var schedOpts []SchedulerOption
+	if s.config.SchedulerIntervalSeconds > 0 {
+		schedOpts = append(schedOpts, WithTickInterval(time.Duration(s.config.SchedulerIntervalSeconds)*time.Second))
+	}
+	if s.config.SchedulerMaxConcurrency != nil {
+		schedOpts = append(schedOpts, WithMaxConcurrency(*s.config.SchedulerMaxConcurrency))
+	}
+	s.scheduler = NewScheduler(s.store, logging.Subsystem("hub.scheduler"), schedOpts...)
 	// Recurring sweeps are cluster-wide-once work: under multi-replica Postgres
 	// they must run on a single replica per tick (gated by an advisory lock),
 	// otherwise every replica would publish duplicate offline/stalled events and
@@ -2621,6 +2692,7 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 	s.scheduler.RegisterRecurringSingleton("schedule-evaluator", 1, store.LockScheduleEvaluator, s.evaluateSchedulesHandler())
 	s.scheduler.RegisterRecurringSingleton("broker-affinity-reap", 5, store.LockBrokerAffinityReap, s.brokerAffinityReapHandler())
 	s.scheduler.RegisterRecurringSingleton("broker-message-sweep", 5, store.LockBrokerMessageSweep, s.brokerMessageSweepHandler())
+	s.scheduler.RegisterRecurringSingleton("exposed-ports-sweep", 5, store.LockExposedPortsSweep, s.exposedPortsSweepHandler())
 
 	// Register GitHub resolution cache TTL eviction (every 10 minutes)
 	if s.ghResolutionStore != nil {
@@ -2898,6 +2970,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/secrets", s.handleSecrets)
 	s.mux.HandleFunc("/api/v1/secrets/", s.handleSecretByKey)
 
+	// Session metrics (DB-backed, distinct from Cloud Monitoring metrics dashboard)
+	s.mux.HandleFunc("/api/v1/metrics/session/", s.handleSessionMetrics)
+
 	// Groups and Policies (Hub Permissions System)
 	s.mux.HandleFunc("/api/v1/groups", s.handleGroups)
 	s.mux.HandleFunc("/api/v1/groups/", s.handleGroupRoutes)
@@ -2952,6 +3027,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/validate-resources", s.handleAdminValidateResources)
 	s.mux.HandleFunc("/api/v1/admin/integrations", s.handleAdminIntegrations)
 	s.mux.HandleFunc("/api/v1/admin/integrations/", s.handleAdminIntegrationByName)
+	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs/stream", s.handleDiagnosticsLogsStream)
+	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs", s.handleDiagnosticsLogs)
+	s.mux.HandleFunc("/api/v1/admin/health/summary", s.handleHealthSummary)
 	s.mux.HandleFunc("/api/v1/metrics/", s.handleMetricsDashboard)
 	s.mux.HandleFunc("/api/v1/admin/metrics-dashboard", s.handleAdminMetricsDashboard) // legacy backward-compat
 
@@ -3027,7 +3105,7 @@ func (s *Server) applyMiddleware(h http.Handler) http.Handler {
 	// Apply middleware in reverse order (last applied runs first)
 	h = s.recoveryMiddleware(h)
 	if s.requestLogger != nil {
-		h = logging.RequestLogMiddleware(s.requestLogger, "hub", logging.HubPathPatterns())(h)
+		h = logging.RequestLogMiddleware(s.requestLogger, "hub", logging.HubPathPatterns(), s.config.SlowRequestThreshold)(h)
 	} else {
 		h = s.loggingMiddleware(h)
 	}
@@ -3058,6 +3136,10 @@ func (s *Server) applyMiddleware(h http.Handler) http.Handler {
 	if s.config.CORSEnabled {
 		h = s.corsMiddleware(h)
 	}
+
+	// OTel HTTP tracing (outermost - wraps all middleware for full request lifecycle)
+	h = otelhttp.NewHandler(h, "hub")
+
 	return h
 }
 
@@ -3158,8 +3240,16 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 			level = slog.LevelWarn
 		}
 
-		if duration > 2*time.Second {
-			slog.Warn("Slow request",
+		// Log slow requests, exempting streaming responses.
+		contentType := strings.ToLower(wrapped.Header().Get("Content-Type"))
+		isStreaming := strings.HasPrefix(contentType, "text/event-stream")
+		isUpgrade := r.Header.Get("Upgrade") != ""
+		slowThreshold := s.config.SlowRequestThreshold
+		if slowThreshold <= 0 {
+			slowThreshold = logging.DefaultSlowRequestThreshold
+		}
+		if !isStreaming && !isUpgrade && duration > slowThreshold {
+			slog.Info("Slow request",
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
 				slog.Duration("elapsed", duration),

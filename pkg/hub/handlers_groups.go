@@ -16,7 +16,6 @@ package hub
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -210,6 +209,12 @@ func (s *Server) createGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.groupsLogger().Info("group created",
+		"group_id", group.ID,
+		"slug", group.Slug,
+		"group_type", group.GroupType,
+		"created_by", createdBy)
+
 	// Add the creating user as an owner of the new group
 	if createdBy != "" {
 		if err := s.store.AddGroupMember(ctx, &store.GroupMember{
@@ -219,7 +224,7 @@ func (s *Server) createGroup(w http.ResponseWriter, r *http.Request) {
 			Role:       store.GroupMemberRoleOwner,
 		}); err != nil && err != store.ErrAlreadyExists {
 			// Log but don't fail the group creation
-			slog.Warn("failed to add creator as owner of new group",
+			s.groupsLogger().Warn("failed to add creator as owner of new group",
 				"group", group.ID, "user", createdBy, "error", err)
 		}
 	}
@@ -353,6 +358,10 @@ func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 
+	s.groupsLogger().Info("group updated",
+		"group_id", group.ID,
+		"slug", group.Slug)
+
 	writeJSON(w, http.StatusOK, group)
 }
 
@@ -392,6 +401,10 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request, id string) 
 		writeErrorFromErr(w, err, "")
 		return
 	}
+
+	s.groupsLogger().Info("group deleted",
+		"group_id", group.ID,
+		"slug", group.Slug)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -631,6 +644,12 @@ func (s *Server) addGroupMember(w http.ResponseWriter, r *http.Request, group *s
 		return
 	}
 
+	s.groupsLogger().Info("group member added",
+		"group_id", groupID,
+		"member_type", member.MemberType,
+		"member_id", member.MemberID,
+		"role", member.Role)
+
 	// Return enriched response with display name
 	resp := GroupMemberInfo{
 		GroupMember: *member,
@@ -730,6 +749,11 @@ func (s *Server) removeGroupMember(w http.ResponseWriter, r *http.Request, group
 		writeErrorFromErr(w, err, "")
 		return
 	}
+
+	s.groupsLogger().Info("group member removed",
+		"group_id", group.ID,
+		"member_type", memberType,
+		"member_id", memberID)
 
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -14,6 +14,7 @@ import (
 	mexporter "github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric"
 	texporter "github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/trace"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
+	scionlog "github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/trace"
@@ -84,24 +85,12 @@ func NewGCPExporter(config *Config) (*GCPExporter, error) {
 		metricExporter = newDebugMetricExporter(metricExporter)
 	}
 
-	// Build common labels for agent identification
+	// Build common labels for agent identification.
+	// Most identifiers are carried as OTel resource attributes (see providers.go);
+	// only hub has no resource-attribute equivalent.
 	commonLabels := map[string]string{}
-	if agentID := os.Getenv("SCION_AGENT_ID"); agentID != "" {
-		commonLabels["agent_id"] = agentID
-	}
-	legacyProjectID := os.Getenv("SCION_GROVE_ID")
-	projectID := os.Getenv("SCION_PROJECT_ID")
-	if legacyProjectID != "" {
-		commonLabels["grove_id"] = legacyProjectID
-	}
-	if projectID != "" {
-		commonLabels["project_id"] = projectID
-	}
-	// Ensure both are set if either is available for transition
-	if legacyProjectID == "" && projectID != "" {
-		commonLabels["grove_id"] = projectID
-	} else if projectID == "" && legacyProjectID != "" {
-		commonLabels["project_id"] = legacyProjectID
+	if hubName := os.Getenv("SCION_HUB_NAME"); hubName != "" {
+		commonLabels["hub"] = hubName
 	}
 
 	var loggerOpts []logging.LoggerOption
@@ -113,7 +102,7 @@ func NewGCPExporter(config *Config) (*GCPExporter, error) {
 		traceExporter:  traceExp,
 		metricExporter: metricExporter,
 		logClient:      logClient,
-		logger:         logClient.Logger("scion-agents", loggerOpts...),
+		logger:         logClient.Logger(scionlog.AgentLogID, loggerOpts...),
 		projectID:      config.ProjectID,
 		metricsDebug:   config.MetricsDebug,
 	}, nil

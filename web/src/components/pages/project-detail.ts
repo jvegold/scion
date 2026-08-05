@@ -23,7 +23,7 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
-import type { PageData, Project, Agent, AgentPhase, Capabilities } from '../../shared/types.js';
+import type { PageData, Project, Agent, AgentPhase, Capabilities, ProjectSessionMetricsSummary } from '../../shared/types.js';
 import { can, canAny, getAgentDisplayStatus, isAgentRunning, isTerminalAvailable, isSharedWorkspace } from '../../shared/types.js';
 import type { StatusType } from '../shared/status-badge.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
@@ -41,6 +41,8 @@ import { WorkspaceFileBrowserDataSource, SharedDirFileBrowserDataSource } from '
 import type { FileBrowserDataSource } from '../shared/file-browser.js';
 import { WorkspaceFileEditorDataSource, SharedDirFileEditorDataSource } from '../shared/file-editor.js';
 import type { FileEditorDataSource } from '../shared/file-editor.js';
+import { showToast } from '../../utils/toast.js';
+import { showConfirm } from '../shared/confirm-dialog.js';
 
 type AgentSortField = 'name' | 'status' | 'created' | 'updated';
 type SortDir = 'asc' | 'desc';
@@ -122,6 +124,9 @@ export class ScionPageProjectDetail extends LitElement {
   private phaseFilter: AgentPhase | '' = '';
 
   @state()
+  private labelFilter = '';
+
+  @state()
   private sortField: AgentSortField = 'updated';
 
   @state()
@@ -155,6 +160,12 @@ export class ScionPageProjectDetail extends LitElement {
     activeAgents24h: number;
     periodLabel: string;
   } | null = null;
+
+  /**
+   * DB-backed session metrics summary for the project.
+   */
+  @state()
+  private sessionMetricsSummary: ProjectSessionMetricsSummary | null = null;
 
   /**
    * Whether the messages section is expanded (lazy-load trigger)
@@ -202,6 +213,22 @@ export class ScionPageProjectDetail extends LitElement {
    */
   @state()
   private cloneError = '';
+
+  /** Whether the create-template dialog is open */
+  @state()
+  private templateDialogOpen = false;
+
+  /** Name for the new template */
+  @state()
+  private templateName = '';
+
+  /** Whether the create-template operation is in progress */
+  @state()
+  private templateLoading = false;
+
+  /** Error message from create-template operation */
+  @state()
+  private templateError = '';
 
   static override styles = css`
     :host {
@@ -300,6 +327,8 @@ export class ScionPageProjectDetail extends LitElement {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
       gap: 1.5rem;
+      max-height: 26rem;
+      overflow-y: auto;
     }
 
     .agent-card {
@@ -387,7 +416,8 @@ export class ScionPageProjectDetail extends LitElement {
       background: var(--scion-surface, #ffffff);
       border: 1px solid var(--scion-border, #e2e8f0);
       border-radius: var(--scion-radius-lg, 0.75rem);
-      overflow: hidden;
+      max-height: 26rem;
+      overflow-y: auto;
     }
 
     .agent-table-container table {
@@ -904,6 +934,7 @@ export class ScionPageProjectDetail extends LitElement {
 
       // Fetch metrics summary (non-blocking, gracefully degrades)
       void this.loadMetricsSummary();
+      void this.loadSessionMetricsSummary();
 
       // Auto-discover GitHub App installation if project has a GitHub remote but no installation
       if (this.project && this.project.gitRemote && /github\.com[/:]/.test(this.project.gitRemote) && this.project.githubInstallationId == null) {
@@ -936,6 +967,19 @@ export class ScionPageProjectDetail extends LitElement {
     }
   }
 
+  private async loadSessionMetricsSummary(): Promise<void> {
+    try {
+      const res = await apiFetch(`/api/v1/projects/${this.projectId}/metrics/summary`);
+      if (res.ok) {
+        this.sessionMetricsSummary = (await res.json()) as ProjectSessionMetricsSummary;
+      } else {
+        this.sessionMetricsSummary = null;
+      }
+    } catch {
+      this.sessionMetricsSummary = null;
+    }
+  }
+
   private formatTokenCount(n: number): string {
     if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
     if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -950,7 +994,15 @@ export class ScionPageProjectDetail extends LitElement {
   }
 
   private async fetchAndMergeAgents(): Promise<void> {
-    const response = await apiFetch(`/api/v1/projects/${this.projectId}/agents`);
+    const params = new URLSearchParams();
+    if (this.labelFilter.trim() && this.labelFilter.includes('=')) {
+      params.append('label', this.labelFilter.trim());
+    }
+    const qs = params.toString();
+    const url = qs
+      ? `/api/v1/projects/${this.projectId}/agents?${qs}`
+      : `/api/v1/projects/${this.projectId}/agents`;
+    const response = await apiFetch(url);
     if (!response.ok) return;
 
     const data = (await response.json()) as
@@ -1070,7 +1122,7 @@ export class ScionPageProjectDetail extends LitElement {
     event?: MouseEvent
   ): Promise<void> {
     if (action === 'delete') {
-      if (!event?.altKey && !confirm('Are you sure you want to delete this agent?')) {
+      if (!event?.altKey && !(await showConfirm('Are you sure you want to delete this agent?'))) {
         return;
       }
       this.actionLoading = { ...this.actionLoading, [agentId]: true };
@@ -1090,7 +1142,7 @@ export class ScionPageProjectDetail extends LitElement {
         this.backgroundRefresh();
       } catch (err) {
         console.error('Failed to delete agent:', err);
-        alert(err instanceof Error ? err.message : 'Failed to delete agent');
+        showToast(err instanceof Error ? err.message : 'Failed to delete agent');
       } finally {
         this.actionLoading = { ...this.actionLoading, [agentId]: false };
       }
@@ -1129,7 +1181,7 @@ export class ScionPageProjectDetail extends LitElement {
       this.backgroundRefresh();
     } catch (err) {
       console.error(`Failed to ${action} agent:`, err);
-      alert(err instanceof Error ? err.message : `Failed to ${action} agent`);
+      showToast(err instanceof Error ? err.message : `Failed to ${action} agent`);
       this.backgroundRefresh();
     }
   }
@@ -1142,6 +1194,16 @@ export class ScionPageProjectDetail extends LitElement {
     let list = this.agents;
     if (this.phaseFilter) {
       list = list.filter(a => a.phase === this.phaseFilter);
+    }
+    if (this.labelFilter.trim()) {
+      const parts = this.labelFilter.trim().split('=');
+      const filterKey = parts[0];
+      const filterValue = parts.slice(1).join('=');
+      list = list.filter(a => {
+        if (!a.labels) return false;
+        if (filterValue) return a.labels[filterKey] === filterValue;
+        return filterKey in a.labels;
+      });
     }
     const sorted = [...list];
     sorted.sort((a, b) => {
@@ -1157,7 +1219,7 @@ export class ScionPageProjectDetail extends LitElement {
           cmp = (a.created || a.createdAt || '').localeCompare(b.created || b.createdAt || '');
           break;
         case 'updated':
-          cmp = (a.updated || a.updatedAt || '').localeCompare(b.updated || b.updatedAt || '');
+          cmp = ((a.lastActivityEvent && !a.lastActivityEvent.startsWith('0001')) ? a.lastActivityEvent : (a.updated || a.updatedAt || '')).localeCompare((b.lastActivityEvent && !b.lastActivityEvent.startsWith('0001')) ? b.lastActivityEvent : (b.updated || b.updatedAt || ''));
           break;
       }
       return this.sortDir === 'asc' ? cmp : -cmp;
@@ -1231,6 +1293,20 @@ export class ScionPageProjectDetail extends LitElement {
             @click=${() => this.setPhaseFilter('error')}
           >Error</button>
         </div>
+        <sl-input
+          size="small"
+          placeholder="Filter by label (key=value)"
+          clearable
+          .value=${this.labelFilter}
+          @sl-input=${(e: Event) => {
+            this.labelFilter = (e.target as HTMLElement & { value: string }).value;
+          }}
+          @sl-change=${() => void this.backgroundRefresh()}
+          @sl-clear=${() => { this.labelFilter = ''; void this.backgroundRefresh(); }}
+          style="max-width: 220px;"
+        >
+          <sl-icon slot="prefix" name="tag"></sl-icon>
+        </sl-input>
         ${this.viewMode === 'grid' ? html`
           <sl-dropdown>
             <sl-button slot="trigger" size="small" outline>
@@ -1258,7 +1334,7 @@ export class ScionPageProjectDetail extends LitElement {
     const confirmMsg = isProjectAdmin
       ? 'Are you sure you want to stop all running agents in this project?'
       : 'Are you sure you want to stop all of your running agents in this project?';
-    if (!confirm(confirmMsg)) {
+    if (!(await showConfirm(confirmMsg))) {
       return;
     }
 
@@ -1279,13 +1355,13 @@ export class ScionPageProjectDetail extends LitElement {
 
       const result = (await response.json()) as { stopped: number; failed: number; scope?: string };
       if (result.failed > 0) {
-        alert(`Stopped ${result.stopped} agents, ${result.failed} failed.`);
+        showToast(`Stopped ${result.stopped} agents, ${result.failed} failed.`, 'warning');
       }
 
       this.backgroundRefresh();
     } catch (err) {
       console.error('Failed to stop agents:', err);
-      alert(err instanceof Error ? err.message : 'Failed to stop agents');
+      showToast(err instanceof Error ? err.message : 'Failed to stop agents');
       this.backgroundRefresh();
     } finally {
       this.stopAllLoading = false;
@@ -1375,6 +1451,88 @@ export class ScionPageProjectDetail extends LitElement {
     } finally {
       this.cloneLoading = false;
     }
+  }
+
+  private openTemplateDialog(): void {
+    this.templateName = this.project ? `${this.project.name} Template` : '';
+    this.templateError = '';
+    this.templateLoading = false;
+    this.templateDialogOpen = true;
+  }
+
+  private async handleCreateTemplate(): Promise<void> {
+    if (!this.templateName.trim()) {
+      this.templateError = 'Template name is required.';
+      return;
+    }
+    this.templateLoading = true;
+    this.templateError = '';
+    try {
+      const response = await apiFetch(`/api/v1/projects/${this.projectId}/clone`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: this.templateName.trim(), asTemplate: true }),
+      });
+      if (!response.ok) {
+        const errorText = await extractApiError(response, 'Failed to create template');
+        throw new Error(errorText);
+      }
+      this.templateDialogOpen = false;
+      // Navigate to hub resources templates tab
+      window.history.pushState({}, '', '/settings?tab=project-templates');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    } catch (err) {
+      this.templateError = err instanceof Error ? err.message : 'Failed to create template';
+    } finally {
+      this.templateLoading = false;
+    }
+  }
+
+  private renderTemplateDialog() {
+    return html`
+      <sl-dialog
+        label="Create Template"
+        ?open=${this.templateDialogOpen}
+        @sl-request-close=${(e: CustomEvent) => {
+          if (this.templateLoading) {
+            e.preventDefault();
+            return;
+          }
+          this.templateDialogOpen = false;
+        }}
+      >
+        <p>
+          Create a project template from
+          <strong>${this.project?.name ?? 'this project'}</strong>.
+        </p>
+        <sl-input
+          label="Template Name"
+          .value=${this.templateName}
+          @sl-input=${(e: Event) => (this.templateName = (e.target as HTMLInputElement).value)}
+          ?disabled=${this.templateLoading}
+        ></sl-input>
+        ${this.templateError
+          ? html`<div class="clone-error">${this.templateError}</div>`
+          : nothing}
+        <sl-button
+          slot="footer"
+          variant="primary"
+          @click=${() => this.handleCreateTemplate()}
+          ?loading=${this.templateLoading}
+          ?disabled=${this.templateLoading}
+        >
+          Create Template
+        </sl-button>
+        <sl-button
+          slot="footer"
+          variant="default"
+          @click=${() => (this.templateDialogOpen = false)}
+          ?disabled=${this.templateLoading}
+        >
+          Cancel
+        </sl-button>
+      </sl-dialog>
+    `;
   }
 
   private renderCloneDialog() {
@@ -1480,12 +1638,31 @@ export class ScionPageProjectDetail extends LitElement {
               `
             : nothing}
           ${can(this.project?._capabilities, 'read')
-            ? html`
-                <sl-button size="small" @click=${() => this.openCloneDialog()}>
-                  <sl-icon slot="prefix" name="copy"></sl-icon>
-                  Clone
-                </sl-button>
-              `
+            ? this.pageData?.user?.role === 'admin'
+              ? html`
+                  <sl-dropdown>
+                    <sl-button slot="trigger" size="small" caret>
+                      <sl-icon slot="prefix" name="copy"></sl-icon>
+                      Clone
+                    </sl-button>
+                    <sl-menu>
+                      <sl-menu-item @click=${() => this.openCloneDialog()}>
+                        <sl-icon slot="prefix" name="copy"></sl-icon>
+                        Clone Project
+                      </sl-menu-item>
+                      <sl-menu-item @click=${() => this.openTemplateDialog()}>
+                        <sl-icon slot="prefix" name="file-earmark-plus"></sl-icon>
+                        Create Template
+                      </sl-menu-item>
+                    </sl-menu>
+                  </sl-dropdown>
+                `
+              : html`
+                  <sl-button size="small" @click=${() => this.openCloneDialog()}>
+                    <sl-icon slot="prefix" name="copy"></sl-icon>
+                    Clone
+                  </sl-button>
+                `
             : nothing}
           <a href="/projects/${this.projectId}/metrics" style="text-decoration: none;">
             <sl-button size="small">
@@ -1560,6 +1737,23 @@ export class ScionPageProjectDetail extends LitElement {
         </div>
       ` : nothing}
 
+      ${this.sessionMetricsSummary ? html`
+        <div class="stats-row" style="margin-top: 0.5rem;">
+          <div class="stat">
+            <span class="stat-label">Total Sessions</span>
+            <span class="stat-value">${this.sessionMetricsSummary.totalSessions}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Total Tokens</span>
+            <span class="stat-value">${this.formatTokenCount(this.sessionMetricsSummary.totalTokensInput + this.sessionMetricsSummary.totalTokensOutput)}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Active Agents</span>
+            <span class="stat-value">${this.sessionMetricsSummary.activeAgents}</span>
+          </div>
+        </div>
+      ` : nothing}
+
       ${this.pullResult
         ? html`
             <sl-alert
@@ -1625,6 +1819,7 @@ export class ScionPageProjectDetail extends LitElement {
       ${this.shouldShowFilesSection() ? this.renderFilesSection() : ''}
 
       ${this.renderCloneDialog()}
+      ${this.renderTemplateDialog()}
     `;
   }
 
@@ -1890,7 +2085,7 @@ export class ScionPageProjectDetail extends LitElement {
             size="small"
           ></scion-status-badge>
         </td>
-        <td class="hide-mobile">${(agent.updated || agent.updatedAt) ? this.formatRelativeTime(agent.updated || agent.updatedAt!) : '\u2014'}</td>
+        <td class="hide-mobile">${((agent.lastActivityEvent && !agent.lastActivityEvent.startsWith('0001')) || agent.updated || agent.updatedAt) ? this.formatRelativeTime(((agent.lastActivityEvent && !agent.lastActivityEvent.startsWith('0001')) ? agent.lastActivityEvent : (agent.updated || agent.updatedAt))!) : '\u2014'}</td>
         <td class="hide-mobile">
           <span class="task-cell">${agent.taskSummary || '\u2014'}</span>
         </td>

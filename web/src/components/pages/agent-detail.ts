@@ -34,6 +34,7 @@ import type {
   Project,
   Notification,
   Subscription,
+  AgentMetricsSummary,
 } from '../../shared/types.js';
 import {
   can,
@@ -56,6 +57,9 @@ import type { ScionAgentLogViewer } from '../shared/agent-log-viewer.js';
 import '../shared/agent-message-viewer.js';
 import type { ScionAgentMessageViewer } from '../shared/agent-message-viewer.js';
 import '../shared/hash-display.js';
+import '../shared/quick-message-dialog.js';
+import { showToast } from '../../utils/toast.js';
+import { showConfirm } from '../shared/confirm-dialog.js';
 
 /**
  * Parse a Go-style duration string (e.g. "2h30m", "1h", "45m", "90s") into
@@ -135,6 +139,12 @@ export class ScionPageAgentDetail extends LitElement {
 
   @state()
   private subscriptionLoading = false;
+
+  @state()
+  private quickMessageOpen = false;
+
+  @state()
+  private metricsSummary: AgentMetricsSummary | null = null;
 
   static override styles = css`
     :host {
@@ -549,6 +559,16 @@ export class ScionPageAgentDetail extends LitElement {
       margin-bottom: 1rem;
     }
 
+    /* ---- Port link ---- */
+    .port-link {
+      color: #4ade80;
+      text-decoration: none;
+    }
+    .port-link:hover {
+      text-decoration: underline;
+      color: #22c55e;
+    }
+
     /* ---- Visibility badge ---- */
     .visibility-badge {
       display: inline-flex;
@@ -692,6 +712,9 @@ export class ScionPageAgentDetail extends LitElement {
 
       await Promise.all(parallel);
 
+      // Load metrics summary (non-blocking).
+      this.loadMetricsSummary();
+
       stateManager.seedAgents([this.agent]);
       if (this.project) {
         stateManager.seedProjects([this.project]);
@@ -704,6 +727,17 @@ export class ScionPageAgentDetail extends LitElement {
       this.error = err instanceof Error ? err.message : 'Failed to load agent';
     } finally {
       this.loading = false;
+    }
+  }
+
+  private async loadMetricsSummary(): Promise<void> {
+    try {
+      const res = await apiFetch(`/api/v1/agents/${this.agentId}/metrics/summary`);
+      if (res.ok) {
+        this.metricsSummary = (await res.json()) as AgentMetricsSummary;
+      }
+    } catch {
+      // Metrics loading is optional — do not block the page.
     }
   }
 
@@ -762,7 +796,7 @@ export class ScionPageAgentDetail extends LitElement {
     if (!this.agent) return;
 
     if (action === 'delete') {
-      if (!event?.altKey && !confirm('Are you sure you want to delete this agent?')) {
+      if (!event?.altKey && !(await showConfirm('Are you sure you want to delete this agent?'))) {
         return;
       }
       this.actionLoading = { ...this.actionLoading, delete: true };
@@ -779,7 +813,7 @@ export class ScionPageAgentDetail extends LitElement {
         window.location.href = this.project ? `/projects/${this.project.id}` : '/agents';
       } catch (err) {
         console.error('Failed to delete agent:', err);
-        alert(err instanceof Error ? err.message : 'Failed to delete agent');
+        showToast(err instanceof Error ? err.message : 'Failed to delete agent');
       } finally {
         this.actionLoading = { ...this.actionLoading, delete: false };
       }
@@ -801,7 +835,7 @@ export class ScionPageAgentDetail extends LitElement {
         this.backgroundRefresh();
       } catch (err) {
         console.error('Failed to reset auth:', err);
-        alert(err instanceof Error ? err.message : 'Failed to reset auth');
+        showToast(err instanceof Error ? err.message : 'Failed to reset auth');
       } finally {
         this.actionLoading = { ...this.actionLoading, 'reset-auth': false };
       }
@@ -836,7 +870,7 @@ export class ScionPageAgentDetail extends LitElement {
       this.backgroundRefresh();
     } catch (err) {
       console.error(`Failed to ${action} agent:`, err);
-      alert(err instanceof Error ? err.message : `Failed to ${action} agent`);
+      showToast(err instanceof Error ? err.message : `Failed to ${action} agent`);
       this.backgroundRefresh();
     }
   }
@@ -942,11 +976,13 @@ export class ScionPageAgentDetail extends LitElement {
 
       <sl-tab-group @sl-tab-show=${this.handleTabShow}>
         <sl-tab slot="nav" panel="status">Status</sl-tab>
+        <sl-tab slot="nav" panel="metrics">Metrics</sl-tab>
         <sl-tab slot="nav" panel="logs">Logs</sl-tab>
         <sl-tab slot="nav" panel="messages">Messages</sl-tab>
         <sl-tab slot="nav" panel="configuration">Configuration</sl-tab>
 
         <sl-tab-panel name="status">${this.renderStatusTab()}</sl-tab-panel>
+        <sl-tab-panel name="metrics">${this.renderMetricsTab()}</sl-tab-panel>
         <sl-tab-panel name="logs">
           <scion-agent-log-viewer
             agentId=${this.agentId}
@@ -969,6 +1005,13 @@ export class ScionPageAgentDetail extends LitElement {
         </sl-tab-panel>
         <sl-tab-panel name="configuration">${this.renderConfigurationTab()}</sl-tab-panel>
       </sl-tab-group>
+
+      <scion-quick-message-dialog
+        agentId=${this.agentId}
+        agentName=${this.agent.name || ''}
+        ?open=${this.quickMessageOpen}
+        @sl-request-close=${() => { this.quickMessageOpen = false; }}
+      ></scion-quick-message-dialog>
     `;
   }
 
@@ -1013,6 +1056,19 @@ export class ScionPageAgentDetail extends LitElement {
           </div>
         </div>
         <div class="header-actions">
+          ${can(agent._capabilities, 'message')
+            ? html`
+                <sl-button
+                  variant="default"
+                  size="small"
+                  outline
+                  @click=${() => { this.quickMessageOpen = true; }}
+                >
+                  <sl-icon slot="prefix" name="chat-dots"></sl-icon>
+                  Message
+                </sl-button>
+              `
+            : nothing}
           ${can(agent._capabilities, 'attach')
             ? html`
                 <a href="/agents/${this.agentId}/terminal" style="text-decoration: none;">
@@ -1117,7 +1173,7 @@ export class ScionPageAgentDetail extends LitElement {
               `
             : nothing}
           <sl-tooltip content="See this agent in graph">
-            <a href="/agents/graph?focus=${this.agentId}" style="text-decoration: none;">
+            <a href="/agents/graph?project=${agent.projectId}&focus=${this.agentId}" style="text-decoration: none;">
               <sl-button variant="default" size="small">
                 <sl-icon slot="prefix" name="diagram-3"></sl-icon>
               </sl-button>
@@ -1150,6 +1206,7 @@ export class ScionPageAgentDetail extends LitElement {
     return html`
       ${this.renderCurrentStateCard(agent)} ${this.renderCurrentTaskCard(agent)}
       ${this.renderLimitsUsageCard(agent)} ${this.renderConnectivityCard(agent)}
+      ${this.renderExposedPortsCard(agent)}
       ${this.renderNotificationsCard()}
     `;
   }
@@ -1196,8 +1253,8 @@ export class ScionPageAgentDetail extends LitElement {
                     status=${agent.activity as StatusType}
                     label=${agent.activity}
                     size="small"
-                  ></scion-status-badge>${(agent.updated || agent.updatedAt)
-                    ? html`<span style="color: var(--scion-text-muted, #64748b); font-size: 0.85em; margin-left: 0.5em;">${this.formatRelativeTime((agent.updated || agent.updatedAt)!)}</span>`
+                  ></scion-status-badge>${((agent.lastActivityEvent && !this.isZeroDate(agent.lastActivityEvent)) || agent.updated || agent.updatedAt)
+                    ? html`<span style="color: var(--scion-text-muted, #64748b); font-size: 0.85em; margin-left: 0.5em;">${this.formatRelativeTime(((agent.lastActivityEvent && !this.isZeroDate(agent.lastActivityEvent)) ? agent.lastActivityEvent : (agent.updated || agent.updatedAt))!)}</span>`
                     : ''}`
                 : html`<span style="color: var(--scion-text-muted, #64748b);">—</span>`}
             </span>
@@ -1215,18 +1272,6 @@ export class ScionPageAgentDetail extends LitElement {
                 <div class="info-item">
                   <span class="info-label">Detail</span>
                   <span class="info-value">${agent.detail.message}</span>
-                </div>
-              `
-            : ''}
-          ${agent.labels && Object.keys(agent.labels).length > 0
-            ? html`
-                <div class="info-item">
-                  <span class="info-label">Labels</span>
-                  <span class="info-value">
-                    ${Object.entries(agent.labels).map(
-                      ([k, v]) => html`<sl-tag size="small" variant="neutral" style="margin: 0.15em;">${k}: ${v}</sl-tag>`
-                    )}
-                  </span>
                 </div>
               `
             : ''}
@@ -1348,6 +1393,151 @@ export class ScionPageAgentDetail extends LitElement {
         </div>
       </div>
     `;
+  }
+
+  private renderExposedPortsCard(agent: Agent) {
+    const ports = agent.exposedPorts;
+    if (!ports || ports.length === 0) return nothing;
+
+    return html`
+      <div class="card">
+        <h3 class="card-title">Exposed Ports</h3>
+        <div class="info-grid">
+          ${ports.map(
+            (p) => html`
+              <div class="info-item">
+                <span class="info-label">
+                  :${p.port}${p.label ? ` (${p.label})` : ''}
+                </span>
+                <span class="info-value">
+                  <a
+                    href="/api/v1/agents/${agent.id}/ports/${p.port}/proxy/"
+                    target="_blank"
+                    rel="noopener"
+                    class="port-link"
+                  >
+                    Open in new tab
+                  </a>
+                </span>
+              </div>
+            `
+          )}
+        </div>
+      </div>
+    `;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Metrics Tab
+  // ---------------------------------------------------------------------------
+
+  private renderMetricsTab() {
+    const m = this.metricsSummary;
+    if (!m) {
+      return html`
+        <div class="card">
+          <h3 class="card-title">Session Metrics</h3>
+          <p style="color: var(--scion-text-muted, #888)">No session metrics available yet.</p>
+        </div>
+      `;
+    }
+
+    return html`
+      <div class="card">
+        <h3 class="card-title">Token Usage</h3>
+        <div class="info-grid">
+          <div class="info-item">
+            <span class="info-label">TOTAL SESSIONS</span>
+            <span class="info-value">${m.totalSessions.toLocaleString()}</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">INPUT TOKENS</span>
+            <span class="info-value">${m.totalTokensInput.toLocaleString()}</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">OUTPUT TOKENS</span>
+            <span class="info-value">${m.totalTokensOutput.toLocaleString()}</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">CACHED TOKENS</span>
+            <span class="info-value">${m.totalTokensCached.toLocaleString()}</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">REASONING TOKENS</span>
+            <span class="info-value">${m.totalTokensReasoning.toLocaleString()}</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">AVG TOKENS / SESSION</span>
+            <span class="info-value">${m.avgTokensPerSession.toLocaleString()}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 class="card-title">Session Statistics</h3>
+        <div class="info-grid">
+          <div class="info-item">
+            <span class="info-label">TOTAL TOOL CALLS</span>
+            <span class="info-value">${m.totalToolCalls.toLocaleString()}</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">AVG DURATION</span>
+            <span class="info-value">${this.formatDurationMs(m.avgSessionDurationMs)}</span>
+          </div>
+        </div>
+      </div>
+
+      ${m.mostUsedTools.length > 0
+        ? html`
+            <div class="card">
+              <h3 class="card-title">Most Used Tools</h3>
+              <div class="info-grid">
+                ${m.mostUsedTools.map(
+                  (t) => html`
+                    <div class="info-item">
+                      <span class="info-label">${t.name.toUpperCase()}</span>
+                      <span class="info-value">
+                        ${t.calls} calls
+                        ${t.error > 0
+                          ? html`<span style="color: var(--scion-danger-500, #ef4444)"> (${t.error} errors)</span>`
+                          : nothing}
+                      </span>
+                    </div>
+                  `
+                )}
+              </div>
+            </div>
+          `
+        : nothing}
+      ${m.mostUsedModels.length > 0
+        ? html`
+            <div class="card">
+              <h3 class="card-title">Models</h3>
+              <div class="info-grid">
+                ${m.mostUsedModels.map(
+                  (model) => html`
+                    <div class="info-item">
+                      <span class="info-label">${model.model.toUpperCase()}</span>
+                      <span class="info-value">${model.sessions} sessions</span>
+                    </div>
+                  `
+                )}
+              </div>
+            </div>
+          `
+        : nothing}
+    `;
+  }
+
+  private formatDurationMs(ms: number): string {
+    if (ms <= 0) return '—';
+    const totalSeconds = Math.round(ms / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    if (minutes > 0) return `${minutes}m ${seconds}s`;
+    return `${seconds}s`;
   }
 
   // ---------------------------------------------------------------------------

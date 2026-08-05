@@ -246,8 +246,7 @@ func TestContainerScriptHarness_StagesBundle(t *testing.T) {
 func TestContainerScriptHarness_ResolveAuth_StagesCandidateEnv(t *testing.T) {
 	h, _ := newTestContainerScriptHarness(t)
 	resolved, err := h.ResolveAuth(api.AuthConfig{
-		AnthropicAPIKey: "sk-ant-xxx",
-		ClaudeAuthFile:  "/tmp/.credentials.json",
+		EnvVars: map[string]string{"ANTHROPIC_API_KEY": "sk-ant-xxx"},
 	})
 	if err != nil {
 		t.Fatalf("ResolveAuth: %v", err)
@@ -257,9 +256,6 @@ func TestContainerScriptHarness_ResolveAuth_StagesCandidateEnv(t *testing.T) {
 	}
 	if resolved.EnvVars["ANTHROPIC_API_KEY"] != "sk-ant-xxx" {
 		t.Errorf("missing ANTHROPIC_API_KEY in env")
-	}
-	if len(resolved.Files) != 1 || !strings.Contains(resolved.Files[0].ContainerPath, ".claude/.credentials.json") {
-		t.Errorf("unexpected file mappings: %+v", resolved.Files)
 	}
 }
 
@@ -366,6 +362,237 @@ func TestContainerScriptHarness_ApplyAuthSettings_ExplicitTypeFallsBackToEntry(t
 	}
 	if payload["explicit_type"] != "api-key" {
 		t.Errorf("explicit_type=%v, want api-key", payload["explicit_type"])
+	}
+}
+
+func TestContainerScriptHarness_ApplyAuthSettings_RejectsHarnessImplementationName(t *testing.T) {
+	// Regression test for data-corruption bug: if a prior backfill incorrectly
+	// wrote the harness implementation name ("container-script") into
+	// SCION_HARNESS_SELECTED_AUTH, ApplyAuthSettings must discard it and fall
+	// back to c.entry.AuthSelectedType rather than propagating it as
+	// explicit_type — which would crash the container-side provisioner with
+	// "unknown auth type 'container-script'".
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "config.yaml"), "harness: testharness\nimage: scion-test:latest\n")
+	writeFile(t, filepath.Join(dir, "provision.py"), "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+	entry := config.HarnessConfigEntry{
+		Harness:          "testharness",
+		Image:            "scion-test:latest",
+		AuthSelectedType: "vertex-ai",
+		Provisioner: &config.HarnessProvisionerConfig{
+			Type:             "container-script",
+			InterfaceVersion: 1,
+			Command:          []string{"python3", "$HOME/.scion/harness/provision.py"},
+		},
+	}
+	h, err := NewContainerScriptHarness(dir, entry)
+	if err != nil {
+		t.Fatalf("NewContainerScriptHarness: %v", err)
+	}
+
+	agentHome := t.TempDir()
+	// Simulate corrupted state: SCION_HARNESS_SELECTED_AUTH contains the
+	// harness implementation name instead of a valid auth type.
+	resolved := &api.ResolvedAuth{
+		Method: "container-script",
+		EnvVars: map[string]string{
+			"SCION_HARNESS_SELECTED_AUTH": "container-script",
+			"ANTHROPIC_API_KEY":           "sk-test",
+		},
+	}
+	if err := h.ApplyAuthSettings(agentHome, resolved); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(agentHome, ".scion", "harness", "inputs", "auth-candidates.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	// Must fall back to c.entry.AuthSelectedType, NOT use "container-script".
+	if payload["explicit_type"] != "vertex-ai" {
+		t.Errorf("explicit_type=%v, want vertex-ai (should reject container-script)", payload["explicit_type"])
+	}
+}
+
+func TestContainerScriptHarness_ApplyAuthSettings_RejectsAllImplementationNames(t *testing.T) {
+	// Verify that all known harness implementation names are rejected.
+	for _, implName := range []string{"container-script", "generic", "builtin", "passthrough"} {
+		t.Run(implName, func(t *testing.T) {
+			h, _ := newTestContainerScriptHarness(t)
+			agentHome := t.TempDir()
+			resolved := &api.ResolvedAuth{
+				Method: "container-script",
+				EnvVars: map[string]string{
+					"SCION_HARNESS_SELECTED_AUTH": implName,
+				},
+			}
+			if err := h.ApplyAuthSettings(agentHome, resolved); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(agentHome, ".scion", "harness", "inputs", "auth-candidates.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]interface{}
+			if err := json.Unmarshal(data, &payload); err != nil {
+				t.Fatalf("invalid JSON: %v", err)
+			}
+			// explicit_type must NOT be the implementation name.
+			if payload["explicit_type"] == implName {
+				t.Errorf("explicit_type=%v — should have been rejected", implName)
+			}
+		})
+	}
+}
+
+func TestIsHarnessImplementationName(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"container-script", true},
+		{"generic", true},
+		{"builtin", true},
+		{"passthrough", true},
+		{"vertex-ai", false},
+		{"api-key", false},
+		{"oauth-token", false},
+		{"auth-file", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsHarnessImplementationName(tt.name); got != tt.want {
+				t.Errorf("IsHarnessImplementationName(%q)=%v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+func newClaudeHarness(t *testing.T) *ContainerScriptHarness {
+	t.Helper()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "config.yaml"), "harness: claude\nimage: scion-claude:latest\n")
+	writeFile(t, filepath.Join(dir, "provision.py"), "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+	entry := config.HarnessConfigEntry{
+		Harness: "claude",
+		Image:   "scion-claude:latest",
+		Provisioner: &config.HarnessProvisionerConfig{
+			Type:             "builtin",
+			InterfaceVersion: 1,
+		},
+	}
+	h, err := NewContainerScriptHarness(dir, entry)
+	if err != nil {
+		t.Fatalf("NewContainerScriptHarness: %v", err)
+	}
+	return h
+}
+
+func TestContainerScriptHarness_ResolveAuth_VertexAICredentialTranslation(t *testing.T) {
+	// When the harness is "claude" and auth type is "vertex-ai", ResolveAuth
+	// must translate GCP env vars into Anthropic-specific env vars that Claude
+	// Code requires. This translation is normally done by the Python
+	// provisioner, but when provisioner type is "builtin" (no command), the
+	// Python script never runs and Go must handle it.
+	h := newClaudeHarness(t)
+
+	resolved, err := h.ResolveAuth(api.AuthConfig{
+		SelectedType:       "vertex-ai",
+		GoogleCloudProject: "my-project",
+		GoogleCloudRegion:  "us-central1",
+	})
+	if err != nil {
+		t.Fatalf("ResolveAuth: %v", err)
+	}
+
+	// Must set Anthropic-specific Vertex AI env vars.
+	if got := resolved.EnvVars["ANTHROPIC_VERTEX_PROJECT_ID"]; got != "my-project" {
+		t.Errorf("ANTHROPIC_VERTEX_PROJECT_ID=%q, want %q", got, "my-project")
+	}
+	if got := resolved.EnvVars["CLOUD_ML_REGION"]; got != "us-central1" {
+		t.Errorf("CLOUD_ML_REGION=%q, want %q", got, "us-central1")
+	}
+	if got := resolved.EnvVars["CLAUDE_CODE_USE_VERTEX"]; got != "1" {
+		t.Errorf("CLAUDE_CODE_USE_VERTEX=%q, want %q", got, "1")
+	}
+
+	// Must also still have the raw GCP env vars.
+	if got := resolved.EnvVars["GOOGLE_CLOUD_PROJECT"]; got != "my-project" {
+		t.Errorf("GOOGLE_CLOUD_PROJECT=%q, want %q", got, "my-project")
+	}
+	if got := resolved.EnvVars["GOOGLE_CLOUD_REGION"]; got != "us-central1" {
+		t.Errorf("GOOGLE_CLOUD_REGION=%q, want %q", got, "us-central1")
+	}
+}
+
+func TestContainerScriptHarness_ResolveAuth_VertexAIInferredFromProject(t *testing.T) {
+	// When SelectedType is empty but GoogleCloudProject is set, ResolveAuth
+	// should infer vertex-ai and apply the credential translation.
+	h := newClaudeHarness(t)
+
+	resolved, err := h.ResolveAuth(api.AuthConfig{
+		GoogleCloudProject: "inferred-project",
+		GoogleCloudRegion:  "europe-west1",
+	})
+	if err != nil {
+		t.Fatalf("ResolveAuth: %v", err)
+	}
+
+	if got := resolved.EnvVars["ANTHROPIC_VERTEX_PROJECT_ID"]; got != "inferred-project" {
+		t.Errorf("ANTHROPIC_VERTEX_PROJECT_ID=%q, want %q", got, "inferred-project")
+	}
+	if got := resolved.EnvVars["CLAUDE_CODE_USE_VERTEX"]; got != "1" {
+		t.Errorf("CLAUDE_CODE_USE_VERTEX=%q, want %q", got, "1")
+	}
+}
+
+func TestContainerScriptHarness_ResolveAuth_NoVertexTranslationForNonClaude(t *testing.T) {
+	// Vertex AI credential translation must NOT happen for non-Claude harnesses.
+	h, _ := newTestContainerScriptHarness(t) // harness name is "testharness"
+
+	resolved, err := h.ResolveAuth(api.AuthConfig{
+		SelectedType:       "vertex-ai",
+		GoogleCloudProject: "my-project",
+		GoogleCloudRegion:  "us-central1",
+	})
+	if err != nil {
+		t.Fatalf("ResolveAuth: %v", err)
+	}
+
+	// Must NOT set Anthropic-specific vars for non-Claude harness.
+	if _, ok := resolved.EnvVars["ANTHROPIC_VERTEX_PROJECT_ID"]; ok {
+		t.Error("ANTHROPIC_VERTEX_PROJECT_ID should not be set for non-Claude harness")
+	}
+	if _, ok := resolved.EnvVars["CLAUDE_CODE_USE_VERTEX"]; ok {
+		t.Error("CLAUDE_CODE_USE_VERTEX should not be set for non-Claude harness")
+	}
+	if _, ok := resolved.EnvVars["CLOUD_ML_REGION"]; ok {
+		t.Error("CLOUD_ML_REGION should not be set for non-Claude harness")
+	}
+}
+
+func TestContainerScriptHarness_ResolveAuth_NoVertexTranslationForAPIKey(t *testing.T) {
+	// When auth type is api-key, Vertex AI translation must not happen
+	// even for Claude harness.
+	h := newClaudeHarness(t)
+
+	resolved, err := h.ResolveAuth(api.AuthConfig{
+		SelectedType: "api-key",
+		EnvVars:      map[string]string{"ANTHROPIC_API_KEY": "sk-ant-test"},
+	})
+	if err != nil {
+		t.Fatalf("ResolveAuth: %v", err)
+	}
+
+	if _, ok := resolved.EnvVars["ANTHROPIC_VERTEX_PROJECT_ID"]; ok {
+		t.Error("ANTHROPIC_VERTEX_PROJECT_ID should not be set for api-key auth")
+	}
+	if _, ok := resolved.EnvVars["CLAUDE_CODE_USE_VERTEX"]; ok {
+		t.Error("CLAUDE_CODE_USE_VERTEX should not be set for api-key auth")
 	}
 }
 
@@ -862,5 +1089,73 @@ func TestResolve_LegacyBuiltinCodexNoDir(t *testing.T) {
 	}
 	if resolved.Implementation != "generic" {
 		t.Errorf("Implementation=%q want generic", resolved.Implementation)
+	}
+}
+
+// TestDiscoverExistingSecretFiles verifies that discoverExistingSecretFiles
+// returns two maps (env-type and file-type) of secret name to container-relative
+// path for non-empty files in the secrets directory, correctly categorised via
+// the harness auth config's required_files declarations.
+func TestDiscoverExistingSecretFiles(t *testing.T) {
+	h, _ := newTestContainerScriptHarness(t)
+	agentHome := t.TempDir()
+
+	// No secrets dir yet — should return nil, nil
+	envSecrets, fileSecrets := h.discoverExistingSecretFiles(agentHome)
+	if envSecrets != nil {
+		t.Errorf("expected nil env secrets for missing secrets dir, got %v", envSecrets)
+	}
+	if fileSecrets != nil {
+		t.Errorf("expected nil file secrets for missing secrets dir, got %v", fileSecrets)
+	}
+
+	// Set up auth config with a file-type secret so categorisation can be tested.
+	h.entry.Auth = &config.HarnessAuthMetadata{
+		Types: map[string]config.HarnessAuthTypeMetadata{
+			"claude": {
+				RequiredFiles: []config.HarnessAuthFileRequirement{
+					{Name: "CLAUDE_AUTH"},
+				},
+			},
+		},
+	}
+
+	// Create secrets dir with env-type, file-type, and empty files
+	secretDir := filepath.Join(agentHome, ".scion", "harness", "secrets")
+	if err := os.MkdirAll(secretDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(secretDir, "GOOGLE_CLOUD_PROJECT"), []byte("my-project"), 0600)
+	_ = os.WriteFile(filepath.Join(secretDir, "GOOGLE_CLOUD_REGION"), []byte("us-central1"), 0600)
+	_ = os.WriteFile(filepath.Join(secretDir, "CLAUDE_AUTH"), []byte("auth-token"), 0600)
+	_ = os.WriteFile(filepath.Join(secretDir, "EMPTY_SECRET"), []byte(""), 0600) // empty — should be skipped
+
+	envSecrets, fileSecrets = h.discoverExistingSecretFiles(agentHome)
+
+	// Env-type: GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_REGION
+	if len(envSecrets) != 2 {
+		t.Fatalf("expected 2 env secrets, got %d: %v", len(envSecrets), envSecrets)
+	}
+	if envSecrets["GOOGLE_CLOUD_PROJECT"] != "$HOME/.scion/harness/secrets/GOOGLE_CLOUD_PROJECT" {
+		t.Errorf("GOOGLE_CLOUD_PROJECT path = %q", envSecrets["GOOGLE_CLOUD_PROJECT"])
+	}
+	if envSecrets["GOOGLE_CLOUD_REGION"] != "$HOME/.scion/harness/secrets/GOOGLE_CLOUD_REGION" {
+		t.Errorf("GOOGLE_CLOUD_REGION path = %q", envSecrets["GOOGLE_CLOUD_REGION"])
+	}
+
+	// File-type: CLAUDE_AUTH (matches required_files in auth config)
+	if len(fileSecrets) != 1 {
+		t.Fatalf("expected 1 file secret, got %d: %v", len(fileSecrets), fileSecrets)
+	}
+	if fileSecrets["CLAUDE_AUTH"] != "$HOME/.scion/harness/secrets/CLAUDE_AUTH" {
+		t.Errorf("CLAUDE_AUTH path = %q", fileSecrets["CLAUDE_AUTH"])
+	}
+
+	// Empty secret should not appear in either map
+	if _, ok := envSecrets["EMPTY_SECRET"]; ok {
+		t.Error("empty secret file should not be included in env secrets")
+	}
+	if _, ok := fileSecrets["EMPTY_SECRET"]; ok {
+		t.Error("empty secret file should not be included in file secrets")
 	}
 }

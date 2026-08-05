@@ -34,6 +34,8 @@ import { customElement, property, state } from 'lit/decorators.js';
 import type { Skill } from '../../shared/types.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
 import { resourceStyles } from './resource-styles.js';
+import { showToast } from '../../utils/toast.js';
+import { showConfirm } from './confirm-dialog.js';
 
 export type InjectedSkillsScope = 'project' | 'user' | 'hub';
 
@@ -290,10 +292,24 @@ export class ScionInjectedSkillsPanel extends LitElement {
         font-size: 0.75rem;
         color: var(--scion-text-muted, #64748b);
         margin-top: 0.125rem;
+        display: inline-flex;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
         max-width: 300px;
+      }
+
+      .skill-uri-prefix {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        flex-shrink: 1;
+        min-width: 0;
+      }
+
+      .skill-uri-name {
+        white-space: nowrap;
+        flex-shrink: 0;
       }
 
       .skill-info {
@@ -769,8 +785,11 @@ export class ScionInjectedSkillsPanel extends LitElement {
         this.dialogError = 'Please select a skill from the search results';
         return;
       }
-      // Build a skill bank URI from the skill's slug
-      uri = `skill://${this.dialogSelectedSkill.slug}`;
+      // Build a canonical skill bank URI: skill://scion/<slug>
+      // A single-segment form (skill://<slug>) is now accepted by
+      // ParseSkillURI, but the two-segment form is the canonical stored
+      // shape and avoids ambiguity with the registry field.
+      uri = `skill://scion/${this.dialogSelectedSkill.slug}`;
     } else {
       const raw = this.dialogUri.trim();
       if (!raw) {
@@ -1074,6 +1093,31 @@ export class ScionInjectedSkillsPanel extends LitElement {
     `;
   }
 
+  /**
+   * Renders a skill URI with middle-truncation: the prefix (scheme + path)
+   * truncates with an ellipsis when space is tight, while the skill name
+   * (last path segment) is always fully visible.
+   */
+  private renderMiddleTruncatedUri(uri: string) {
+    if (!uri) {
+      return nothing;
+    }
+    const lastSlash = uri.lastIndexOf('/');
+    if (lastSlash === -1 || lastSlash === uri.length - 1) {
+      // No path separator or trailing slash — show the whole URI as-is
+      // (still needs nowrap to avoid wrapping in the flex container)
+      return html`<span class="skill-uri" title=${uri}
+        ><span class="skill-uri-name">${uri}</span></span
+      >`;
+    }
+    const prefix = uri.slice(0, lastSlash + 1);
+    const name = uri.slice(lastSlash + 1);
+    return html`<span class="skill-uri" title=${uri}
+      ><span class="skill-uri-prefix">${prefix}</span
+      ><span class="skill-uri-name">${name}</span></span
+    >`;
+  }
+
   private renderDescription(): string {
     switch (this.scope) {
       case 'project':
@@ -1159,7 +1203,7 @@ export class ScionInjectedSkillsPanel extends LitElement {
             ${row.skillName
               ? html`<span class="skill-name">${row.skillName}</span>`
               : nothing}
-            <span class="skill-uri">${row.uri}</span>
+            ${this.renderMiddleTruncatedUri(row.uri)}
             ${row.skillSlug
               ? html`<span class="skill-uri">/${row.skillSlug}</span>`
               : nothing}
@@ -1206,11 +1250,11 @@ export class ScionInjectedSkillsPanel extends LitElement {
 
   private async handleDeleteRow(row: SkillRow, rowIndex: number): Promise<void> {
     const label = row.skillName || row.uri;
-    if (!confirm(`Remove skill "${label}" from this ${this.scope === 'hub' ? 'hub' : this.scope === 'project' ? 'project' : 'profile'}?`)) {
+    if (!(await showConfirm(`Remove skill "${label}" from this ${this.scope === 'hub' ? 'hub' : this.scope === 'project' ? 'project' : 'profile'}?`))) {
       return;
     }
     // Guard against stale rowIndex: a concurrent drag-reorder between the click
-    // and the confirm() call could shift row positions. Re-find the row by its
+    // and the showConfirm() call could shift row positions. Re-find the row by its
     // stable identity (URI + id) before committing the delete.
     let resolvedIndex = rowIndex;
     const currentAtIndex = this.rows[rowIndex];
@@ -1224,7 +1268,7 @@ export class ScionInjectedSkillsPanel extends LitElement {
       await this.deleteEntry(row, resolvedIndex);
     } catch (err) {
       console.error('Failed to delete skill:', err);
-      alert(err instanceof Error ? err.message : 'Failed to remove skill');
+      showToast(err instanceof Error ? err.message : 'Failed to remove skill');
     } finally {
       this._deletingIndex = null;
     }

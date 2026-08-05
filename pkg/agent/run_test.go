@@ -1599,6 +1599,85 @@ profiles:
 	})
 }
 
+func TestHarnessAuthCorruptedValueNotPersisted(t *testing.T) {
+	// Regression test: when opts.HarnessAuth contains a harness implementation
+	// name (e.g. "container-script" from corrupted scion-agent.json), it must
+	// NOT be persisted to scion-agent.json. The guards at run.go:493 and
+	// run.go:754 prevent this.
+	tmpDir := t.TempDir()
+
+	oldWd, _ := os.Getwd()
+	_ = os.Chdir(tmpDir)
+	defer func() { _ = os.Chdir(oldWd) }()
+
+	originalHome := os.Getenv("HOME")
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
+	_ = os.Setenv("HOME", tmpDir)
+
+	globalScionDir := filepath.Join(tmpDir, ".scion")
+
+	hcDir := filepath.Join(globalScionDir, "harness-configs", "test-harness")
+	_ = os.MkdirAll(hcDir, 0755)
+	_ = os.WriteFile(filepath.Join(hcDir, "config.yaml"), []byte("harness: gemini\nuser: scion\nimage: test-image:latest\n"), 0644)
+
+	tplDir := filepath.Join(globalScionDir, "templates", "default")
+	_ = os.MkdirAll(tplDir, 0755)
+	_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(`{"default_harness_config": "test-harness"}`), 0644)
+
+	_ = os.WriteFile(filepath.Join(globalScionDir, "settings.yaml"), []byte(`schema_version: "1"
+active_profile: local
+profiles:
+  local:
+    runtime: docker
+`), 0644)
+
+	projectDir := filepath.Join(tmpDir, "project")
+	projectScionDir := filepath.Join(projectDir, ".scion")
+	_ = os.MkdirAll(projectScionDir, 0755)
+
+	for _, implName := range []string{"container-script", "generic", "builtin", "passthrough"} {
+		t.Run(implName, func(t *testing.T) {
+			mockRT := &runtime.MockRuntime{
+				ListFunc: func(ctx context.Context, labelFilter map[string]string) ([]api.AgentInfo, error) {
+					return []api.AgentInfo{}, nil
+				},
+				RunFunc: func(ctx context.Context, config runtime.RunConfig) (string, error) {
+					return "mock-id", nil
+				},
+			}
+
+			agentName := "corrupt-" + implName
+			agentDir := filepath.Join(projectScionDir, "agents", agentName)
+			_ = os.MkdirAll(filepath.Join(agentDir, "home"), 0755)
+			// Simulate corrupted scion-agent.json with harness implementation name
+			_ = os.WriteFile(filepath.Join(agentDir, "scion-agent.json"), []byte(`{
+				"harness": "gemini",
+				"auth_selectedType": "`+implName+`"
+			}`), 0644)
+
+			mgr := NewManager(mockRT)
+			_, err := mgr.Start(context.Background(), api.StartOptions{
+				Name:        agentName,
+				ProjectPath: projectScionDir,
+				NoAuth:      true,
+				HarnessAuth: implName, // corrupted value from Hub
+			})
+			if err != nil {
+				t.Fatalf("Start failed: %v", err)
+			}
+
+			data, err := os.ReadFile(filepath.Join(agentDir, "scion-agent.json"))
+			if err != nil {
+				t.Fatalf("failed to read scion-agent.json: %v", err)
+			}
+			// The corrupted implementation name must NOT appear as auth_selectedType.
+			if strings.Contains(string(data), `"`+implName+`"`) {
+				t.Errorf("scion-agent.json still contains corrupted value %q: %s", implName, string(data))
+			}
+		})
+	}
+}
+
 func TestBuildAgentEnv_TelemetryNoOverrideExplicit(t *testing.T) {
 	// Explicit opts.Env values must not be overwritten by telemetry config.
 	enabled := true
@@ -1790,17 +1869,20 @@ func TestFilterResolvedSecretsForResolvedAuth(t *testing.T) {
 	}
 }
 
-func TestIsAuthEnvKey_BuiltinKeys(t *testing.T) {
-	builtins := []string{
-		"GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY",
-		"CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY",
+func TestIsAuthEnvKey_GCPSharedKeys(t *testing.T) {
+	// GCP shared fields are always auth-related regardless of config
+	gcpKeys := []string{
 		"GOOGLE_CLOUD_PROJECT", "GCP_PROJECT", "ANTHROPIC_VERTEX_PROJECT_ID",
 		"GOOGLE_CLOUD_REGION", "CLOUD_ML_REGION", "GOOGLE_CLOUD_LOCATION",
 	}
-	for _, key := range builtins {
+	for _, key := range gcpKeys {
 		if !isAuthEnvKey(key) {
 			t.Errorf("isAuthEnvKey(%q) = false, want true", key)
 		}
+	}
+	// Per-provider keys are no longer built-in — they come from config
+	if isAuthEnvKey("GEMINI_API_KEY") {
+		t.Error("isAuthEnvKey(GEMINI_API_KEY) without config = true, want false")
 	}
 	if isAuthEnvKey("RANDOM_ENV_VAR") {
 		t.Error("isAuthEnvKey(RANDOM_ENV_VAR) = true, want false")
@@ -1812,6 +1894,7 @@ func TestIsAuthEnvKey_ConfigDrivenKeys(t *testing.T) {
 		"COPILOT_GITHUB_TOKEN": {},
 		"GH_TOKEN":             {},
 		"GITHUB_TOKEN":         {},
+		"GEMINI_API_KEY":       {},
 	}
 
 	if !isAuthEnvKey("COPILOT_GITHUB_TOKEN", configKeys) {
@@ -1820,9 +1903,13 @@ func TestIsAuthEnvKey_ConfigDrivenKeys(t *testing.T) {
 	if !isAuthEnvKey("GH_TOKEN", configKeys) {
 		t.Error("isAuthEnvKey(GH_TOKEN, configKeys) = false, want true")
 	}
-	// Built-in keys still work with config keys present
+	// Config-declared per-provider keys work with config keys present
 	if !isAuthEnvKey("GEMINI_API_KEY", configKeys) {
 		t.Error("isAuthEnvKey(GEMINI_API_KEY, configKeys) = false, want true")
+	}
+	// GCP shared keys always work
+	if !isAuthEnvKey("GOOGLE_CLOUD_PROJECT", configKeys) {
+		t.Error("isAuthEnvKey(GOOGLE_CLOUD_PROJECT, configKeys) = false, want true")
 	}
 	// Unknown key is still not auth
 	if isAuthEnvKey("RANDOM_VAR", configKeys) {

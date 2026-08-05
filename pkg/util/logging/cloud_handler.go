@@ -22,11 +22,14 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"time"
 
 	gcplog "cloud.google.com/go/logging"
 	logpb "cloud.google.com/go/logging/apiv2/loggingpb"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/version"
 )
 
 // Environment variable names for Cloud Logging configuration.
@@ -57,6 +60,8 @@ type CloudLoggingConfig struct {
 	Component string
 	// HubName is the logical hub identity used in the "hub" log label.
 	HubName string
+	// HubID is the stable unique hub instance ID used in the "hub_id" log label.
+	HubID string
 	// BufferedByteLimit is the maximum bytes the Cloud Logging client
 	// will buffer. Prevents unbounded memory growth when Cloud Logging
 	// is temporarily unavailable. Default: 8 MiB.
@@ -74,10 +79,16 @@ type CloudHandler struct {
 	level     slog.Level
 	component string
 	hubName   string
+	hubID     string
 	hostname  string
 	projectID string
+	version   string
 	attrs     []slog.Attr
 	groups    []string
+
+	// logHook, when non-nil, receives each entry instead of sending
+	// it to the Cloud Logging API. Used only in tests.
+	logHook func(gcplog.Entry)
 }
 
 // NewCloudHandler creates a new CloudHandler that sends logs to Cloud Logging.
@@ -126,8 +137,10 @@ func NewCloudHandler(ctx context.Context, config CloudLoggingConfig, level slog.
 		level:     level,
 		component: config.Component,
 		hubName:   config.HubName,
+		hubID:     config.HubID,
 		hostname:  hostname,
 		projectID: projectID,
+		version:   version.Short(),
 	}
 
 	cleanup := func() {
@@ -183,6 +196,22 @@ func (h *CloudHandler) Handle(_ context.Context, r slog.Record) error {
 		}
 	}
 
+	// Add serviceContext for GCP Error Reporting (all levels)
+	payload["serviceContext"] = map[string]any{
+		"service": h.component,
+		"version": h.version,
+	}
+
+	// ERROR+ only: stack trace and @type for GCP Error Reporting
+	if r.Level >= slog.LevelError {
+		if _, hasST := payload["stack_trace"]; !hasST {
+			payload["stack_trace"] = string(debug.Stack())
+		}
+		if _, hasType := payload["@type"]; !hasType {
+			payload["@type"] = errorReportingType
+		}
+	}
+
 	// Map slog level to Cloud Logging severity
 	severity := slogLevelToSeverity(r.Level)
 
@@ -192,6 +221,9 @@ func (h *CloudHandler) Handle(_ context.Context, r slog.Record) error {
 	}
 	if h.hubName != "" {
 		labels["hub"] = h.hubName
+	}
+	if h.hubID != "" {
+		labels["hub_id"] = h.hubID
 	}
 	if h.hostname != "" {
 		labels["node"] = h.hostname
@@ -226,6 +258,10 @@ func (h *CloudHandler) Handle(_ context.Context, r slog.Record) error {
 		delete(payload, "message")
 	}
 
+	if h.logHook != nil {
+		h.logHook(entry)
+		return nil
+	}
 	h.logger.Log(entry)
 	return nil
 }
@@ -241,10 +277,13 @@ func (h *CloudHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		level:     h.level,
 		component: h.component,
 		hubName:   h.hubName,
+		hubID:     h.hubID,
 		hostname:  h.hostname,
 		projectID: h.projectID,
+		version:   h.version,
 		attrs:     newAttrs,
 		groups:    h.groups,
+		logHook:   h.logHook,
 	}
 }
 
@@ -259,10 +298,13 @@ func (h *CloudHandler) WithGroup(name string) slog.Handler {
 		level:     h.level,
 		component: h.component,
 		hubName:   h.hubName,
+		hubID:     h.hubID,
 		hostname:  h.hostname,
 		projectID: h.projectID,
+		version:   h.version,
 		attrs:     h.attrs,
 		groups:    newGroups,
+		logHook:   h.logHook,
 	}
 }
 
@@ -274,7 +316,8 @@ func (h *CloudHandler) Client() *gcplog.Client {
 
 // NewCloudHandlerFromClient creates a CloudHandler from an existing client.
 // This avoids opening a second connection for the request log stream.
-func NewCloudHandlerFromClient(client *gcplog.Client, logID, component, hubName string, level slog.Level) *CloudHandler {
+// hubID is optional — when non-empty, it is emitted as the "hub_id" label.
+func NewCloudHandlerFromClient(client *gcplog.Client, logID, component, hubName, hubID string, level slog.Level) *CloudHandler {
 	logger := client.Logger(logID)
 	hostname, _ := os.Hostname()
 	return &CloudHandler{
@@ -283,8 +326,10 @@ func NewCloudHandlerFromClient(client *gcplog.Client, logID, component, hubName 
 		level:     level,
 		component: component,
 		hubName:   hubName,
+		hubID:     hubID,
 		hostname:  hostname,
 		projectID: resolveProjectID(),
+		version:   version.Short(),
 	}
 }
 
@@ -342,13 +387,21 @@ func resolveProjectID() string {
 	return os.Getenv(EnvGoogleCloudProject)
 }
 
+// Cloud Logging log IDs for the server's log streams.
+const (
+	// ServerLogID is the Cloud Logging log ID for the main server log.
+	ServerLogID = "scion-server"
+	// AgentLogID is the Cloud Logging log ID for the agent log.
+	AgentLogID = "scion-agents"
+)
+
 // resolveLogID returns the Cloud Logging log ID from environment variables.
-// Defaults to "scion-server" if not set.
+// Defaults to ServerLogID if not set.
 func resolveLogID() string {
 	if v := os.Getenv(EnvCloudLoggingLogID); v != "" {
 		return v
 	}
-	return "scion-server"
+	return ServerLogID
 }
 
 // isCloudLoggingEnabled checks if direct Cloud Logging is enabled via env var.

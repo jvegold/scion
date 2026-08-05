@@ -90,6 +90,7 @@ var koanfPathToJSONField = map[string]map[string]string{
 	},
 	"lifecycle": {
 		"server.hub.auto_suspend_stalled":     "auto_suspend_stalled",
+		"server.hub.stalled_threshold":        "stalled_threshold",
 		"server.hub.soft_delete_retention":    "soft_delete_retention",
 		"server.hub.soft_delete_retain_files": "soft_delete_retain_files",
 	},
@@ -104,6 +105,9 @@ var koanfPathToJSONField = map[string]map[string]string{
 		"server.github_app.installation_url": "installation_url",
 		"server.github_app.private_key_path": "private_key_path",
 	},
+	"auto_expose_ports": {
+		"auto_expose_ports.enabled": "enabled",
+	},
 }
 
 // jsonFieldToKoanfPaths maps section name → json field → koanf path for the
@@ -116,6 +120,7 @@ var jsonFieldToKoanfPaths = map[string]map[string]string{
 	},
 	"lifecycle": {
 		"auto_suspend_stalled":     "server.hub.auto_suspend_stalled",
+		"stalled_threshold":        "server.hub.stalled_threshold",
 		"soft_delete_retention":    "server.hub.soft_delete_retention",
 		"soft_delete_retain_files": "server.hub.soft_delete_retain_files",
 	},
@@ -129,6 +134,9 @@ var jsonFieldToKoanfPaths = map[string]map[string]string{
 		"webhooks_enabled": "server.github_app.webhooks_enabled",
 		"installation_url": "server.github_app.installation_url",
 		"private_key_path": "server.github_app.private_key_path",
+	},
+	"auto_expose_ports": {
+		"enabled": "auto_expose_ports.enabled",
 	},
 }
 

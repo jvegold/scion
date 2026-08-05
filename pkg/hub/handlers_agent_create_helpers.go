@@ -417,6 +417,44 @@ func (s *Server) populateAgentConfig(ctx context.Context, agent *store.Agent, pr
 		}
 	}
 
+	// Apply project-level AutoExposePortsEnabled override.
+	// Only set the env var if the agent's own config does not already specify it,
+	// so agent-level settings take priority over project-level.
+	if project != nil && project.Annotations != nil {
+		if val, ok := project.Annotations[projectSettingAutoExposePortsEnabled]; ok {
+			enabled, err := strconv.ParseBool(val)
+			if err == nil {
+				if agent.AppliedConfig.InlineConfig == nil {
+					agent.AppliedConfig.InlineConfig = &api.ScionConfig{}
+				}
+				if agent.AppliedConfig.InlineConfig.Env == nil {
+					agent.AppliedConfig.InlineConfig.Env = make(map[string]string)
+				}
+				if _, exists := agent.AppliedConfig.InlineConfig.Env["SCION_AUTO_EXPOSE_PORTS"]; !exists {
+					agent.AppliedConfig.InlineConfig.Env["SCION_AUTO_EXPOSE_PORTS"] = strconv.FormatBool(enabled)
+				}
+			}
+		}
+	}
+
+	// Apply hub-level AutoExposePortsDefault as lowest-priority fallback.
+	// Injects SCION_AUTO_EXPOSE_PORTS if neither the agent config nor
+	// the project annotation already set it, respecting both true and false defaults.
+	s.mu.RLock()
+	hubAutoExposeDefault := s.config.AutoExposePortsDefault
+	s.mu.RUnlock()
+	if hubAutoExposeDefault != nil {
+		if agent.AppliedConfig.InlineConfig == nil {
+			agent.AppliedConfig.InlineConfig = &api.ScionConfig{}
+		}
+		if agent.AppliedConfig.InlineConfig.Env == nil {
+			agent.AppliedConfig.InlineConfig.Env = make(map[string]string)
+		}
+		if _, exists := agent.AppliedConfig.InlineConfig.Env["SCION_AUTO_EXPOSE_PORTS"]; !exists {
+			agent.AppliedConfig.InlineConfig.Env["SCION_AUTO_EXPOSE_PORTS"] = strconv.FormatBool(*hubAutoExposeDefault)
+		}
+	}
+
 	// Merge injected skills from hub/user/project scopes into InlineConfig.Skills
 	// so the provisioner's existing Step 3b handles them.
 	s.mergeInjectedSkills(ctx, agent, project)
@@ -447,6 +485,9 @@ func (s *Server) mergeInjectedSkills(ctx context.Context, agent *store.Agent, pr
 			hubRefs = append(setting.System, setting.UserDefined...)
 		}
 	}
+	for i := range hubRefs {
+		hubRefs[i].Scope = "hub"
+	}
 
 	// Fetch user-scope injected skills.
 	var userRefs []api.SkillReference
@@ -461,6 +502,9 @@ func (s *Server) mergeInjectedSkills(ctx context.Context, agent *store.Agent, pr
 				userRefs = append(userRefs, si.ToSkillReference())
 			}
 		}
+	}
+	for i := range userRefs {
+		userRefs[i].Scope = "user"
 	}
 
 	// Fetch project-scope injected skills.
@@ -477,9 +521,26 @@ func (s *Server) mergeInjectedSkills(ctx context.Context, agent *store.Agent, pr
 			}
 		}
 	}
+	// Copy the slice to avoid mutating the original SkillReference values.
+	if len(projectRefs) > 0 {
+		copied := make([]api.SkillReference, len(projectRefs))
+		copy(copied, projectRefs)
+		projectRefs = copied
+	}
+	for i := range projectRefs {
+		projectRefs[i].Scope = "project"
+	}
 
 	// Template refs are already in InlineConfig.Skills (highest precedence).
-	templateRefs := agent.AppliedConfig.InlineConfig.Skills
+	// Copy the slice to avoid mutating the caller's InlineConfig.Skills in place.
+	var templateRefs []api.SkillReference
+	if len(agent.AppliedConfig.InlineConfig.Skills) > 0 {
+		templateRefs = make([]api.SkillReference, len(agent.AppliedConfig.InlineConfig.Skills))
+		copy(templateRefs, agent.AppliedConfig.InlineConfig.Skills)
+		for i := range templateRefs {
+			templateRefs[i].Scope = "template"
+		}
+	}
 
 	// Merge: hub → user → project → template (lowest to highest precedence).
 	merged := mergeSkillRefs(hubRefs, userRefs, projectRefs, templateRefs)
@@ -1088,12 +1149,7 @@ func (s *Server) hasRequiredAuthCredentials(ctx context.Context, agent *store.Ag
 	}
 
 	// Explicit auth type selected or no authMeta — use config-driven check when available.
-	var keyGroups [][]string
-	if authMeta != nil {
-		keyGroups = harness.RequiredAuthEnvKeysFromConfig(authMeta, agent.AppliedConfig.HarnessAuth)
-	} else {
-		keyGroups = harness.RequiredAuthEnvKeys(harnessType, agent.AppliedConfig.HarnessAuth)
-	}
+	keyGroups := harness.RequiredAuthEnvKeysFromConfig(authMeta, agent.AppliedConfig.HarnessAuth)
 	if len(keyGroups) == 0 && authMeta == nil {
 		return true, nil
 	}

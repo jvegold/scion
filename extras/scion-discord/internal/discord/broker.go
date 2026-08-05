@@ -88,6 +88,8 @@ func (e *hubError) userFacingMessage() string {
 		return "Target agent not found. Use `/scion agents` to see available agents."
 	case "forbidden":
 		return "You don't have permission to message this agent."
+	case "agent_not_running":
+		return "Agent is not running. It may be stopped, suspended, or in error state."
 	case "broker_auth_failed", "unauthorized":
 		return "Authentication error — please contact an administrator."
 	default:
@@ -158,6 +160,7 @@ type DiscordBroker struct {
 
 	agentCacheTTL  time.Duration
 	projectSlugMap map[string]string // injected by hub: projectID -> slug
+	downloadsPath  string            // override for file download directory; empty = default
 
 	config *Config
 
@@ -308,6 +311,11 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 			b.agentCacheTTL = d
 		}
 
+		// Parse optional downloads directory override.
+		if v, ok := config["downloads_path"]; ok && v != "" {
+			b.downloadsPath = v
+		}
+
 		b.log.Info("Discord broker phase 1 configured",
 			"application_id", cfg.ApplicationID,
 			"guild_ids", cfg.GuildIDs,
@@ -345,9 +353,11 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 			appID = b.config.ApplicationID
 			guildIDs = b.config.GuildIDs
 		}
-		b.commands = NewCommandHandler(b.store, b.session, b.hubClient, b.deliverInbound, appID, guildIDs, b.agentCacheTTL, b.log)
+		sendSearchRoot := config["send_search_root"]
+		b.commands = NewCommandHandler(b.store, b.session, b.hubClient, b.deliverInbound, appID, guildIDs, b.agentCacheTTL, sendSearchRoot, b.log)
 		b.callbacks = NewCallbackHandler(b.store, b.session, b.hubClient, b.deliverInbound, b.log)
-		b.registration = NewRegistrationHandler(b.store, b.session, b.hubURL, b.hmacKey, b.brokerID, b.httpClient, b.log)
+		registerURL := config["register_url"]
+		b.registration = NewRegistrationHandler(b.store, b.session, b.hubURL, registerURL, b.hmacKey, b.brokerID, b.httpClient, b.log)
 
 		// Parse hub-injected project slug map (projectID -> slug).
 		if slugMapJSON, ok := config["project_slug_map"]; ok && slugMapJSON != "" {
@@ -1226,7 +1236,7 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		if isBotMentioned(m, botUserID) {
 			unresolved := extractUnresolvedMentions(m.Content, botUserID, agents)
 			if len(unresolved) > 0 {
-				errMsg := fmt.Sprintf("Unknown agent: %q. Use `/scion agents` to see available agents.", unresolved[0])
+				errMsg := fmt.Sprintf("Unknown agent: %s. Use `/scion agents` to see available agents.", strings.Join(unresolved, ", "))
 				s.ChannelMessageSend(channelID, errMsg)
 			}
 		}
@@ -1253,6 +1263,29 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 			// User resolution via store mapping is not yet wired up.
 			return "", false
 		})
+
+		// If the user typed an unknown @mention at the start, show an error
+		// instead of silently routing to the default agent.
+		hasUnknownStartMention := false
+		for _, sm := range classified.StartMentions {
+			if sm.Kind == "unknown" {
+				hasUnknownStartMention = true
+				break
+			}
+		}
+		if hasUnknownStartMention && countAgentStartMentions(classified) == 0 {
+			var unresolved []string
+			for _, sm := range classified.StartMentions {
+				if sm.Kind == "unknown" {
+					unresolved = append(unresolved, sm.Name)
+				}
+			}
+			if len(unresolved) > 0 {
+				errMsg := fmt.Sprintf("Unknown agent: %s. Use `/scion agents` to see available agents.", strings.Join(unresolved, ", "))
+				s.ChannelMessageSend(channelID, errMsg)
+				return
+			}
+		}
 	}
 
 	// Determine which agent slugs are start-mentions (to strip from text).
@@ -1271,8 +1304,12 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 	// Filter targets to only start-mention agents, or exclude body-mention agents if no start-mentions exist.
 	// Body-mention agents will be handled by the TypeMention delivery loop.
 	if !isAll {
-		if len(classified.StartMentions) > 0 {
-			startMentionSet := make(map[string]bool, len(classified.StartMentions))
+		// Count only agent-kind start mentions for filtering.
+		// Unknown-kind start mentions (non-existent agents) must not
+		// trigger filtering, otherwise they empty the target list.
+		agentStartMentions := countAgentStartMentions(classified)
+		if agentStartMentions > 0 {
+			startMentionSet := make(map[string]bool, agentStartMentions)
 			for _, sm := range classified.StartMentions {
 				if sm.Kind == "agent" {
 					startMentionSet[strings.ToLower(sm.Name)] = true
@@ -1307,7 +1344,7 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		}
 
 		// If body-mention filter emptied targets, restore default agent so instruction is delivered.
-		if len(targets) == 0 && len(classified.StartMentions) == 0 && effectiveDefault != "" && !hasNonBotMentions(m.Message, botUserID) {
+		if len(targets) == 0 && agentStartMentions == 0 && effectiveDefault != "" && !hasNonBotMentions(m.Message, botUserID) {
 			text := strings.TrimSpace(m.Content)
 			if text != "" && !strings.HasPrefix(text, "/") {
 				targets = []string{effectiveDefault}
@@ -1637,6 +1674,11 @@ func (b *DiscordBroker) resolveThreadParent(channelID string) (parentID string, 
 	if ch == nil || err != nil {
 		ch, err = session.Channel(channelID)
 		if err != nil {
+			// Intentionally NOT cached: a transient REST failure must not
+			// poison the cache. Returning ("", false) lets the caller
+			// retry on the next lookup. Compare with the fix in
+			// commands.go's resolveChannelLink (issue #576).
+			b.log.Error("Failed to resolve thread parent", "channel_id", channelID, "error", err)
 			return "", false
 		}
 	}
@@ -1979,7 +2021,13 @@ func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *disc
 	timestamp := time.Now().Unix()
 	destName := fmt.Sprintf("discord_%d_%s", timestamp, fileName)
 
-	hostDir := filepath.Join("/home/scion/.scion/projects", projectSlug, "downloads")
+	// Use configured downloads_path if set; otherwise default to project dir.
+	var hostDir string
+	if b.downloadsPath != "" {
+		hostDir = strings.ReplaceAll(b.downloadsPath, "{project_slug}", projectSlug)
+	} else {
+		hostDir = filepath.Join("/home/scion/.scion/projects", projectSlug, "downloads")
+	}
 	if err := os.MkdirAll(hostDir, 0o755); err != nil {
 		return "", "", fmt.Errorf("create downloads dir: %w", err)
 	}
@@ -1997,7 +2045,14 @@ func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *disc
 		return "", "", fmt.Errorf("write file: %w", err)
 	}
 
-	agentPath = filepath.Join("/workspace/downloads", destName)
+	// Derive the agent-visible path from the same base used to save the file.
+	// When a custom downloads_path is configured, the agent sees that path
+	// directly; otherwise it sees the conventional /workspace/downloads mount.
+	if b.downloadsPath != "" {
+		agentPath = filepath.Join(strings.ReplaceAll(b.downloadsPath, "{project_slug}", projectSlug), destName)
+	} else {
+		agentPath = filepath.Join("/workspace/downloads", destName)
+	}
 	contentType := att.ContentType
 	if contentType == "" {
 		contentType = "file"

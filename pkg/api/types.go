@@ -372,13 +372,15 @@ type TelemetryConfig struct {
 
 // TelemetryCloudConfig holds cloud OTLP forwarding settings.
 type TelemetryCloudConfig struct {
-	Enabled  *bool             `json:"enabled,omitempty" yaml:"enabled,omitempty"`
-	Endpoint string            `json:"endpoint,omitempty" yaml:"endpoint,omitempty"`
-	Protocol string            `json:"protocol,omitempty" yaml:"protocol,omitempty"`
-	Headers  map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
-	TLS      *TelemetryTLS     `json:"tls,omitempty" yaml:"tls,omitempty"`
-	Batch    *TelemetryBatch   `json:"batch,omitempty" yaml:"batch,omitempty"`
-	Provider string            `json:"provider,omitempty" yaml:"provider,omitempty"`
+	Enabled      *bool             `json:"enabled,omitempty" yaml:"enabled,omitempty"`
+	Endpoint     string            `json:"endpoint,omitempty" yaml:"endpoint,omitempty"`
+	Protocol     string            `json:"protocol,omitempty" yaml:"protocol,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
+	TLS          *TelemetryTLS     `json:"tls,omitempty" yaml:"tls,omitempty"`
+	Batch        *TelemetryBatch   `json:"batch,omitempty" yaml:"batch,omitempty"`
+	Provider     string            `json:"provider,omitempty" yaml:"provider,omitempty"`
+	GCPProjectID *string           `json:"gcp_project_id,omitempty" yaml:"gcp_project_id,omitempty"`
+	CloudLogging *bool             `json:"cloud_logging,omitempty" yaml:"cloud_logging,omitempty"`
 }
 
 // TelemetryTLS holds TLS settings for OTLP export.
@@ -499,24 +501,14 @@ func (c *ScionConfig) IsDetached() bool {
 }
 
 type AuthConfig struct {
-	// Google/Gemini auth
-	GeminiAPIKey         string
-	GoogleAPIKey         string
+	// GCP shared fields — used across vertex-ai harnesses and have
+	// special handling. These remain as first-class fields because they
+	// participate in multi-source fallback resolution (e.g.
+	// GOOGLE_CLOUD_PROJECT | GCP_PROJECT | ANTHROPIC_VERTEX_PROJECT_ID)
+	// and are referenced by ResolveAuth for vertex-ai credential translation.
 	GoogleAppCredentials string
 	GoogleCloudProject   string
 	GoogleCloudRegion    string
-	OAuthCreds           string
-
-	// Anthropic auth
-	AnthropicAPIKey  string
-	ClaudeOAuthToken string // CLAUDE_CODE_OAUTH_TOKEN (long-lived, from `claude setup-token`)
-	ClaudeAuthFile   string // ~/.claude/.credentials.json path (rotating refresh-token store)
-
-	// OpenAI/Codex auth
-	OpenAIAPIKey     string
-	CodexAPIKey      string
-	CodexAuthFile    string
-	OpenCodeAuthFile string
 
 	// GCP metadata server mode ("block", "passthrough", "assign").
 	// When "assign", a GCP service account is available via the metadata
@@ -528,9 +520,15 @@ type AuthConfig struct {
 
 	// EnvVars holds config-driven auth env vars gathered from harness
 	// config metadata (auth.types[*].required_env). These flow through
-	// the auth pipeline alongside the hardcoded fields above, enabling
-	// new harnesses to declare auth requirements without Go code changes.
+	// the auth pipeline as the sole source of per-provider credentials,
+	// enabling harnesses to declare auth requirements without Go code changes.
 	EnvVars map[string]string
+
+	// Files holds config-driven file-based auth credentials gathered from
+	// harness config metadata (auth.types[*].required_files). Each entry
+	// maps a field name (e.g. "ClaudeAuthFile") to the host path of the
+	// credential file. These replace the former per-provider file fields.
+	Files map[string]string
 }
 
 // ResolvedAuth represents the single best auth method selected by a harness's
@@ -592,10 +590,11 @@ type AgentInfo struct {
 	Warnings   []string          `json:"warnings,omitempty"`
 
 	// Timestamps
-	Created   time.Time `json:"created,omitempty"`   // When the agent was created
-	Updated   time.Time `json:"updated,omitempty"`   // Last modification timestamp
-	LastSeen  time.Time `json:"lastSeen,omitempty"`  // Last heartbeat/status report
-	DeletedAt time.Time `json:"deletedAt,omitempty"` // When the agent was soft-deleted
+	Created           time.Time `json:"created,omitempty"`           // When the agent was created
+	Updated           time.Time `json:"updated,omitempty"`           // Last modification timestamp
+	LastSeen          time.Time `json:"lastSeen,omitempty"`          // Last heartbeat/status report
+	LastActivityEvent time.Time `json:"lastActivityEvent,omitempty"` // Last meaningful activity change
+	DeletedAt         time.Time `json:"deletedAt,omitempty"`         // When the agent was soft-deleted
 
 	// Ownership & access
 	CreatedBy  string   `json:"createdBy,omitempty"`  // User/system that created the agent
@@ -684,6 +683,10 @@ type SkillReference struct {
 	URI      string `json:"uri" yaml:"uri" koanf:"uri"`
 	As       string `json:"as,omitempty" yaml:"as,omitempty" koanf:"as"`
 	Optional bool   `json:"optional,omitempty" yaml:"optional,omitempty" koanf:"optional"`
+	// Scope indicates the injection source of this skill reference.
+	// Valid values: "hub", "user", "project", "template", "platform", "" (empty = lowest precedence).
+	// Used for destination-name collision resolution: higher-scope skills win.
+	Scope string `json:"scope,omitempty" yaml:"scope,omitempty" koanf:"scope"`
 }
 
 // SkillInjectionEntry is the API representation of one injected-skills list entry.

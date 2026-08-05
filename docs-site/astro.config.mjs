@@ -29,8 +29,12 @@ const hostedUserGuide = {
 		{ label: 'Connecting to a Hub', slug: 'hosted/user/hosted-user' },
 		{ label: 'User Access Tokens', slug: 'hosted/user/personal-access-tokens' },
 		{ label: 'Secrets & Environment', slug: 'hosted/user/secrets' },
+		{ label: 'Pre-Start Hooks', slug: 'hosted/user/pre-start-hooks' },
+		{ label: 'Port Forwarding & Auto-Expose', slug: 'hosted/user/port-forwarding' },
 		{ label: 'Messaging & Notifications', slug: 'hosted/user/messaging' },
+		{ label: 'Scheduling & Events', slug: 'hosted/user/scheduling' },
 		{ label: 'External Channels', slug: 'hosted/user/external-channels' },
+		{ label: 'A2A Protocol Bridge', slug: 'hosted/user/a2a-bridge' },
 	],
 };
 
@@ -88,7 +92,16 @@ export default defineConfig({
 						{ label: 'Philosophy', slug: 'philosophy' },
 						{ label: 'Supported Harnesses', slug: 'supported-harnesses' },
 						{ label: 'Glossary', slug: 'glossary' },
-						{ label: 'Release Notes', slug: 'release-notes' },
+						{
+							label: 'Release Notes',
+							items: [
+								{ label: 'Overview', slug: 'release-notes' },
+								{ label: 'Jul 27 -- Aug 2', slug: 'release-notes/2026-07-27' },
+								{ label: 'Jul 19 -- 25', slug: 'release-notes/2026-07-19' },
+								{ label: 'Jul 12 -- 19', slug: 'release-notes/2026-07-12' },
+								{ label: 'Archive (Daily)', slug: 'release-notes-archive' },
+							],
+						},
 					],
 				},
 				{
@@ -98,6 +111,7 @@ export default defineConfig({
 						{ label: 'Onboarding Wizard', slug: 'getting-started/onboarding' },
 						{ label: 'Tutorial', slug: 'getting-started/tutorial' },
 						{ label: 'Setting Up Telegram', slug: 'getting-started/telegram' },
+						{ label: 'Setting Up Discord', slug: 'getting-started/discord' },
 					],
 				},
 				{

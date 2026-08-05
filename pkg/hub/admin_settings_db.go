@@ -194,6 +194,8 @@ func applySnapshotToResponse(resp *ServerConfigResponse, snap Layer1Snapshot) {
 	resp.DefaultMaxModelCalls = snap.DefaultMaxModelCalls
 	resp.DefaultMaxDuration = snap.DefaultMaxDuration
 	resp.DefaultResources = snap.DefaultResources
+	resp.DefaultModel = snap.DefaultModel
+	resp.DefaultThinkingLevel = snap.DefaultThinkingLevel
 
 	// Telemetry — always set from snapshot (nil = no telemetry configured).
 	resp.Telemetry = snap.TelemetryConfig
@@ -218,6 +220,7 @@ func applySnapshotToResponse(resp *ServerConfigResponse, snap Layer1Snapshot) {
 	// true/false, so that a DB-explicit false overrides a file-loaded true.
 	b := snap.AutoSuspendStalled
 	resp.Server.Hub.AutoSuspendStalled = &b
+	resp.Server.Hub.StalledThreshold = snap.StalledThreshold
 	resp.Server.Hub.SoftDeleteRetention = snap.SoftDeleteRetention
 	b2 := snap.SoftDeleteRetainFiles
 	resp.Server.Hub.SoftDeleteRetainFiles = &b2
@@ -238,6 +241,13 @@ func applySnapshotToResponse(resp *ServerConfigResponse, snap Layer1Snapshot) {
 	// Notifications — always set from snapshot so an explicit empty DB
 	// value overrides file-loaded channels.
 	resp.Server.NotificationChannels = snap.NotificationChannels
+
+	// Auto-expose ports
+	if snap.AutoExposePortsEnabled != nil {
+		resp.AutoExposePorts = &config.AutoExposePortsSettings{
+			Enabled: snap.AutoExposePortsEnabled,
+		}
+	}
 }
 
 // buildSectionMetadata reads the OperationalSettings cache to determine
@@ -650,6 +660,16 @@ func extractKoanfKeysFromRequest(req *ServerConfigUpdateRequest) []string {
 	if req.DefaultResources != nil {
 		keys = append(keys, "default_resources")
 	}
+	if req.DefaultModel != nil {
+		keys = append(keys, "default_model")
+	}
+	if req.DefaultThinkingLevel != nil {
+		keys = append(keys, "default_thinking_level")
+	}
+
+	if req.AutoExposePorts != nil {
+		keys = append(keys, "auto_expose_ports.enabled")
+	}
 
 	if req.Telemetry != nil {
 		keys = append(keys, "telemetry.enabled")
@@ -697,6 +717,9 @@ func extractKoanfKeysFromRequest(req *ServerConfigUpdateRequest) []string {
 			}
 			if hub.AutoSuspendStalled != nil {
 				keys = append(keys, "server.hub.auto_suspend_stalled")
+			}
+			if hub.StalledThreshold != "" {
+				keys = append(keys, "server.hub.stalled_threshold")
 			}
 			if hub.SoftDeleteRetention != "" {
 				keys = append(keys, "server.hub.soft_delete_retention")
@@ -927,6 +950,9 @@ func buildSingleSectionDoc(req *ServerConfigUpdateRequest, secName string, fp *f
 		d := &opsettings.LifecycleSettings{}
 		if req.Server != nil && req.Server.Hub != nil {
 			d.AutoSuspendStalled = req.Server.Hub.AutoSuspendStalled
+			if req.Server.Hub.StalledThreshold != "" {
+				d.StalledThreshold = req.Server.Hub.StalledThreshold
+			}
 			if req.Server.Hub.SoftDeleteRetention != "" {
 				d.SoftDeleteRetention = req.Server.Hub.SoftDeleteRetention
 			}
@@ -961,6 +987,16 @@ func buildSingleSectionDoc(req *ServerConfigUpdateRequest, secName string, fp *f
 		if req.DefaultResources != nil {
 			d.DefaultResources = req.DefaultResources
 		}
+		if req.DefaultModel != nil {
+			d.DefaultModel = *req.DefaultModel
+		}
+		if req.DefaultThinkingLevel != nil {
+			if *req.DefaultThinkingLevel > 0 {
+				d.DefaultThinkingLevel = req.DefaultThinkingLevel
+			} else {
+				d.DefaultThinkingLevel = nil
+			}
+		}
 		doc = d
 
 	case "endpoints":
@@ -994,6 +1030,13 @@ func buildSingleSectionDoc(req *ServerConfigUpdateRequest, secName string, fp *f
 			d.PrivateKeyPath = ga.PrivateKeyPath
 		}
 		doc = d
+
+	case "auto_expose_ports":
+		if req.AutoExposePorts != nil {
+			doc = req.AutoExposePorts
+		} else {
+			return nil, nil
+		}
 
 	case "notifications":
 		d := &opsettings.NotificationsSettings{}

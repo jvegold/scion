@@ -76,7 +76,8 @@
           "default": "text",
           "x-env-var": "SCION_SERVER_LOG_FORMAT",
           "x-since": "1"
-        }
+        },
+        "scheduler": { "$ref": "#/$defs/serverScheduler" }
       },
       "additionalProperties": false
     },
@@ -214,6 +215,21 @@
     "default_resources": {
       "$ref": "#/$defs/resourceSpec",
       "description": "Default resource requests/limits for new agents.",
+      "x-scope": "any",
+      "x-since": "1"
+    },
+    "default_model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Default LLM model alias or ID for new agents (e.g. 'small', 'large', 'claude-opus-4-8').",
+      "x-scope": "any",
+      "x-since": "1"
+    },
+    "default_thinking_level": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "description": "Default thinking/reasoning level for new agents (1-100). 0 is reserved as the clear sentinel.",
       "x-scope": "any",
       "x-since": "1"
     }
@@ -775,6 +791,12 @@
           "description": "Automatically suspend stalled agents.",
           "x-env-var": "SCION_SERVER_HUB_AUTO_SUSPEND_STALLED",
           "x-since": "1"
+        },
+        "stalled_threshold": {
+          "type": "string",
+          "description": "Duration before marking agents as stalled (e.g. '5m', '10m', '30m').",
+          "x-env-var": "SCION_SERVER_HUB_STALLED_THRESHOLD",
+          "x-since": "1"
         }
       }
     },
@@ -926,6 +948,30 @@
         "gcp_credentials": { "type": "string", "x-env-var": "SCION_SERVER_SECRETS_GCPCREDENTIALS" }
       }
     },
+    "serverScheduler": {
+      "type": "object",
+      "description": "Hub background task scheduler settings. Controls tick frequency and concurrency to tune DB load.",
+      "x-since": "1",
+      "properties": {
+        "interval_seconds": {
+          "type": "integer",
+          "minimum": 10,
+          "default": 60,
+          "description": "Root ticker interval in seconds. All recurring handlers fire at multiples of this interval. Increasing this value reduces DB connection pressure on small deployments.",
+          "x-env-var": "SCION_SERVER_SCHEDULER_INTERVAL_SECONDS",
+          "x-since": "1"
+        },
+        "max_concurrency": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 2,
+          "description": "Maximum number of recurring handlers that may run simultaneously in a single tick. Default 2 to prevent DB connection pool saturation on small deployments. Set to 0 for unlimited (pre-fix behavior).",
+          "x-env-var": "SCION_SERVER_SCHEDULER_MAX_CONCURRENCY",
+          "x-since": "1"
+        }
+      },
+      "additionalProperties": false
+    },
     "telemetryConfig": {
       "type": "object",
       "description": "Telemetry and observability configuration.",
@@ -983,7 +1029,24 @@
           "x-since": "1"
         },
         "tls": { "$ref": "#/$defs/telemetryTLS" },
-        "batch": { "$ref": "#/$defs/telemetryBatch" }
+        "batch": { "$ref": "#/$defs/telemetryBatch" },
+        "provider": {
+          "type": "string",
+          "description": "Cloud telemetry provider (e.g., 'gcp' for GCP-native export).",
+          "x-since": "1"
+        },
+        "gcp_project_id": {
+          "type": "string",
+          "description": "GCP project ID for telemetry (Cloud Monitoring). Overrides auto-detection from SA credentials.",
+          "x-since": "1"
+        },
+        "cloud_logging": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable direct Cloud Logging output. When set, the server writes structured logs to Cloud Logging. The SCION_CLOUD_LOGGING env var takes precedence over this setting.",
+          "x-env-var": "SCION_CLOUD_LOGGING",
+          "x-since": "1"
+        }
       },
       "additionalProperties": false
     },

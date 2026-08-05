@@ -34,7 +34,11 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
 	gouuid "github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
+
+var tracer = otel.Tracer("scion-hub")
 
 // parseLabelFilters parses label=key=value query parameters into a map and
 // validates the resulting labels against constraint rules.
@@ -383,6 +387,13 @@ func (s *Server) createAgentInProject(
 	notifySubscriberID string,
 ) {
 	ctx := r.Context()
+	ctx, span := tracer.Start(ctx, "hub.agent.create")
+	defer span.End()
+	// Note: HTTP error status is recorded by the otelhttp parent span.
+	span.SetAttributes(
+		attribute.String("scion.agent.name", req.Name),
+		attribute.String("scion.project.id", projectID),
+	)
 	hubCreateStart := time.Now()
 
 	// Verify project exists and get its configuration
@@ -393,6 +404,13 @@ func (s *Server) createAgentInProject(
 			return
 		}
 		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	// Reject agent creation in template projects
+	if project.IsTemplate() {
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest,
+			"cannot create agents in a template project", nil)
 		return
 	}
 
@@ -1187,6 +1205,15 @@ func (s *Server) buildEnvGatherResponse(ctx context.Context, agent *store.Agent,
 				continue
 			}
 		}
+		// Check hub-scope env_vars
+		if hubID := s.HubID(); hubID != "" {
+			vars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: "hub", ScopeID: hubID, Key: key})
+			if err == nil && len(vars) > 0 {
+				resp.HubWarnings = append(resp.HubWarnings,
+					fmt.Sprintf("%s is stored in Hub env storage (hub scope) but was not included in the dispatch — injection_mode may be as_needed", key))
+				continue
+			}
+		}
 		// Check secret backend
 		if s.secretBackend != nil {
 			if agent.OwnerID != "" {
@@ -1202,6 +1229,15 @@ func (s *Server) buildEnvGatherResponse(ctx context.Context, agent *store.Agent,
 				if err == nil && len(metas) > 0 {
 					resp.HubWarnings = append(resp.HubWarnings,
 						fmt.Sprintf("%s is stored in Hub secrets (project scope) but was not included in the dispatch — this may indicate a resolution issue", key))
+					continue
+				}
+			}
+			// Check hub-scope secrets
+			if hubID := s.HubID(); hubID != "" {
+				metas, err := s.secretBackend.List(ctx, secret.Filter{Scope: "hub", ScopeID: hubID, Name: key})
+				if err == nil && len(metas) > 0 {
+					resp.HubWarnings = append(resp.HubWarnings,
+						fmt.Sprintf("%s is stored in Hub secrets (hub scope) but was not included in the dispatch — injection_mode may be as_needed", key))
 					continue
 				}
 			}
@@ -1469,6 +1505,12 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Handle agent port-forward registration, tunnel, and proxy routes.
+	if action == "ports" || strings.HasPrefix(action, "ports/") {
+		s.handleAgentPorts(w, r, id, strings.TrimPrefix(strings.TrimPrefix(action, "ports"), "/"))
+		return
+	}
+
 	// Handle agent logs relay (GET, proxied to broker)
 	if action == "logs" {
 		s.handleAgentLogs(w, r, id)
@@ -1511,6 +1553,12 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 	// Handle agent-scoped secret creation: PUT /api/v1/agents/{id}/secrets/{key}
 	if action == "secrets" || strings.HasPrefix(action, "secrets/") {
 		s.handleAgentSecrets(w, r, id, strings.TrimPrefix(action, "secrets"))
+		return
+	}
+
+	// Handle agent session metrics summary (GET /api/v1/agents/{id}/metrics/summary)
+	if action == "metrics/summary" {
+		s.handleAgentMetricsSummary(w, r, id)
 		return
 	}
 
@@ -1758,6 +1806,12 @@ func (s *Server) deleteAgent(w http.ResponseWriter, r *http.Request, id string) 
 // Hard-delete: permanently removes the agent record from the store.
 func (s *Server) performAgentDelete(w http.ResponseWriter, r *http.Request, agent *store.Agent) {
 	ctx := r.Context()
+	ctx, span := tracer.Start(ctx, "hub.agent.delete")
+	defer span.End()
+	// Note: HTTP error status is recorded by the otelhttp parent span.
+	span.SetAttributes(
+		attribute.String("scion.agent.id", agent.ID),
+	)
 
 	// Enforce policy-based authorization: only the agent's creator (owner) or admins can delete
 	if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
@@ -1805,6 +1859,9 @@ func (s *Server) performAgentDelete(w http.ResponseWriter, r *http.Request, agen
 	if !isManagedAgentRuntime(agent.Runtime) && !force && !s.checkBrokerAvailability(w, r, agent) {
 		return
 	}
+
+	// Clear exposed ports — the agent is being deleted so its ports are unreachable.
+	s.clearExposedPortsForAgent(ctx, agent.ID)
 
 	now := time.Now()
 
@@ -1915,13 +1972,36 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, a
 		return
 	}
 
+	ctx, span := tracer.Start(r.Context(), "hub.agent.action")
+	defer span.End()
+	// Note: HTTP error status is recorded by the otelhttp parent span.
+	span.SetAttributes(
+		attribute.String("scion.agent.id", id),
+		attribute.String("scion.agent.action", action),
+	)
+	r = r.WithContext(ctx)
+
 	// For actions other than status/token refresh and outbound-message
 	// (self-access), we require user or agent authentication
 	// with appropriate scopes. Self-access endpoints enforce their own auth checks.
-	if action != api.AgentActionStatus &&
-		action != api.AgentActionTokenRefresh &&
-		action != api.AgentActionRefreshToken &&
-		action != api.AgentActionOutboundMessage {
+	selfAccess := action == api.AgentActionStatus ||
+		action == api.AgentActionMetrics ||
+		action == api.AgentActionTokenRefresh ||
+		action == api.AgentActionRefreshToken ||
+		action == api.AgentActionOutboundMessage
+
+	// Self-message: allow an agent to deliver a message to itself using its
+	// own token, without requiring the ScopeAgentLifecycle scope. This mirrors
+	// the outbound-message self-access pattern and is used by sciontool to
+	// send system notifications (e.g. port auto-expose) to the agent's own
+	// harness input.
+	if action == api.AgentActionMessage {
+		if claims := GetAgentFromContext(r.Context()); claims != nil && claims.Subject == id {
+			selfAccess = true
+		}
+	}
+
+	if !selfAccess {
 		userIdent := GetUserIdentityFromContext(r.Context())
 		agentIdent := GetAgentIdentityFromContext(r.Context())
 		if userIdent == nil && agentIdent == nil {
@@ -1980,6 +2060,8 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, a
 		s.handleAgentGitHubTokenRefresh(w, r, id)
 	case api.AgentActionOutboundMessage:
 		s.handleAgentOutboundMessage(w, r, id)
+	case api.AgentActionMetrics:
+		s.handleAgentMetrics(w, r, id)
 	case api.AgentActionMessages:
 		// Defence-in-depth: this action is normally intercepted earlier in
 		// handleAgentRoute (before the POST-only gate) so that GET requests

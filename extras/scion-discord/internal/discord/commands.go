@@ -18,8 +18,10 @@ import (
 
 // AgentInfo holds an agent's slug and current activity state.
 type AgentInfo struct {
+	ID       string `json:"id"`
 	Slug     string `json:"slug"`
 	Activity string `json:"activity,omitempty"`
+	Phase    string `json:"phase,omitempty"`
 }
 
 // ProjectOption holds a project's identifiers for display in selection UI.
@@ -70,6 +72,9 @@ type HubClient interface {
 	// onBehalfOf is a namespaced principal (e.g. "user:alice@example.com"); it is
 	// sent as the X-Scion-On-Behalf-Of header, NOT in the body.
 	CreateAgent(ctx context.Context, projectID string, req CreateAgentRequest, onBehalfOf string) (*CreateAgentResponse, error)
+
+	// HubBaseURL returns the base URL of the hub (e.g. "https://hub.example.com").
+	HubBaseURL() string
 }
 
 // CommandHandler manages Discord slash command registration and dispatch.
@@ -81,14 +86,20 @@ type CommandHandler struct {
 	appID          string
 	guildIDs       []string // empty = global commands
 	agentCacheTTL  time.Duration
+	searchRoot     string // base directory for /scion send file searches
 	deliverInbound func(topic string, msg *messages.StructuredMessage) *hubError
 }
 
 // NewCommandHandler creates a new CommandHandler. agentCacheTTL controls how
-// long agent lists are cached before refreshing from the Hub API.
-func NewCommandHandler(store Store, session *discordgo.Session, hubClient HubClient, deliverInbound func(string, *messages.StructuredMessage) *hubError, appID string, guildIDs []string, agentCacheTTL time.Duration, log *slog.Logger) *CommandHandler {
+// long agent lists are cached before refreshing from the Hub API. searchRoot
+// sets the base directory for /scion send file searches; when empty it
+// defaults to DefaultSearchRoot.
+func NewCommandHandler(store Store, session *discordgo.Session, hubClient HubClient, deliverInbound func(string, *messages.StructuredMessage) *hubError, appID string, guildIDs []string, agentCacheTTL time.Duration, searchRoot string, log *slog.Logger) *CommandHandler {
 	if log == nil {
 		log = slog.Default()
+	}
+	if searchRoot == "" {
+		searchRoot = DefaultSearchRoot
 	}
 	return &CommandHandler{
 		store:          store,
@@ -99,6 +110,7 @@ func NewCommandHandler(store Store, session *discordgo.Session, hubClient HubCli
 		appID:          appID,
 		guildIDs:       guildIDs,
 		agentCacheTTL:  agentCacheTTL,
+		searchRoot:     searchRoot,
 	}
 }
 
@@ -272,6 +284,31 @@ func (h *CommandHandler) RegisterCommandsForGuild(guildID string) error {
 			},
 			{
 				Type:        discordgo.ApplicationCommandOptionSubCommand,
+				Name:        "terminal",
+				Description: "Get the web terminal URL for an agent",
+				Options: []*discordgo.ApplicationCommandOption{{
+					Type:         discordgo.ApplicationCommandOptionString,
+					Name:         "agent",
+					Description:  "Agent name",
+					Required:     true,
+					Autocomplete: true,
+				}},
+			},
+			{
+				Type:        discordgo.ApplicationCommandOptionSubCommand,
+				Name:        "send",
+				Description: "Send a file by path or search for files by name",
+				Options: []*discordgo.ApplicationCommandOption{
+					{
+						Type:        discordgo.ApplicationCommandOptionString,
+						Name:        "path",
+						Description: "Absolute file path or partial name to search",
+						Required:    true,
+					},
+				},
+			},
+			{
+				Type:        discordgo.ApplicationCommandOptionSubCommand,
 				Name:        "help",
 				Description: "Show available commands",
 			},
@@ -300,7 +337,9 @@ var ephemeralCommands = map[string]bool{
 	"unlink":   true,
 	"settings": true,
 	"default":  true,
+	"terminal": true,
 	"thread":   true,
+	"send":     true,
 }
 
 // ephemeralFlag returns MessageFlagsEphemeral if the subcommand should be
@@ -368,8 +407,12 @@ func (h *CommandHandler) HandleSlashCommand(s *discordgo.Session, i *discordgo.I
 			h.HandleSettings(s, i)
 		case "default":
 			h.HandleDefault(s, i)
+		case "terminal":
+			h.HandleTerminal(s, i)
 		case "thread":
 			h.HandleThread(s, i)
+		case "send":
+			h.HandleSend(s, i)
 		// register and unregister are handled by RegistrationHandler
 		// and should be wired up in the broker's dispatch
 		default:
@@ -502,6 +545,8 @@ func helpText() string {
 		"`/scion msg <agent> <text>` — Send a message to an agent\n" +
 		"`/scion logs <agent>` — View agent logs\n" +
 		"`/scion default [agent]` — Set or clear the default agent\n" +
+		"`/scion terminal <agent>` — Get the web terminal URL for an agent\n" +
+		"`/scion send <path>` — Send a file by path or search for files\n" +
 		"`/scion thread <title> [template]` — Create a thread with a new agent\n" +
 		"`/scion register` — Link your Discord account to Scion Hub\n" +
 		"`/scion unregister` — Unlink your Discord account\n" +
@@ -574,7 +619,11 @@ func (h *CommandHandler) HandleSetup(s *discordgo.Session, i *discordgo.Interact
 
 	// If running in a thread/forum topic, resolve the parent channel.
 	var link *ChannelLink
-	parentID := threadParentID(s, i.ChannelID)
+	parentID, ok := threadParentID(s, i.ChannelID)
+	if !ok {
+		h.followup(s, i, "Failed to resolve channel details due to a Discord API error. Please try again.")
+		return
+	}
 	if parentID != "" {
 		link, err = h.store.GetChannelLink(ctx, parentID)
 		if err != nil {
@@ -719,7 +768,7 @@ func (h *CommandHandler) HandleAgents(s *discordgo.Session, i *discordgo.Interac
 
 	var lines []string
 	for _, agent := range agents {
-		emoji := activityEmoji(agent.Activity)
+		emoji := agentStatusEmoji(agent.Activity, agent.Phase)
 		label := agent.Slug
 		if agent.Activity != "" {
 			label += " -- " + agent.Activity
@@ -774,8 +823,26 @@ func (h *CommandHandler) HandleInfo(s *discordgo.Session, i *discordgo.Interacti
 				sb.WriteString(fmt.Sprintf("\n**Server:** %s", link.GuildName))
 			}
 			sb.WriteString(fmt.Sprintf("\n**Channel project:** %s", link.ProjectSlug))
-			if link.DefaultAgent != "" {
-				sb.WriteString(fmt.Sprintf("\n**Default agent:** %s", link.DefaultAgent))
+
+			// Check for thread-level default agent.
+			// link.ChannelID is the parent channel (resolveChannelLink falls back);
+			// if it differs from i.ChannelID, we are in a thread.
+			if link.ChannelID != i.ChannelID {
+				threadDefault, tdErr := h.store.GetThreadDefault(ctx, link.ChannelID, i.ChannelID)
+				if tdErr != nil {
+					h.log.Error("Failed to get thread default for info", "error", tdErr)
+				} else if threadDefault != "" {
+					sb.WriteString(fmt.Sprintf("\n**Thread default agent:** %s", threadDefault))
+				}
+				// Show channel default as context (it's the fallback)
+				if link.DefaultAgent != "" {
+					sb.WriteString(fmt.Sprintf("\n**Channel default agent:** %s", link.DefaultAgent))
+				}
+			} else {
+				// Not in a thread — show channel default as before
+				if link.DefaultAgent != "" {
+					sb.WriteString(fmt.Sprintf("\n**Default agent:** %s", link.DefaultAgent))
+				}
 			}
 		}
 	}
@@ -807,11 +874,15 @@ func (h *CommandHandler) HandleStatus(s *discordgo.Session, i *discordgo.Interac
 	}
 
 	// Detect thread context for default info display.
-	statusParentID := threadParentID(s, i.ChannelID)
+	statusParentID, ok := threadParentID(s, i.ChannelID)
+	if !ok {
+		h.followup(s, i, "Failed to resolve channel details due to a Discord API error. Please try again.")
+		return
+	}
 
 	for _, agent := range agents {
 		if agent.Slug == agentSlug {
-			emoji := activityEmoji(agent.Activity)
+			emoji := agentStatusEmoji(agent.Activity, agent.Phase)
 			activity := agent.Activity
 			if activity == "" {
 				activity = "unknown"
@@ -1004,7 +1075,11 @@ func (h *CommandHandler) HandleDefault(s *discordgo.Session, i *discordgo.Intera
 	}
 
 	// Detect thread context.
-	parentID := threadParentID(s, i.ChannelID)
+	parentID, ok := threadParentID(s, i.ChannelID)
+	if !ok {
+		h.followup(s, i, "Failed to resolve channel details due to a Discord API error. Please try again.")
+		return
+	}
 	isThread := parentID != ""
 	threadID := ""
 	if isThread {
@@ -1194,6 +1269,54 @@ func isForumChannelType(s *discordgo.Session, channelID string) bool {
 		ch.Type == discordgo.ChannelTypeGuildMedia
 }
 
+// HandleTerminal returns the web terminal URL for a running agent.
+func (h *CommandHandler) HandleTerminal(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	agentSlug := getSubcommandOption(i, "agent")
+	if agentSlug == "" {
+		h.followup(s, i, "Usage: `/scion terminal <agent-name>`")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
+	if err != nil {
+		h.log.Error("Failed to get channel link", "error", err, "channel_id", i.ChannelID)
+		h.followup(s, i, "Something went wrong. Please try again.")
+		return
+	}
+	if link == nil {
+		h.followup(s, i, "This channel is not linked to a project. Use `/scion setup` first.")
+		return
+	}
+
+	agents, err := h.hubClient.ListAgents(ctx, link.ProjectID)
+	if err != nil {
+		h.log.Error("Failed to list agents", "error", err, "project_id", link.ProjectID)
+		h.followup(s, i, "Failed to fetch agents. Please try again later.")
+		return
+	}
+
+	for _, agent := range agents {
+		if strings.EqualFold(agent.Slug, agentSlug) {
+			if strings.ToLower(agent.Phase) != "running" {
+				phase := agent.Phase
+				if phase == "" {
+					phase = "unknown"
+				}
+				h.followup(s, i, fmt.Sprintf("Agent **%s** is not running (phase: %s).", agent.Slug, phase))
+				return
+			}
+			terminalURL := fmt.Sprintf("%s/agents/%s/terminal", h.hubClient.HubBaseURL(), agent.ID)
+			h.followup(s, i, fmt.Sprintf("Terminal for **%s**: %s", agent.Slug, terminalURL))
+			return
+		}
+	}
+
+	h.followup(s, i, fmt.Sprintf("Agent '%s' not found in this project.", agentSlug))
+}
+
 // HandleThread creates a Discord thread and a Scion agent in one command.
 // It implements the full lifecycle: validation (Phase 0), concurrent fan-out
 // (Phase 1/6), binding + kickoff (Phase 2–3/7), and hub capability probe
@@ -1212,7 +1335,11 @@ func (h *CommandHandler) HandleThread(s *discordgo.Session, i *discordgo.Interac
 	// If invoked from inside a thread, create a sibling in the parent channel
 	// (decision 1a). If in a regular channel, use the current channel.
 	channelID := i.ChannelID
-	parentID := threadParentID(s, channelID)
+	parentID, ok := threadParentID(s, channelID)
+	if !ok {
+		h.followup(s, i, "Failed to resolve channel details due to a Discord API error. Please try again.")
+		return
+	}
 	if parentID != "" {
 		// We are inside a thread — create sibling in parent channel.
 		channelID = parentID
@@ -1304,6 +1431,19 @@ func (h *CommandHandler) HandleThread(s *discordgo.Session, i *discordgo.Interac
 	// would be ownerless — a condition that should be detected and reported.
 	// Full probe deferred to a follow-up change.
 
+	// Step 0.7: Check bot has permission to create threads in the target channel.
+	if s.State != nil && s.State.User != nil {
+		botPerms, permErr := s.State.UserChannelPermissions(s.State.User.ID, channelID)
+		if permErr == nil {
+			if botPerms&discordgo.PermissionCreatePublicThreads == 0 {
+				h.followup(s, i, "The bot does not have **Create Public Threads** permission in this channel. "+
+					"Please re-invite the bot using the invite link from the admin settings page, "+
+					"or grant the permission manually in Server Settings > Roles.")
+				return
+			}
+		}
+	}
+
 	// --- Phase 6: Concurrent fan-out ---
 	h.log.Info("Thread command validation passed, starting orchestration",
 		"title", title,
@@ -1384,11 +1524,15 @@ func (h *CommandHandler) HandleThread(s *discordgo.Session, i *discordgo.Interac
 		h.log.Error("Thread command: both agent and thread creation failed",
 			"agent_error", agentErr, "thread_error", threadErr,
 			"slug", slug, "title", title)
+		threadErrMsg := threadErr.Error()
+		if strings.Contains(threadErrMsg, "403") || strings.Contains(threadErrMsg, "Missing Access") {
+			threadErrMsg += " (This may be a permissions issue — try re-inviting the bot from the admin settings page.)"
+		}
 		h.followup(s, i, fmt.Sprintf(
 			"Failed to create both the agent and the thread.\n"+
 				"Agent error: %s\n"+
 				"Thread error: %s",
-			agentErr.Error(), threadErr.Error()))
+			agentErr.Error(), threadErrMsg))
 		return
 
 	case agentErr != nil && threadErr == nil:
@@ -1413,11 +1557,15 @@ func (h *CommandHandler) HandleThread(s *discordgo.Session, i *discordgo.Interac
 		// Agent OK, thread failed — ephemeral reply MUST name the slug.
 		h.log.Error("Thread command: thread creation failed but agent was created",
 			"thread_error", threadErr, "slug", agentResp.Slug)
+		threadErrMsg := threadErr.Error()
+		if strings.Contains(threadErrMsg, "403") || strings.Contains(threadErrMsg, "Missing Access") {
+			threadErrMsg += " (This may be a permissions issue — try re-inviting the bot from the admin settings page.)"
+		}
 		h.followup(s, i, fmt.Sprintf(
 			"Agent **%s** was created but the Discord thread could not be created.\n"+
 				"Error: %s\n"+
 				"The agent is running. Create a thread manually and run `/scion default %s` in it to bind.",
-			agentResp.Slug, threadErr.Error(), agentResp.Slug))
+			agentResp.Slug, threadErrMsg, agentResp.Slug))
 		return
 	}
 
@@ -1684,9 +1832,14 @@ var (
 	threadParents   = make(map[string]string)
 )
 
-// threadParentID returns the parent channel ID if channelID is a thread,
-// or empty string if it is not a thread or the lookup fails.
-func threadParentID(s *discordgo.Session, channelID string) string {
+// threadParentID returns the parent channel ID if channelID is a thread.
+//
+// Return values:
+//   - (parentID, true)  — channelID is a thread; parentID is its parent.
+//   - ("", true)        — channelID is confirmed NOT a thread.
+//   - ("", false)       — lookup failed (e.g. transient REST error); caller
+//     should NOT cache the result so the next call can retry.
+func threadParentID(s *discordgo.Session, channelID string) (string, bool) {
 	var ch *discordgo.Channel
 	var err error
 	if s.State != nil {
@@ -1695,15 +1848,15 @@ func threadParentID(s *discordgo.Session, channelID string) string {
 	if ch == nil || err != nil {
 		ch, err = s.Channel(channelID)
 		if err != nil {
-			return ""
+			return "", false // lookup failed — do not cache
 		}
 	}
 	if ch.Type == discordgo.ChannelTypeGuildPublicThread ||
 		ch.Type == discordgo.ChannelTypeGuildPrivateThread ||
 		ch.Type == discordgo.ChannelTypeGuildNewsThread {
-		return ch.ParentID
+		return ch.ParentID, true
 	}
-	return ""
+	return "", true // confirmed not a thread
 }
 
 // resolveChannelLink looks up a ChannelLink for channelID. If no active link
@@ -1719,10 +1872,16 @@ func resolveChannelLink(ctx context.Context, s *discordgo.Session, store Store, 
 		threadParentsMu.Unlock()
 
 		if !cached {
-			parentID = threadParentID(s, channelID)
-			threadParentsMu.Lock()
-			threadParents[channelID] = parentID
-			threadParentsMu.Unlock()
+			var ok bool
+			parentID, ok = threadParentID(s, channelID)
+			if ok {
+				// Only cache when the lookup succeeded. On failure (!ok)
+				// we leave the entry absent so the next call retries,
+				// avoiding negative-cache poisoning from transient errors.
+				threadParentsMu.Lock()
+				threadParents[channelID] = parentID
+				threadParentsMu.Unlock()
+			}
 		}
 
 		if parentID != "" {
@@ -1732,24 +1891,54 @@ func resolveChannelLink(ctx context.Context, s *discordgo.Session, store Store, 
 	return link, nil
 }
 
-// activityEmoji returns an emoji for an agent activity state.
-func activityEmoji(activity string) string {
+// agentStatusEmoji returns an icon based on the agent's activity and phase.
+// Activity takes priority when present; phase is the fallback.
+func agentStatusEmoji(activity, phase string) string {
+	// Activity icons (priority)
 	switch strings.ToLower(activity) {
-	case "idle":
-		return "💤"
-	case "executing":
-		return "⚙️"
+	case "working":
+		return "⚙️" // gear
 	case "thinking":
-		return "💭"
+		return "\U0001f4ad" // thought balloon
+	case "executing":
+		return "⚙️" // gear
+	case "waiting_for_input":
+		return "\U0001f514" // bell
 	case "blocked":
-		return "🚧"
+		return "\U0001f6a7" // construction
 	case "completed":
-		return "✅"
-	case "error":
-		return "❌"
+		return "✅" // check mark
+	case "limits_exceeded":
+		return "\U0001f6ab" // prohibited
 	case "stalled":
-		return "⏳"
-	default:
-		return "▶️"
+		return "⏳" // hourglass
+	case "offline":
+		return "\U0001f4e1" // satellite antenna
+	case "crashed":
+		return "\U0001f4a5" // collision/crash
 	}
+
+	// Phase icons (fallback)
+	switch strings.ToLower(phase) {
+	case "created":
+		return "\U0001f4e6" // package
+	case "provisioning":
+		return "\U0001f504" // counterclockwise arrows
+	case "cloning":
+		return "\U0001f4e5" // inbox tray
+	case "starting":
+		return "\U0001f680" // rocket
+	case "running":
+		return "▶️" // play
+	case "suspended":
+		return "⏸️" // pause
+	case "stopping":
+		return "\U0001f6d1" // stop sign
+	case "stopped":
+		return "⏹️" // stop button
+	case "error":
+		return "❌" // cross mark
+	}
+
+	return "▶️" // play (default)
 }

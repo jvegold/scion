@@ -19,6 +19,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -73,6 +74,7 @@ type mockRuntimeBrokerClient struct {
 	startReturnResp        *RemoteAgentResponse // custom start response if set
 	cleanupCalls           int
 	cleanupSlugs           []string
+	createWithGatherFunc   func(ctx context.Context, brokerID, brokerEndpoint string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, *RemoteEnvRequirementsResponse, error)
 }
 
 func (m *mockRuntimeBrokerClient) CreateAgent(ctx context.Context, brokerID, brokerEndpoint string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, error) {
@@ -195,6 +197,9 @@ func (m *mockRuntimeBrokerClient) CreateAgentWithGather(ctx context.Context, bro
 	m.lastBrokerID = brokerID
 	m.lastEndpoint = brokerEndpoint
 	m.lastCreateReq = req
+	if m.createWithGatherFunc != nil {
+		return m.createWithGatherFunc(ctx, brokerID, brokerEndpoint, req)
+	}
 	if m.returnErr != nil {
 		return nil, nil, m.returnErr
 	}
@@ -1377,22 +1382,24 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_ResolvesEnvFromStorage(t *testin
 
 	// Store an env var in project scope (simulating API key stored in hub)
 	if err := memStore.CreateEnvVar(ctx, &store.EnvVar{
-		ID:      tid("ev-project-1"),
-		Key:     "GEMINI_API_KEY",
-		Value:   "test-api-key-123",
-		Scope:   "project",
-		ScopeID: tid("project-env"),
+		ID:            tid("ev-project-1"),
+		Key:           "GEMINI_API_KEY",
+		Value:         "test-api-key-123",
+		Scope:         "project",
+		ScopeID:       tid("project-env"),
+		InjectionMode: store.InjectionModeAlways,
 	}); err != nil {
 		t.Fatalf("failed to set env var: %v", err)
 	}
 
 	// Store a user-scoped env var
 	if err := memStore.CreateEnvVar(ctx, &store.EnvVar{
-		ID:      tid("ev-user-1"),
-		Key:     "CUSTOM_VAR",
-		Value:   "user-value",
-		Scope:   "user",
-		ScopeID: "owner-1",
+		ID:            tid("ev-user-1"),
+		Key:           "CUSTOM_VAR",
+		Value:         "user-value",
+		Scope:         "user",
+		ScopeID:       "owner-1",
+		InjectionMode: store.InjectionModeAlways,
 	}); err != nil {
 		t.Fatalf("failed to set env var: %v", err)
 	}
@@ -1470,11 +1477,12 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_ConfigEnvTakesPrecedence(t *test
 
 	// Store an env var that conflicts with config env
 	if err := memStore.CreateEnvVar(ctx, &store.EnvVar{
-		ID:      tid("ev-prec-1"),
-		Key:     "API_KEY",
-		Value:   "storage-value",
-		Scope:   "project",
-		ScopeID: tid("project-prec"),
+		ID:            tid("ev-prec-1"),
+		Key:           "API_KEY",
+		Value:         "storage-value",
+		Scope:         "project",
+		ScopeID:       tid("project-prec"),
+		InjectionMode: store.InjectionModeAlways,
 	}); err != nil {
 		t.Fatalf("failed to set env var: %v", err)
 	}
@@ -1533,11 +1541,12 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_StorageOverridesEmptyConfigEnv(t
 
 	// Store an env var that should override the empty config value
 	if err := memStore.CreateEnvVar(ctx, &store.EnvVar{
-		ID:      tid("ev-empty-1"),
-		Key:     "GEMINI_API_KEY",
-		Value:   "stored-api-key",
-		Scope:   "project",
-		ScopeID: tid("project-empty-env"),
+		ID:            tid("ev-empty-1"),
+		Key:           "GEMINI_API_KEY",
+		Value:         "stored-api-key",
+		Scope:         "project",
+		ScopeID:       tid("project-empty-env"),
+		InjectionMode: store.InjectionModeAlways,
 	}); err != nil {
 		t.Fatalf("failed to set env var: %v", err)
 	}
@@ -2248,11 +2257,12 @@ func TestBuildCreateRequest_ResolvesStorageEnvVars(t *testing.T) {
 
 	// Store a user-scoped env var
 	envVar := &store.EnvVar{
-		ID:      tid("ev-1"),
-		Key:     "GEMINI_API_KEY",
-		Value:   "stored-key-value",
-		Scope:   "user",
-		ScopeID: tid("user-1"),
+		ID:            tid("ev-1"),
+		Key:           "GEMINI_API_KEY",
+		Value:         "stored-key-value",
+		Scope:         "user",
+		ScopeID:       tid("user-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, envVar); err != nil {
 		t.Fatalf("failed to create env var: %v", err)
@@ -2301,11 +2311,12 @@ func TestBuildCreateRequest_ConfigEnvOverridesStorage(t *testing.T) {
 
 	// Store a user-scoped env var with the same key as config env
 	envVar := &store.EnvVar{
-		ID:      tid("ev-1"),
-		Key:     "MY_KEY",
-		Value:   "storage-value",
-		Scope:   "user",
-		ScopeID: tid("user-1"),
+		ID:            tid("ev-1"),
+		Key:           "MY_KEY",
+		Value:         "storage-value",
+		Scope:         "user",
+		ScopeID:       tid("user-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, envVar); err != nil {
 		t.Fatalf("failed to create env var: %v", err)
@@ -2365,11 +2376,12 @@ func TestBuildCreateRequest_ResolvesProjectAndUserScopes(t *testing.T) {
 
 	// Store a project-scoped env var
 	projectEnv := &store.EnvVar{
-		ID:      tid("ev-project"),
-		Key:     "SHARED_KEY",
-		Value:   "project-value",
-		Scope:   "project",
-		ScopeID: tid("project-1"),
+		ID:            tid("ev-project"),
+		Key:           "SHARED_KEY",
+		Value:         "project-value",
+		Scope:         "project",
+		ScopeID:       tid("project-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, projectEnv); err != nil {
 		t.Fatalf("failed to create project env var: %v", err)
@@ -2377,11 +2389,12 @@ func TestBuildCreateRequest_ResolvesProjectAndUserScopes(t *testing.T) {
 
 	// Store a user-scoped env var with the same key (higher precedence)
 	userEnv := &store.EnvVar{
-		ID:      tid("ev-user"),
-		Key:     "SHARED_KEY",
-		Value:   "user-value",
-		Scope:   "user",
-		ScopeID: tid("user-1"),
+		ID:            tid("ev-user"),
+		Key:           "SHARED_KEY",
+		Value:         "user-value",
+		Scope:         "user",
+		ScopeID:       tid("user-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, userEnv); err != nil {
 		t.Fatalf("failed to create user env var: %v", err)
@@ -2389,11 +2402,12 @@ func TestBuildCreateRequest_ResolvesProjectAndUserScopes(t *testing.T) {
 
 	// Store a project-only env var
 	projectOnly := &store.EnvVar{
-		ID:      tid("ev-project-only"),
-		Key:     "GROVE_ONLY_KEY",
-		Value:   "project-only-value",
-		Scope:   "project",
-		ScopeID: tid("project-1"),
+		ID:            tid("ev-project-only"),
+		Key:           "GROVE_ONLY_KEY",
+		Value:         "project-only-value",
+		Scope:         "project",
+		ScopeID:       tid("project-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, projectOnly); err != nil {
 		t.Fatalf("failed to create project-only env var: %v", err)
@@ -2446,11 +2460,12 @@ func TestDispatchAgentCreate_IncludesStorageEnvVars(t *testing.T) {
 
 	// Store user-scoped env vars
 	envVar := &store.EnvVar{
-		ID:      tid("ev-1"),
-		Key:     "API_TOKEN",
-		Value:   "secret-token-123",
-		Scope:   "user",
-		ScopeID: tid("user-1"),
+		ID:            tid("ev-1"),
+		Key:           "API_TOKEN",
+		Value:         "secret-token-123",
+		Scope:         "user",
+		ScopeID:       tid("user-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, envVar); err != nil {
 		t.Fatalf("failed to create env var: %v", err)
@@ -3368,6 +3383,89 @@ func TestBuildCreateRequest_NoAuth_SkipsSecrets(t *testing.T) {
 	})
 }
 
+// mockProvisionCredsBackend extends mockSecretBackend with List and Get support
+// for testing provisionCredentials collection.
+type mockProvisionCredsBackend struct {
+	mockSecretBackend
+	projectSecrets []secret.SecretMeta
+	secretValues   map[string]*secret.SecretWithValue
+}
+
+func (m *mockProvisionCredsBackend) List(_ context.Context, filter secret.Filter) ([]secret.SecretMeta, error) {
+	if filter.Scope == secret.ScopeProject {
+		return m.projectSecrets, nil
+	}
+	return nil, nil
+}
+
+func (m *mockProvisionCredsBackend) Get(_ context.Context, name, scope, scopeID string) (*secret.SecretWithValue, error) {
+	if sv, ok := m.secretValues[name]; ok {
+		return sv, nil
+	}
+	return nil, nil
+}
+
+func TestBuildCreateRequest_NoAuth_ProvisionCredentialsSurvive(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("host-1"),
+		Name:     "test-host",
+		Slug:     "test-host",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+	dispatcher.SetSecretBackend(&mockProvisionCredsBackend{
+		mockSecretBackend: mockSecretBackend{
+			secrets: []secret.SecretWithValue{
+				{SecretMeta: secret.SecretMeta{Name: "CLAUDE_AUTH", SecretType: "file", Target: "~/.claude/.credentials.json"}, Value: "secret-data"},
+			},
+		},
+		projectSecrets: []secret.SecretMeta{
+			{Name: "GH_EXAMPLE", SecretType: "environment", Scope: secret.ScopeProject},
+		},
+		secretValues: map[string]*secret.SecretWithValue{
+			"GH_EXAMPLE": {SecretMeta: secret.SecretMeta{Name: "GH_EXAMPLE", SecretType: "environment"}, Value: "ghp_token123"},
+		},
+	})
+
+	agent := &store.Agent{
+		ID:              tid("agent-noauth-prov"),
+		Name:            "noauth-prov-agent",
+		Slug:            "noauth-prov-agent",
+		OwnerID:         tid("user-1"),
+		ProjectID:       tid("project-1"),
+		RuntimeBrokerID: tid("host-1"),
+		AppliedConfig:   &store.AgentAppliedConfig{NoAuth: true},
+	}
+
+	req, err := dispatcher.buildCreateRequest(ctx, agent, "TestNoAuthProvisionCreds")
+	if err != nil {
+		t.Fatalf("buildCreateRequest failed: %v", err)
+	}
+
+	// ProvisionCredentials must be populated even under NoAuth — they serve
+	// skill resolution (gh:// tokens), not harness auth.
+	if req.ProvisionCredentials == nil {
+		t.Fatal("expected ProvisionCredentials to be non-nil with NoAuth=true")
+	}
+	if req.ProvisionCredentials["GH_EXAMPLE"] != "ghp_token123" {
+		t.Errorf("expected ProvisionCredentials[GH_EXAMPLE]=%q, got %q", "ghp_token123", req.ProvisionCredentials["GH_EXAMPLE"])
+	}
+
+	// ResolvedSecrets must still be suppressed under NoAuth.
+	if len(req.ResolvedSecrets) != 0 {
+		t.Errorf("expected no resolved secrets with NoAuth=true, got %d", len(req.ResolvedSecrets))
+	}
+}
+
 func TestHTTPAgentDispatcher_DispatchAgentCreate_AppliesImageRegistry(t *testing.T) {
 	ctx := context.Background()
 	memStore := createTestStore(t)
@@ -3915,5 +4013,415 @@ func TestInjectThinkingLevelEnv(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// setupFinalizeEnvTest creates a broker, project, project provider and agent
+// ready for DispatchFinalizeEnv tests.
+func setupFinalizeEnvTest(t *testing.T, ctx context.Context, memStore store.Store, asNeededVars []store.EnvVar) *store.Agent {
+	t.Helper()
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-finalize"),
+		Name:     "finalize-broker",
+		Slug:     "finalize-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	project := &store.Project{
+		ID:   tid("project-finalize"),
+		Name: "finalize-project",
+		Slug: "finalize-project",
+	}
+	if err := memStore.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	provider := &store.ProjectProvider{
+		ProjectID:  tid("project-finalize"),
+		BrokerID:   tid("broker-finalize"),
+		BrokerName: "finalize-broker",
+		LocalPath:  "/home/user/project/.scion",
+		Status:     store.BrokerStatusOnline,
+	}
+	if err := memStore.AddProjectProvider(ctx, provider); err != nil {
+		t.Fatalf("failed to add project provider: %v", err)
+	}
+
+	for i, v := range asNeededVars {
+		v.Scope = "project"
+		v.ScopeID = tid("project-finalize")
+		v.InjectionMode = store.InjectionModeAsNeeded
+		if v.ID == "" {
+			v.ID = tid("ev-finalize-" + string(rune('0'+i)))
+		}
+		asNeededVars[i] = v
+		if err := memStore.CreateEnvVar(ctx, &asNeededVars[i]); err != nil {
+			t.Fatalf("failed to create env var %q: %v", v.Key, err)
+		}
+	}
+
+	return &store.Agent{
+		ID:              tid("agent-finalize"),
+		Name:            "finalize-agent",
+		Slug:            "finalize-agent",
+		ProjectID:       tid("project-finalize"),
+		OwnerID:         "owner-1",
+		RuntimeBrokerID: tid("broker-finalize"),
+		AppliedConfig:   &store.AgentAppliedConfig{},
+	}
+}
+
+func TestDispatchFinalizeEnv_PartialAutoResolve(t *testing.T) {
+	// Scenario: broker needs two keys (DB_HOST, API_KEY). The CLI provides
+	// DB_HOST, but API_KEY is available as an as_needed env var. After the
+	// first create call reports API_KEY still needed, the second-pass
+	// resolution should satisfy it without returning ErrEnvStillMissing.
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	agent := setupFinalizeEnvTest(t, ctx, memStore, []store.EnvVar{
+		{Key: "API_KEY", Value: "auto-resolved-key"},
+	})
+
+	callCount := 0
+	mockClient := &mockRuntimeBrokerClient{
+		createWithGatherFunc: func(_ context.Context, _, _ string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, *RemoteEnvRequirementsResponse, error) {
+			callCount++
+			if callCount == 1 {
+				// First call: broker says API_KEY is still needed
+				return nil, &RemoteEnvRequirementsResponse{
+					AgentID: req.ID,
+					Needs:   []string{"API_KEY"},
+				}, nil
+			}
+			// Second call: all resolved — check API_KEY was merged
+			if v, ok := req.ResolvedEnv["API_KEY"]; !ok || v != "auto-resolved-key" {
+				t.Errorf("second call: expected API_KEY='auto-resolved-key', got %q (ok=%v)", v, ok)
+			}
+			if v, ok := req.ResolvedEnv["DB_HOST"]; !ok || v != "cli-provided-host" {
+				t.Errorf("second call: expected DB_HOST='cli-provided-host', got %q (ok=%v)", v, ok)
+			}
+			return &RemoteAgentResponse{
+				Agent: &RemoteAgentInfo{
+					ID:    req.ID,
+					Slug:  req.Slug,
+					Name:  req.Name,
+					Phase: string(state.PhaseRunning),
+				},
+				Created: true,
+			}, nil, nil
+		},
+	}
+
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	err := dispatcher.DispatchFinalizeEnv(ctx, agent, map[string]string{
+		"DB_HOST": "cli-provided-host",
+	})
+	if err != nil {
+		t.Fatalf("DispatchFinalizeEnv returned unexpected error: %v", err)
+	}
+
+	if callCount != 2 {
+		t.Errorf("expected 2 CreateAgentWithGather calls, got %d", callCount)
+	}
+}
+
+func TestDispatchFinalizeEnv_FullAutoResolveInFinalize(t *testing.T) {
+	// Scenario: after merging CLI-provided env, the broker still needs two
+	// keys (SECRET_A, SECRET_B) — but both are available as as_needed env
+	// vars. The second pass resolves them all; no ErrEnvStillMissing.
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	agent := setupFinalizeEnvTest(t, ctx, memStore, []store.EnvVar{
+		{Key: "SECRET_A", Value: "val-a"},
+		{Key: "SECRET_B", Value: "val-b"},
+	})
+
+	callCount := 0
+	mockClient := &mockRuntimeBrokerClient{
+		createWithGatherFunc: func(_ context.Context, _, _ string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, *RemoteEnvRequirementsResponse, error) {
+			callCount++
+			if callCount == 1 {
+				return nil, &RemoteEnvRequirementsResponse{
+					AgentID: req.ID,
+					Needs:   []string{"SECRET_A", "SECRET_B"},
+				}, nil
+			}
+			// Verify both keys were merged
+			for _, k := range []string{"SECRET_A", "SECRET_B"} {
+				if _, ok := req.ResolvedEnv[k]; !ok {
+					t.Errorf("second call: expected %s in ResolvedEnv", k)
+				}
+			}
+			return &RemoteAgentResponse{
+				Agent: &RemoteAgentInfo{
+					ID:    req.ID,
+					Slug:  req.Slug,
+					Name:  req.Name,
+					Phase: string(state.PhaseRunning),
+				},
+				Created: true,
+			}, nil, nil
+		},
+	}
+
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	err := dispatcher.DispatchFinalizeEnv(ctx, agent, map[string]string{
+		"CLI_VAR": "cli-value",
+	})
+	if err != nil {
+		t.Fatalf("DispatchFinalizeEnv returned unexpected error: %v", err)
+	}
+
+	if callCount != 2 {
+		t.Errorf("expected 2 CreateAgentWithGather calls, got %d", callCount)
+	}
+}
+
+func TestDispatchFinalizeEnv_NoAsNeededMatches(t *testing.T) {
+	// Scenario: broker still needs keys after CLI env merge, but no as_needed
+	// entries match. Behavior is unchanged — ErrEnvStillMissing is returned.
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	// No as_needed vars
+	agent := setupFinalizeEnvTest(t, ctx, memStore, nil)
+
+	callCount := 0
+	mockClient := &mockRuntimeBrokerClient{
+		createWithGatherFunc: func(_ context.Context, _, _ string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, *RemoteEnvRequirementsResponse, error) {
+			callCount++
+			return nil, &RemoteEnvRequirementsResponse{
+				AgentID: req.ID,
+				Needs:   []string{"MISSING_VAR"},
+			}, nil
+		},
+	}
+
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	err := dispatcher.DispatchFinalizeEnv(ctx, agent, map[string]string{
+		"SOME_VAR": "some-value",
+	})
+
+	var stillMissing *ErrEnvStillMissing
+	if !errors.As(err, &stillMissing) {
+		t.Fatalf("expected ErrEnvStillMissing, got: %v", err)
+	}
+
+	if len(stillMissing.Requirements.Needs) != 1 || stillMissing.Requirements.Needs[0] != "MISSING_VAR" {
+		t.Errorf("expected Needs=[MISSING_VAR], got %v", stillMissing.Requirements.Needs)
+	}
+
+	// Should only have called once — no second pass since no as_needed matched
+	if callCount != 1 {
+		t.Errorf("expected 1 CreateAgentWithGather call, got %d", callCount)
+	}
+}
+
+// TestDispatchAgentStart_IncludesHubName verifies that when hubName is set on
+// the dispatcher, SCION_HUB_NAME is injected into resolvedEnv for DispatchAgentStart.
+func TestDispatchAgentStart_IncludesHubName(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hubname-start"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+	dispatcher.SetHubName("my-test-hub")
+
+	agent := &store.Agent{
+		ID:              tid("agent-hubname-start"),
+		Name:            "hubname-start-agent",
+		Slug:            "hubname-start-agent",
+		ProjectID:       tid("project-hubname-start"),
+		OwnerID:         tid("user-hubname-start"),
+		RuntimeBrokerID: tid("broker-hubname-start"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "claude",
+		},
+	}
+
+	err := dispatcher.DispatchAgentStart(ctx, agent, "", false)
+	if err != nil {
+		t.Fatalf("DispatchAgentStart failed: %v", err)
+	}
+
+	if !mockClient.startCalled {
+		t.Fatal("expected StartAgent to be called")
+	}
+
+	if mockClient.lastResolvedEnv == nil {
+		t.Fatal("expected resolvedEnv to be non-nil")
+	}
+
+	if got, ok := mockClient.lastResolvedEnv["SCION_HUB_NAME"]; !ok {
+		t.Error("SCION_HUB_NAME missing from resolvedEnv — hubName not injected on start path")
+	} else if got != "my-test-hub" {
+		t.Errorf("SCION_HUB_NAME = %q, want %q", got, "my-test-hub")
+	}
+}
+
+// TestDispatchAgentStart_OmitsHubNameWhenEmpty verifies that when hubName is
+// NOT set on the dispatcher, SCION_HUB_NAME is absent from resolvedEnv.
+func TestDispatchAgentStart_OmitsHubNameWhenEmpty(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hubname-empty"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	// No SetHubName call — hubName stays empty.
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	agent := &store.Agent{
+		ID:              tid("agent-hubname-empty"),
+		Name:            "hubname-empty-agent",
+		Slug:            "hubname-empty-agent",
+		ProjectID:       tid("project-hubname-empty"),
+		OwnerID:         tid("user-hubname-empty"),
+		RuntimeBrokerID: tid("broker-hubname-empty"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "claude",
+		},
+	}
+
+	err := dispatcher.DispatchAgentStart(ctx, agent, "", false)
+	if err != nil {
+		t.Fatalf("DispatchAgentStart failed: %v", err)
+	}
+
+	if !mockClient.startCalled {
+		t.Fatal("expected StartAgent to be called")
+	}
+
+	if _, ok := mockClient.lastResolvedEnv["SCION_HUB_NAME"]; ok {
+		t.Error("SCION_HUB_NAME should not be present when hubName is empty")
+	}
+}
+
+// TestDispatchAgentRestart_IncludesHubName verifies that SCION_HUB_NAME is
+// injected into resolvedEnv on the restart path when hubName is set.
+func TestDispatchAgentRestart_IncludesHubName(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hubname-restart"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+	dispatcher.SetHubName("restart-hub")
+
+	agent := &store.Agent{
+		ID:              tid("agent-hubname-restart"),
+		Name:            "hubname-restart-agent",
+		Slug:            "hubname-restart-agent",
+		ProjectID:       tid("project-hubname-restart"),
+		OwnerID:         tid("user-hubname-restart"),
+		RuntimeBrokerID: tid("broker-hubname-restart"),
+		AppliedConfig:   &store.AgentAppliedConfig{},
+	}
+
+	err := dispatcher.DispatchAgentRestart(ctx, agent)
+	if err != nil {
+		t.Fatalf("DispatchAgentRestart failed: %v", err)
+	}
+
+	if !mockClient.restartCalled {
+		t.Fatal("expected RestartAgent to be called")
+	}
+
+	env := mockClient.lastRestartResolvedEnv
+	if got, ok := env["SCION_HUB_NAME"]; !ok {
+		t.Error("SCION_HUB_NAME missing from restart resolvedEnv — hubName not injected on restart path")
+	} else if got != "restart-hub" {
+		t.Errorf("SCION_HUB_NAME = %q, want %q", got, "restart-hub")
+	}
+}
+
+// TestDispatchAgentCreate_IncludesHubName verifies that SCION_HUB_NAME is
+// injected into the create request's resolvedEnv when hubName is set.
+func TestDispatchAgentCreate_IncludesHubName(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hubname-create"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+	dispatcher.SetHubName("create-hub")
+
+	agent := &store.Agent{
+		ID:              tid("agent-hubname-create"),
+		Name:            "hubname-create-agent",
+		Slug:            "hubname-create-agent",
+		ProjectID:       tid("project-hubname-create"),
+		OwnerID:         tid("user-hubname-create"),
+		RuntimeBrokerID: tid("broker-hubname-create"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "claude",
+			Task:          "test task",
+		},
+	}
+
+	err := dispatcher.DispatchAgentCreate(ctx, agent)
+	if err != nil {
+		t.Fatalf("DispatchAgentCreate failed: %v", err)
+	}
+
+	if !mockClient.createCalled {
+		t.Fatal("expected CreateAgent to be called")
+	}
+
+	env := mockClient.lastCreateReq.ResolvedEnv
+	if got, ok := env["SCION_HUB_NAME"]; !ok {
+		t.Error("SCION_HUB_NAME missing from create request resolvedEnv — hubName not injected on create path")
+	} else if got != "create-hub" {
+		t.Errorf("SCION_HUB_NAME = %q, want %q", got, "create-hub")
 	}
 }

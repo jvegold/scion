@@ -147,7 +147,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	if opts.InlineConfig != nil {
 		startInlineConfig = opts.InlineConfig
 	}
-	if opts.HarnessAuth != "" {
+	if opts.HarnessAuth != "" && !harness.IsHarnessImplementationName(opts.HarnessAuth) {
 		if startInlineConfig == nil {
 			startInlineConfig = &api.ScionConfig{}
 		}
@@ -472,25 +472,21 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	if !opts.NoAuth {
 		auth = harness.GatherAuthWithEnv(authEnvOverlay, !opts.BrokerMode, authMeta)
 		if opts.BrokerMode {
-			harness.OverlayFileSecrets(&auth, opts.ResolvedSecrets)
+			harness.OverlayFileSecrets(&auth, opts.ResolvedSecrets, authMeta)
 		}
-		util.Debugf("auth: gathered credentials — selectedType=%q, hasGeminiKey=%t, hasGoogleKey=%t, hasOAuth=%t, hasADC=%t, hasAnthropicKey=%t, hasClaudeOAuthToken=%t, hasClaudeAuthFile=%t, cloudProject=%q, gcpMetadataMode=%q, brokerMode=%t",
+		util.Debugf("auth: gathered credentials — selectedType=%q, hasADC=%t, cloudProject=%q, gcpMetadataMode=%q, envVarCount=%d, fileCount=%d, brokerMode=%t",
 			auth.SelectedType,
-			auth.GeminiAPIKey != "",
-			auth.GoogleAPIKey != "",
-			auth.OAuthCreds != "",
 			auth.GoogleAppCredentials != "",
-			auth.AnthropicAPIKey != "",
-			auth.ClaudeOAuthToken != "",
-			auth.ClaudeAuthFile != "",
 			auth.GoogleCloudProject,
 			auth.GCPMetadataMode,
+			len(auth.EnvVars),
+			len(auth.Files),
 			opts.BrokerMode,
 		)
 		harness.OverlaySettings(&auth, h, agentDir)
 		// Apply CLI harness auth override (--harness-auth) before resolution.
 		// This has highest priority, overriding settings, templates, and harness configs.
-		if opts.HarnessAuth != "" {
+		if opts.HarnessAuth != "" && !harness.IsHarnessImplementationName(opts.HarnessAuth) {
 			auth.SelectedType = opts.HarnessAuth
 		}
 		util.Debugf("auth: after overlay — selectedType=%q", auth.SelectedType)
@@ -552,11 +548,28 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			}
 		}
 
-		// Persist the resolved auth method so it can be reported to the Hub.
+		// Persist the resolved auth type so it can be reported to the Hub.
 		// For auto-detected auth, opts.HarnessAuth may be empty; capture the
-		// actual method the harness selected (e.g. "api-key", "vertex-ai").
-		if opts.HarnessAuth == "" && resolved.Method != "" {
-			opts.HarnessAuth = resolved.Method
+		// actual auth type (e.g. "api-key", "vertex-ai").
+		// Prefer SCION_HARNESS_SELECTED_AUTH (the true auth type) over
+		// resolved.Method, which for container-script harnesses is always
+		// "container-script" — an implementation name, not a valid auth type.
+		// Both branches reject harness implementation names so that
+		// already-corrupted scion-agent.json data is not re-persisted
+		// on resume (opts.HarnessAuth stays empty → no write-back).
+		if opts.HarnessAuth == "" {
+			if authType := resolved.EnvVars["SCION_HARNESS_SELECTED_AUTH"]; authType != "" && !harness.IsHarnessImplementationName(authType) {
+				opts.HarnessAuth = authType
+			} else if resolved.Method != "" && !harness.IsHarnessImplementationName(resolved.Method) {
+				opts.HarnessAuth = resolved.Method
+			}
+		}
+
+		// If opts.HarnessAuth is still a harness implementation name (e.g.
+		// "container-script" from a corrupted scion-agent.json), clear it so
+		// it does not leak into persistence or other downstream logic.
+		if harness.IsHarnessImplementationName(opts.HarnessAuth) {
+			opts.HarnessAuth = ""
 		}
 
 		// Surface resolved auth method so CLI can display it
@@ -567,6 +580,13 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		warnings = append(warnings, fmt.Sprintf("Auth: resolved as %s", authDetail))
 	}
 authDone:
+
+	// Unconditionally clear corrupted opts.HarnessAuth. This runs even when
+	// NoAuth is true (the auth block is skipped) to prevent re-persisting
+	// a corrupted value from a prior run's scion-agent.json.
+	if harness.IsHarnessImplementationName(opts.HarnessAuth) {
+		opts.HarnessAuth = ""
+	}
 
 	// 4. Launch container
 	detached := true
@@ -741,17 +761,33 @@ authDone:
 
 	// Persist harness auth override to scion-agent.json so sciontool inside the container sees it.
 	// The actual auth resolution override is applied earlier in the auth gathering block.
+	//
+	// When opts.HarnessAuth is empty but finalScionCfg carries a corrupted
+	// auth_selectedType (harness implementation name from a prior bug), clear
+	// it and rewrite the file to break the self-perpetuating corruption cycle.
 	if opts.HarnessAuth != "" {
 		if finalScionCfg == nil {
 			finalScionCfg = &api.ScionConfig{}
 		}
 		finalScionCfg.AuthSelectedType = opts.HarnessAuth
 		cfgData, marshalErr := json.MarshalIndent(finalScionCfg, "", "  ")
-		if marshalErr == nil {
-			configPath := filepath.Join(agentDir, "scion-agent.json")
-			if writeErr := os.WriteFile(configPath, cfgData, 0644); writeErr != nil {
-				return nil, fmt.Errorf("failed to write agent config %s: %w", configPath, writeErr)
-			}
+		if marshalErr != nil {
+			return nil, fmt.Errorf("failed to marshal agent config: %w", marshalErr)
+		}
+		configPath := filepath.Join(agentDir, "scion-agent.json")
+		if writeErr := os.WriteFile(configPath, cfgData, 0644); writeErr != nil {
+			return nil, fmt.Errorf("failed to write agent config %s: %w", configPath, writeErr)
+		}
+	} else if finalScionCfg != nil && harness.IsHarnessImplementationName(finalScionCfg.AuthSelectedType) {
+		// Active corruption repair: clear the corrupted value and rewrite.
+		finalScionCfg.AuthSelectedType = ""
+		cfgData, marshalErr := json.MarshalIndent(finalScionCfg, "", "  ")
+		if marshalErr != nil {
+			return nil, fmt.Errorf("failed to marshal repaired agent config: %w", marshalErr)
+		}
+		configPath := filepath.Join(agentDir, "scion-agent.json")
+		if writeErr := os.WriteFile(configPath, cfgData, 0644); writeErr != nil {
+			return nil, fmt.Errorf("failed to write agent config %s: %w", configPath, writeErr)
 		}
 	}
 
@@ -1308,28 +1344,23 @@ func secretEnvTarget(s api.ResolvedSecret) string {
 }
 
 func isAuthEnvKey(key string, extraAuthKeys ...map[string]struct{}) bool {
+	// GCP shared fields are always auth-related regardless of harness config
 	switch key {
-	case "GEMINI_API_KEY",
-		"GOOGLE_API_KEY",
-		"ANTHROPIC_API_KEY",
-		"CLAUDE_CODE_OAUTH_TOKEN",
-		"OPENAI_API_KEY",
-		"CODEX_API_KEY",
-		"GOOGLE_CLOUD_PROJECT",
+	case "GOOGLE_CLOUD_PROJECT",
 		"GCP_PROJECT",
 		"ANTHROPIC_VERTEX_PROJECT_ID",
 		"GOOGLE_CLOUD_REGION",
 		"CLOUD_ML_REGION",
 		"GOOGLE_CLOUD_LOCATION":
 		return true
-	default:
-		for _, extra := range extraAuthKeys {
-			if _, ok := extra[key]; ok {
-				return true
-			}
-		}
-		return false
 	}
+	// All other auth env keys come from the config-driven key set
+	for _, extra := range extraAuthKeys {
+		if _, ok := extra[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // configAuthEnvKeySet builds a set of env var keys declared across all auth

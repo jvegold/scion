@@ -52,6 +52,7 @@ type Agent struct {
 	Created           time.Time         `json:"created"`
 	Updated           time.Time         `json:"updated"`
 	LastSeen          time.Time         `json:"lastSeen,omitempty"`
+	LastActivityEvent time.Time         `json:"lastActivityEvent,omitempty"`
 	DeletedAt         time.Time         `json:"deletedAt,omitempty"`
 	CreatedBy         string            `json:"createdBy,omitempty"`
 	OwnerID           string            `json:"ownerId,omitempty"`
@@ -199,16 +200,17 @@ type ProjectProvider struct {
 
 // ProjectSettings represents project configuration settings.
 type ProjectSettings struct {
-	ActiveProfile        string                 `json:"activeProfile,omitempty"`
-	DefaultTemplate      string                 `json:"defaultTemplate,omitempty"`
-	DefaultHarnessConfig string                 `json:"defaultHarnessConfig,omitempty"`
-	DefaultModel         string                 `json:"defaultModel,omitempty"`
-	DefaultThinkingLevel *int                   `json:"defaultThinkingLevel,omitempty"`
-	TelemetryEnabled     *bool                  `json:"telemetryEnabled,omitempty"`
-	Bucket               *BucketConfig          `json:"bucket,omitempty"`
-	Runtimes             map[string]interface{} `json:"runtimes,omitempty"`
-	Harnesses            map[string]interface{} `json:"harnesses,omitempty"`
-	Profiles             map[string]interface{} `json:"profiles,omitempty"`
+	ActiveProfile          string                 `json:"activeProfile,omitempty"`
+	DefaultTemplate        string                 `json:"defaultTemplate,omitempty"`
+	DefaultHarnessConfig   string                 `json:"defaultHarnessConfig,omitempty"`
+	DefaultModel           string                 `json:"defaultModel,omitempty"`
+	DefaultThinkingLevel   *int                   `json:"defaultThinkingLevel,omitempty"`
+	TelemetryEnabled       *bool                  `json:"telemetryEnabled,omitempty"`
+	AutoExposePortsEnabled *bool                  `json:"autoExposePortsEnabled,omitempty"`
+	Bucket                 *BucketConfig          `json:"bucket,omitempty"`
+	Runtimes               map[string]interface{} `json:"runtimes,omitempty"`
+	Harnesses              map[string]interface{} `json:"harnesses,omitempty"`
+	Profiles               map[string]interface{} `json:"profiles,omitempty"`
 
 	// Default agent limits
 	DefaultMaxTurns      int                  `json:"defaultMaxTurns,omitempty"`
@@ -612,8 +614,10 @@ type HarnessConfig struct {
 
 // CloneProjectRequest is the request body for POST /api/v1/projects/{id}/clone.
 type CloneProjectRequest struct {
-	Name string `json:"name"`           // required
-	Slug string `json:"slug,omitempty"` // optional explicit slug override
+	Name       string `json:"name"`                 // required
+	Slug       string `json:"slug,omitempty"`       // optional explicit slug override
+	AsTemplate bool   `json:"asTemplate,omitempty"` // mark clone as template
+	GitRemote  string `json:"gitRemote,omitempty"`  // override source git remote
 }
 
 // HarnessConfigData holds harness-specific configuration.

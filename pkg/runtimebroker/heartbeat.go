@@ -80,6 +80,16 @@ type HeartbeatService struct {
 	doneCh chan struct{}
 }
 
+// SwapManager replaces the agent manager used by the heartbeat service.
+// This is called when the broker's container runtime changes (e.g. via
+// Server.SwapRuntime during onboarding) so the heartbeat picks up the
+// new runtime without being restarted.
+func (s *HeartbeatService) SwapManager(m agent.Manager) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.manager = m
+}
+
 // NewHeartbeatService creates a new heartbeat service.
 // The client must be an authenticated hubclient.RuntimeBrokerService.
 // The manager is used to gather agent status information.
@@ -179,40 +189,48 @@ func (s *HeartbeatService) run(ctx context.Context) {
 
 // sendHeartbeat sends a single heartbeat to the Hub.
 func (s *HeartbeatService) sendHeartbeat(ctx context.Context) error {
-	heartbeat := s.buildHeartbeat()
+	heartbeat := s.buildHeartbeat(ctx)
 	return s.client.Heartbeat(ctx, s.brokerID, heartbeat)
 }
 
 // buildHeartbeat constructs the heartbeat payload from current state.
-func (s *HeartbeatService) buildHeartbeat() *hubclient.BrokerHeartbeat {
+func (s *HeartbeatService) buildHeartbeat(ctx context.Context) *hubclient.BrokerHeartbeat {
 	status := "online"
 
 	heartbeat := &hubclient.BrokerHeartbeat{
 		Status: status,
 	}
 
-	// If we have a manager, gather per-project agent counts
-	if s.manager != nil {
-		projectAgents := s.gatherProjectAgents()
-		if len(projectAgents) > 0 {
-			heartbeat.Projects = projectAgents
-		}
+	// Gather per-project agent counts. gatherProjectAgents snapshots the
+	// current manager under its own lock and handles nil, so no separate
+	// nil check is needed here.
+	if projectAgents := s.gatherProjectAgents(ctx); len(projectAgents) > 0 {
+		heartbeat.Projects = projectAgents
 	}
 
 	return heartbeat
 }
 
 // gatherProjectAgents collects agent information grouped by project.
-func (s *HeartbeatService) gatherProjectAgents() []hubclient.ProjectHeartbeat {
-	if s.manager == nil {
+func (s *HeartbeatService) gatherProjectAgents(ctx context.Context) []hubclient.ProjectHeartbeat {
+	// Snapshot the current manager under the lock so that a concurrent
+	// SwapManager call (triggered by Server.SwapRuntime) is picked up
+	// on the next heartbeat tick rather than racing with this one.
+	s.mu.Lock()
+	mgr := s.manager
+	s.mu.Unlock()
+
+	if mgr == nil {
 		return nil
 	}
 
-	// List all agents managed by this broker (default runtime)
-	agents, err := s.manager.List(context.Background(), nil)
+	// List all agents managed by this broker (default runtime).
+	// If the default manager fails (e.g. its runtime binary is missing),
+	// log a warning and continue — auxiliary managers may still work.
+	agents, err := mgr.List(ctx, nil)
 	if err != nil {
-		s.log.Error("Failed to list agents for heartbeat", "error", err)
-		return nil
+		s.log.Warn("Default runtime agent listing failed for heartbeat, trying auxiliary runtimes", "error", err)
+		agents = nil
 	}
 
 	// Also include agents from auxiliary runtimes (e.g. Kubernetes).
@@ -229,7 +247,7 @@ func (s *HeartbeatService) gatherProjectAgents() []hubclient.ProjectHeartbeat {
 			seen[heartbeatAgentKey(ag)] = true
 		}
 		for _, auxMgr := range s.auxiliaryManagers() {
-			auxAgents, auxErr := auxMgr.List(context.Background(), nil)
+			auxAgents, auxErr := auxMgr.List(ctx, nil)
 			if auxErr != nil {
 				continue
 			}

@@ -23,7 +23,7 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
-import type { PageData, Agent, AgentPhase, Capabilities } from '../../shared/types.js';
+import type { PageData, Agent, AgentPhase, Capabilities, AgentMetricsSummary } from '../../shared/types.js';
 import { can, isTerminalAvailable, getAgentDisplayStatus, isAgentRunning } from '../../shared/types.js';
 
 type AgentSortField = 'name' | 'status' | 'created' | 'updated';
@@ -36,6 +36,9 @@ import type { ViewMode } from '../shared/view-toggle.js';
 import '../shared/status-badge.js';
 import '../shared/view-toggle.js';
 import '../shared/agent-tree-view.js';
+import '../shared/quick-message-dialog.js';
+import { showToast } from '../../utils/toast.js';
+import { showConfirm } from '../shared/confirm-dialog.js';
 
 @customElement('scion-page-agents')
 export class ScionPageAgents extends LitElement {
@@ -104,6 +107,19 @@ export class ScionPageAgents extends LitElement {
 
   @state()
   private sortDir: SortDir = 'desc';
+
+  @state()
+  private quickMessageAgentId = '';
+
+  @state()
+  private quickMessageAgentName = '';
+
+  @state()
+  private quickMessageOpen = false;
+
+  /** Per-agent metrics summaries, keyed by agent ID. */
+  @state()
+  private agentMetrics: Record<string, AgentMetricsSummary> = {};
 
   static override styles = [
     listPageStyles,
@@ -413,11 +429,43 @@ export class ScionPageAgents extends LitElement {
 
     try {
       await this.fetchAndMergeAgents();
+      // Load metrics in background — non-blocking.
+      this.loadAgentMetrics();
     } catch (err) {
       console.error('Failed to load agents:', err);
       this.error = err instanceof Error ? err.message : 'Failed to load agents';
     } finally {
       this.loading = false;
+    }
+  }
+
+  /**
+   * Load metrics summaries for displayed agents. Caps the number of requests
+   * and limits concurrency to avoid overwhelming the backend.
+   */
+  private async loadAgentMetrics(): Promise<void> {
+    const maxAgents = 20;
+    const concurrency = 5;
+    const subset = this.agents.slice(0, maxAgents);
+    const accumulatedMetrics = { ...this.agentMetrics };
+
+    // Process in batches of `concurrency`.
+    for (let i = 0; i < subset.length; i += concurrency) {
+      const batch = subset.slice(i, i + concurrency);
+      await Promise.all(
+        batch.map(async (agent) => {
+          try {
+            const res = await apiFetch(`/api/v1/agents/${agent.id}/metrics/summary`);
+            if (res.ok) {
+              const data = (await res.json()) as AgentMetricsSummary;
+              accumulatedMetrics[agent.id] = data;
+            }
+          } catch {
+            // Metrics loading is optional per agent.
+          }
+        })
+      );
+      this.agentMetrics = { ...accumulatedMetrics };
     }
   }
 
@@ -464,7 +512,7 @@ export class ScionPageAgents extends LitElement {
     event?: MouseEvent
   ): Promise<void> {
     if (action === 'delete') {
-      if (!event?.altKey && !confirm('Are you sure you want to delete this agent?')) {
+      if (!event?.altKey && !(await showConfirm('Are you sure you want to delete this agent?'))) {
         return;
       }
       // Show per-button spinner for delete; don't optimistically remove
@@ -485,7 +533,7 @@ export class ScionPageAgents extends LitElement {
         this.backgroundRefresh();
       } catch (err) {
         console.error('Failed to delete agent:', err);
-        alert(err instanceof Error ? err.message : 'Failed to delete agent');
+        showToast(err instanceof Error ? err.message : 'Failed to delete agent');
       } finally {
         this.actionLoading = { ...this.actionLoading, [agentId]: false };
       }
@@ -524,7 +572,7 @@ export class ScionPageAgents extends LitElement {
       this.backgroundRefresh();
     } catch (err) {
       console.error(`Failed to ${action} agent:`, err);
-      alert(err instanceof Error ? err.message : `Failed to ${action} agent`);
+      showToast(err instanceof Error ? err.message : `Failed to ${action} agent`);
       // Roll back optimistic update on failure
       this.backgroundRefresh();
     }
@@ -535,7 +583,7 @@ export class ScionPageAgents extends LitElement {
   }
 
   private async handleStopAll(): Promise<void> {
-    if (!confirm('Are you sure you want to stop all running agents?')) {
+    if (!(await showConfirm('Are you sure you want to stop all running agents?'))) {
       return;
     }
 
@@ -556,13 +604,13 @@ export class ScionPageAgents extends LitElement {
 
       const result = (await response.json()) as { stopped: number; failed: number };
       if (result.failed > 0) {
-        alert(`Stopped ${result.stopped} agents, ${result.failed} failed.`);
+        showToast(`Stopped ${result.stopped} agents, ${result.failed} failed.`, 'warning');
       }
 
       this.backgroundRefresh();
     } catch (err) {
       console.error('Failed to stop all agents:', err);
-      alert(err instanceof Error ? err.message : 'Failed to stop all agents');
+      showToast(err instanceof Error ? err.message : 'Failed to stop all agents');
       this.backgroundRefresh();
     } finally {
       this.stopAllLoading = false;
@@ -602,7 +650,7 @@ export class ScionPageAgents extends LitElement {
           cmp = (a.created || '').localeCompare(b.created || '');
           break;
         case 'updated':
-          cmp = (a.updated || '').localeCompare(b.updated || '');
+          cmp = ((a.lastActivityEvent && !a.lastActivityEvent.startsWith('0001')) ? a.lastActivityEvent : (a.updated || '')).localeCompare((b.lastActivityEvent && !b.lastActivityEvent.startsWith('0001')) ? b.lastActivityEvent : (b.updated || ''));
           break;
       }
       return this.sortDir === 'asc' ? cmp : -cmp;
@@ -724,6 +772,13 @@ export class ScionPageAgents extends LitElement {
         ${this.renderFilterBar()}
         ${this.renderAgents()}
       `}
+
+      <scion-quick-message-dialog
+        agentId=${this.quickMessageAgentId}
+        agentName=${this.quickMessageAgentName}
+        ?open=${this.quickMessageOpen}
+        @sl-request-close=${() => { this.quickMessageOpen = false; }}
+      ></scion-quick-message-dialog>
     `;
   }
 
@@ -879,6 +934,26 @@ export class ScionPageAgents extends LitElement {
     const isLoading = this.actionLoading[agent.id] || false;
 
     return html`
+      ${can(agent._capabilities, 'message') ? html`
+        <sl-tooltip content="Message">
+          <span style="display: inline-flex">
+            <sl-button
+              class="action-btn-primary"
+              variant="default"
+              size="small"
+              outline
+              @click=${() => {
+                this.quickMessageAgentId = agent.id;
+                this.quickMessageAgentName = agent.name;
+                this.quickMessageOpen = true;
+              }}
+              aria-label="Message"
+            >
+              <sl-icon slot="prefix" name="chat-dots"></sl-icon>
+            </sl-button>
+          </span>
+        </sl-tooltip>
+      ` : nothing}
       ${can(agent._capabilities, 'attach') ? html`
         <sl-tooltip content="Terminal">
           <span style="display: inline-flex">
@@ -1014,6 +1089,15 @@ export class ScionPageAgents extends LitElement {
 
         ${agent.taskSummary ? html` <div class="agent-task">${agent.taskSummary}</div> ` : ''}
 
+        ${this.agentMetrics[agent.id]
+          ? html`
+              <div class="agent-meta" style="margin-top: 0.5em; font-size: 0.8em; color: var(--scion-text-muted, #888);">
+                <div><sl-icon name="bar-chart"></sl-icon> ${this.agentMetrics[agent.id].totalSessions} sessions</div>
+                <div><sl-icon name="hash"></sl-icon> ${(this.agentMetrics[agent.id].totalTokensInput + this.agentMetrics[agent.id].totalTokensOutput).toLocaleString()} tokens</div>
+              </div>
+            `
+          : nothing}
+
         ${agent.labels && Object.keys(agent.labels).length > 0
           ? html`<div class="agent-labels" style="margin-top: 0.5em;">${Object.entries(agent.labels).map(
               ([k, v]) => html`<sl-tag size="small" variant="neutral" style="margin: 0.15em;">${k}: ${v}</sl-tag>`
@@ -1048,6 +1132,8 @@ export class ScionPageAgents extends LitElement {
                 @click=${() => this.toggleSort('updated')}
               >Updated <span class="sort-indicator">${this.sortIndicator('updated')}</span></th>
               <th class="hide-mobile">Task</th>
+              <th class="hide-mobile">Sessions</th>
+              <th class="hide-mobile">Tokens</th>
               <th style="text-align: right">Actions</th>
             </tr>
           </thead>
@@ -1077,10 +1163,12 @@ export class ScionPageAgents extends LitElement {
             size="small"
           ></scion-status-badge>
         </td>
-        <td class="hide-mobile">${agent.updated ? this.formatRelativeTime(agent.updated) : '\u2014'}</td>
+        <td class="hide-mobile">${((agent.lastActivityEvent && !agent.lastActivityEvent.startsWith('0001')) || agent.updated) ? this.formatRelativeTime(((agent.lastActivityEvent && !agent.lastActivityEvent.startsWith('0001')) ? agent.lastActivityEvent : agent.updated)!) : '\u2014'}</td>
         <td class="hide-mobile">
           <span class="task-cell">${agent.taskSummary || '\u2014'}</span>
         </td>
+        <td class="hide-mobile">${this.agentMetrics[agent.id] ? this.agentMetrics[agent.id].totalSessions : '\u2014'}</td>
+        <td class="hide-mobile">${this.agentMetrics[agent.id] ? (this.agentMetrics[agent.id].totalTokensInput + this.agentMetrics[agent.id].totalTokensOutput).toLocaleString() : '\u2014'}</td>
         <td class="actions-cell">
           <span class="table-actions">
             ${this.renderActionButtons(agent)}

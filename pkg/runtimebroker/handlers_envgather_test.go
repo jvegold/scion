@@ -27,6 +27,73 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 )
 
+// claudeAuthBlock is the declarative auth metadata for the claude harness,
+// matching the production harnesses/claude/config.yaml. Tests that need
+// config-driven auth preflight include this block in their harness-config fixture.
+const claudeAuthBlock = `auth:
+  default_type: api-key
+  types:
+    api-key:
+      required_env:
+        - any_of: ["ANTHROPIC_API_KEY"]
+    vertex-ai:
+      required_env:
+        - any_of: ["GOOGLE_CLOUD_PROJECT"]
+        - any_of: ["GOOGLE_CLOUD_REGION", "CLOUD_ML_REGION", "GOOGLE_CLOUD_LOCATION"]
+      required_files:
+        - name: gcloud-adc
+          type: file
+          description: "Google Cloud Application Default Credentials (ADC) file for vertex-ai authentication"
+          field: GoogleAppCredentials
+          alternative_env_keys: ["GOOGLE_APPLICATION_CREDENTIALS"]
+          skipped_when_gcp_service_account_assigned: true
+          required: true
+  autodetect:
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: vertex-ai
+      GOOGLE_CLOUD_PROJECT: vertex-ai
+      ANTHROPIC_API_KEY: api-key
+    files:
+      gcloud-adc: vertex-ai
+`
+
+// geminiAuthBlock is the declarative auth metadata for the gemini harness,
+// matching the production harnesses/gemini-cli/config.yaml.
+const geminiAuthBlock = `auth:
+  default_type: api-key
+  types:
+    api-key:
+      required_env:
+        - any_of: ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+    auth-file:
+      required_files:
+        - name: GEMINI_OAUTH_CREDS
+          type: file
+          target_suffix: "/.gemini/oauth_creds.json"
+          field: OAuthCreds
+    vertex-ai:
+      required_env:
+        - any_of: ["GOOGLE_CLOUD_PROJECT"]
+        - any_of: ["GOOGLE_CLOUD_REGION", "CLOUD_ML_REGION", "GOOGLE_CLOUD_LOCATION"]
+      required_files:
+        - name: gcloud-adc
+          type: file
+          description: "Google Cloud Application Default Credentials (ADC) file for vertex-ai authentication"
+          field: GoogleAppCredentials
+          alternative_env_keys: ["GOOGLE_APPLICATION_CREDENTIALS"]
+          skipped_when_gcp_service_account_assigned: true
+          required: true
+  autodetect:
+    env:
+      GEMINI_API_KEY: api-key
+      GOOGLE_API_KEY: api-key
+      GOOGLE_APPLICATION_CREDENTIALS: vertex-ai
+      GOOGLE_CLOUD_PROJECT: vertex-ai
+    files:
+      GEMINI_OAUTH_CREDS: auth-file
+      gcloud-adc: vertex-ai
+`
+
 // newTestServerWithProjectPath creates a test server with a temporary project path
 // that has versioned settings with declared env vars.
 func newTestServerWithProjectPath(t *testing.T, settingsYAML string) (*Server, *envCapturingManager, string) {
@@ -1299,7 +1366,7 @@ profiles:
 // and SecretInfo showing type=file.
 func TestEnvGather_VertexAI_RequiresADCFile(t *testing.T) {
 	srv, _, projectDir := newTestServerWithHarnessConfig(t, "claude",
-		"harness: claude\nimage: test-image\nuser: scion\nauth_selected_type: vertex-ai\n",
+		"harness: claude\nimage: test-image\nuser: scion\nauth_selected_type: vertex-ai\n"+claudeAuthBlock,
 		`
 schema_version: "1"
 harness_configs:
@@ -1425,7 +1492,7 @@ profiles:
 func TestEnvGather_AutoDetectVertexAI_FromGACEnvVar(t *testing.T) {
 	// No auth_selected_type set — auto-detect should kick in
 	srv, _, projectDir := newTestServerWithHarnessConfig(t, "claude",
-		"harness: claude\nimage: test-image\nuser: scion\n",
+		"harness: claude\nimage: test-image\nuser: scion\n"+claudeAuthBlock,
 		`
 schema_version: "1"
 harness_configs:
@@ -1588,7 +1655,7 @@ profiles:
 // non-admin users who only have GCP credentials.
 func TestEnvGather_AutoDetectVertexAI_FromGCPProject(t *testing.T) {
 	srv, _, projectDir := newTestServerWithHarnessConfig(t, "claude",
-		"harness: claude\nimage: test-image\nuser: scion\n",
+		"harness: claude\nimage: test-image\nuser: scion\n"+claudeAuthBlock,
 		`
 schema_version: "1"
 harness_configs:
@@ -1739,7 +1806,7 @@ func TestEnvGather_HarnessAuthOverride(t *testing.T) {
 	// Provide an OAuth file secret so auto-detect would normally pick auth-file.
 	// But --harness-auth api-key should override to api-key, requiring GEMINI_API_KEY.
 	srv, _, projectDir := newTestServerWithHarnessConfig(t, "gemini",
-		"harness: gemini\nimage: test-image\nuser: scion\n",
+		"harness: gemini\nimage: test-image\nuser: scion\n"+geminiAuthBlock,
 		`
 schema_version: "1"
 profiles:
@@ -1820,7 +1887,7 @@ profiles:
 	if err := os.MkdirAll(hcDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(hcDir, "config.yaml"), []byte("harness: gemini\nimage: test-image\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(hcDir, "config.yaml"), []byte("harness: gemini\nimage: test-image\n"+geminiAuthBlock), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1918,7 +1985,7 @@ profiles:
 
 func TestEnvGather_HarnessAuthOverrideVertexAI(t *testing.T) {
 	srv, _, projectDir := newTestServerWithHarnessConfig(t, "gemini",
-		"harness: gemini\nimage: test-image\nuser: scion\n",
+		"harness: gemini\nimage: test-image\nuser: scion\n"+geminiAuthBlock,
 		`
 schema_version: "1"
 profiles:
@@ -1964,5 +2031,84 @@ profiles:
 	}
 	if !foundProject {
 		t.Errorf("expected GOOGLE_CLOUD_PROJECT in needs/required when harnessAuth=vertex-ai, got needs=%v required=%v", envReqs.Needs, envReqs.Required)
+	}
+}
+
+// TestEnvGather_AlternativesForAnyOfGroup tests that when the broker returns a
+// 202 with a needed key from an any_of group, the Alternatives field maps the
+// canonical key to its alternative names from the group.
+// Regression test for the GOOGLE_CLOUD_LOCATION as_needed bug: the hub needs
+// to know that CLOUD_ML_REGION and GOOGLE_CLOUD_LOCATION are alternatives for
+// GOOGLE_CLOUD_REGION so it can match as_needed env vars stored under those names.
+func TestEnvGather_AlternativesForAnyOfGroup(t *testing.T) {
+	srv, _, projectDir := newTestServerWithHarnessConfig(t, "claude",
+		"harness: claude\nimage: test-image\nuser: scion\n"+claudeAuthBlock,
+		`
+schema_version: "1"
+harness_configs:
+  claude:
+    harness: claude
+profiles:
+  default:
+    runtime: mock
+`)
+
+	body := `{
+		"name": "test-agent-alternatives",
+		"id": "agent-uuid-alt",
+		"gatherEnv": true,
+		"grovePath": "` + projectDir + `",
+		"resolvedEnv": {
+			"GOOGLE_CLOUD_PROJECT": "my-project"
+		},
+		"config": {"template": "claude", "harnessConfig": "claude", "profile": "default"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 (vertex-ai needs region), got %d: %s", w.Code, w.Body.String())
+	}
+
+	var envReqs EnvRequirementsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &envReqs); err != nil {
+		t.Fatal("failed to decode response:", err)
+	}
+
+	// Verify GOOGLE_CLOUD_REGION is in Needs (canonical key)
+	needsMap := make(map[string]struct{})
+	for _, k := range envReqs.Needs {
+		needsMap[k] = struct{}{}
+	}
+	if _, ok := needsMap["GOOGLE_CLOUD_REGION"]; !ok {
+		t.Fatalf("expected GOOGLE_CLOUD_REGION in Needs, got %v", envReqs.Needs)
+	}
+
+	// Verify Alternatives map contains the any_of alternatives for GOOGLE_CLOUD_REGION
+	if envReqs.Alternatives == nil {
+		t.Fatal("expected non-nil Alternatives map")
+	}
+	alts, ok := envReqs.Alternatives["GOOGLE_CLOUD_REGION"]
+	if !ok {
+		t.Fatalf("expected GOOGLE_CLOUD_REGION in Alternatives map, got %v", envReqs.Alternatives)
+	}
+
+	altSet := make(map[string]struct{}, len(alts))
+	for _, a := range alts {
+		altSet[a] = struct{}{}
+	}
+	if _, ok := altSet["CLOUD_ML_REGION"]; !ok {
+		t.Errorf("expected CLOUD_ML_REGION in alternatives for GOOGLE_CLOUD_REGION, got %v", alts)
+	}
+	if _, ok := altSet["GOOGLE_CLOUD_LOCATION"]; !ok {
+		t.Errorf("expected GOOGLE_CLOUD_LOCATION in alternatives for GOOGLE_CLOUD_REGION, got %v", alts)
+	}
+
+	// Satisfied keys should NOT appear in Alternatives
+	if _, ok := envReqs.Alternatives["GOOGLE_CLOUD_PROJECT"]; ok {
+		t.Errorf("GOOGLE_CLOUD_PROJECT should not be in Alternatives (it is satisfied)")
 	}
 }

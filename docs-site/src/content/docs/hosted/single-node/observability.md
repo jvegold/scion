@@ -83,6 +83,16 @@ scion server start --enable-hub
 
 Both approaches can be used simultaneously — OTel for the full telemetry pipeline and Cloud Logging for direct log delivery.
 
+### Google Cloud Error Reporting Integration
+
+For platform operators running in Google Cloud, Scion's logging handlers (`GCPHandler` and `CloudHandler`) natively integrate with **Google Cloud Error Reporting** to automatically discover, group, and track application errors:
+
+1.  **Service Context Grouping**: The loggers automatically inject a `serviceContext` group containing the system component name (e.g. `scion-hub`, `scion-broker`, or `scion-server`) and its build version on all log entries across all severity levels.
+2.  **Automated Error Capture**: On any log entry of severity `ERROR` or higher, the loggers automatically parse the caller's stack frame and inject a `stack_trace` string along with a specific `@type` metadata annotation (set to `type.googleapis.com/google.devtools.clouderrorreporting.v1beta1.ReportedErrorEvent`).
+3.  **Preservation of Custom Annotations**: These attributes allow GCP Error Reporting to instantly parse and group log entries. If your application or a custom hook logs a pre-structured error that already specifies a custom `@type` field, Scion preserves your custom annotation instead of overriding it.
+
+This features works transparently with both the standard OTel log-bridging handler and the direct `cloud.google.com/go/logging` client library.
+
 ### Configuring Agent Telemetry
 
 Agents use `sciontool` as their init process, which includes an embedded OTLP forwarder. This forwarder must be configured to point to your cloud backend.
@@ -147,6 +157,10 @@ The `sciontool` utility ensures that `agent.log` is owned by the `scion` user du
 ## Telemetry Collection
 
 The telemetry pipeline in sciontool collects and forwards OpenTelemetry (OTLP) data from agents. See the [Metrics & OpenTelemetry guide](/scion/hosted/single-node/metrics/) for deep configuration details.
+
+### Telemetry Export Resilience
+
+To safeguard against transient network issues or temporary destination outages, `sciontool`'s telemetry pipeline includes automated **retry with exponential backoff** for all cloud OTLP exports. When an export attempt fails (e.g. due to rate limits or transient 5xx errors from the cloud backend), the pipeline retries with a progressively increasing delay, ensuring high telemetry delivery reliability and preventing data loss.
 
 ### What's Collected
 
@@ -228,6 +242,8 @@ Hub and Broker logs include a `subsystem` attribute that identifies the internal
 | `broker.messages` | Message injection into agent tmux sessions |
 | `broker.heartbeat` | Periodic broker status reports to hub |
 | `broker.env-secrets` | Broker-side environment gathering and finalization |
+
+With the complete roll-out of Tier 3 subsystem logging, dotted logging tags now systematically cover all CRUD handlers across these subsystems, providing comprehensive filtering and tracing for all resource-management actions.
 
 In combo server mode (`scion-server`), both `hub.*` and `broker.*` subsystem logs appear in the same stream. The dotted prefix distinguishes them without requiring separate processes.
 
@@ -399,6 +415,33 @@ Server maintenance operations (like `rebuild-server`, `rebuild-web`, and `pull-i
 If you see logs but they aren't linked to traces in the Cloud Trace waterfall:
 1.  Ensure the agent is using the `sciontool` gRPC port (4317).
 2.  Verify `SCION_OTEL_LOG_ENABLED=true` is set on the system components.
+
+### Common Hub and Broker API Errors
+
+#### 1. `no_runtime_broker` (422 Unprocessable Entity)
+* **Symptom:** Dispatched agents or CLI commands like `scion start` fail immediately with a `no_runtime_broker` error code.
+* **Observable:** The Hub server logs contain `ErrCodeNoRuntimeBroker` or `no_runtime_broker` error messages.
+* **Root Cause:** The Runtime Broker is disconnected, locked up, or saturated (failing to send heartbeats within the expected interval). High load or redundant synchronous workspace sweeps can block heartbeats.
+* **Operator Action:** 
+  1. Check broker daemon health and restart the broker service if unresponsive.
+  2. Wait 30–60 seconds for heartbeats to resume after a restart.
+  3. Reduce concurrent agent start operations under high load.
+
+#### 2. Agent Token Verification Failures
+* **Symptom:** Agents fail to start or refresh tokens with errors like `failed to verify token: error in cryptographic primitive` or repeat `Token refresh failed … 401` in logs.
+* **Observable:** Loop between user `login` and `session_expired` states.
+* **Root Cause:** The Hub regenerated its JWT/session signing keys on restart, or there is a multi-replica key mismatch (replicas using different signing keys).
+* **Operator Action:** 
+  1. Pin the session/JWT signing key securely in the deployment configuration. Ensure `SESSION_SECRET` (or `SharedSigningSecret`) is set consistently across all Hub replicas and survives restarts.
+  2. Have users run `scion message <agent> "continue"` to trigger resume, or perform a manual login refresh.
+
+#### 3. Duplicate `sciontool` Processes (Split-Brain Agent)
+* **Symptom:** An agent gets stuck in the `starting` phase while its activity says `completed`, or has port conflicts.
+* **Observable:** Agent logs show `sciontool init starting as PID <different-pid>` and `Failed to start telemetry: ... address already in use` or similar port conflicts.
+* **Root Cause:** A duplicate `sciontool` process was spawned. This typically happens when test runners (like `go test`) or child processes inherit Hub/agent environment variables and invoke a second `sciontool init`.
+* **Operator Action:** 
+  1. Inspect running processes inside the agent container and terminate the duplicate PID.
+  2. Recreate the agent to clean up the telemetry socket and state files.
 
 ## Related Guides
 

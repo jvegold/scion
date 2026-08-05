@@ -68,6 +68,7 @@ type Layer1Snapshot struct {
 
 	// Lifecycle
 	AutoSuspendStalled    bool
+	StalledThreshold      string // postgres-mode only (see type comment)
 	SoftDeleteRetention   string // postgres-mode only (see type comment)
 	SoftDeleteRetainFiles bool   // postgres-mode only (see type comment)
 
@@ -85,6 +86,9 @@ type Layer1Snapshot struct {
 	TelemetryEnabled *bool
 	TelemetryConfig  *config.V1TelemetryConfig
 
+	// Auto-expose ports
+	AutoExposePortsEnabled *bool
+
 	// Agent defaults
 	DefaultTemplate      string
 	DefaultHarnessConfig string
@@ -92,6 +96,8 @@ type Layer1Snapshot struct {
 	DefaultMaxModelCalls int
 	DefaultMaxDuration   string
 	DefaultResources     *api.ResourceSpec
+	DefaultModel         string
+	DefaultThinkingLevel *int
 
 	// Endpoints
 	PublicURL     string
@@ -557,6 +563,7 @@ func buildSnapshotFromKoanf(k *koanf.Koanf) Layer1Snapshot {
 
 	// Lifecycle
 	snap.AutoSuspendStalled = k.Bool("server.hub.auto_suspend_stalled")
+	snap.StalledThreshold = k.String("server.hub.stalled_threshold")
 	snap.SoftDeleteRetention = k.String("server.hub.soft_delete_retention")
 	snap.SoftDeleteRetainFiles = k.Bool("server.hub.soft_delete_retain_files")
 
@@ -564,6 +571,12 @@ func buildSnapshotFromKoanf(k *koanf.Koanf) Layer1Snapshot {
 	if k.Exists("telemetry.enabled") {
 		v := k.Bool("telemetry.enabled")
 		snap.TelemetryEnabled = &v
+	}
+
+	// Auto-expose ports
+	if k.Exists("auto_expose_ports.enabled") {
+		v := k.Bool("auto_expose_ports.enabled")
+		snap.AutoExposePortsEnabled = &v
 	}
 	teleSub := k.Cut("telemetry")
 	if teleSub != nil && len(teleSub.Keys()) > 0 {
@@ -582,6 +595,11 @@ func buildSnapshotFromKoanf(k *koanf.Koanf) Layer1Snapshot {
 	snap.DefaultMaxTurns = k.Int("default_max_turns")
 	snap.DefaultMaxModelCalls = k.Int("default_max_model_calls")
 	snap.DefaultMaxDuration = k.String("default_max_duration")
+	snap.DefaultModel = k.String("default_model")
+	if k.Exists("default_thinking_level") {
+		v := k.Int("default_thinking_level")
+		snap.DefaultThinkingLevel = &v
+	}
 	if k.Exists("default_resources") {
 		data, err := json.Marshal(k.Get("default_resources"))
 		if err == nil {
@@ -679,6 +697,15 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		applied = append(applied, "telemetry_config")
 	}
 
+	// Auto-expose ports
+	if snap.AutoExposePortsEnabled != nil {
+		oldVal := s.config.AutoExposePortsDefault
+		s.config.AutoExposePortsDefault = snap.AutoExposePortsEnabled
+		if oldVal == nil || *oldVal != *snap.AutoExposePortsEnabled {
+			applied = append(applied, "auto_expose_ports_default")
+		}
+	}
+
 	// Admin emails
 	if len(snap.AdminEmails) > 0 {
 		s.config.AdminEmails = snap.AdminEmails
@@ -690,6 +717,24 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 	s.config.AutoSuspendStalled = snap.AutoSuspendStalled
 	if oldAutoSuspend != snap.AutoSuspendStalled {
 		applied = append(applied, "auto_suspend_stalled")
+	}
+
+	// Stalled threshold
+	if snap.StalledThreshold != "" {
+		if d, err := time.ParseDuration(snap.StalledThreshold); err == nil {
+			if d < 2*time.Minute {
+				defaultThreshold := DefaultServerConfig().StalledThreshold
+				slog.Warn("stalled_threshold below minimum 2m, using default",
+					"configured", snap.StalledThreshold, "default", defaultThreshold)
+				d = defaultThreshold
+			}
+			if s.config.StalledThreshold != d {
+				applied = append(applied, "stalled_threshold")
+			}
+			s.config.StalledThreshold = d
+		} else {
+			slog.Warn("invalid stalled_threshold duration, keeping current value", "value", snap.StalledThreshold, "error", err)
+		}
 	}
 
 	// User access mode
@@ -733,6 +778,8 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		DefaultMaxTurns:      snap.DefaultMaxTurns,
 		DefaultMaxModelCalls: snap.DefaultMaxModelCalls,
 		DefaultMaxDuration:   snap.DefaultMaxDuration,
+		DefaultModel:         snap.DefaultModel,
+		DefaultThinkingLevel: snap.DefaultThinkingLevel,
 	}
 	// Deep-copy the one pointer field, symmetrically with hubAgentDefaults()'s
 	// read side. Aliasing the snapshot's pointee would leave the CALLER of
@@ -743,6 +790,10 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 	if snap.DefaultResources != nil {
 		rs := *snap.DefaultResources
 		newDefaults.DefaultResources = &rs
+	}
+	if snap.DefaultThinkingLevel != nil {
+		v := *snap.DefaultThinkingLevel
+		newDefaults.DefaultThinkingLevel = &v
 	}
 	if !agentDefaultsEqual(s.config.AgentDefaults, newDefaults) {
 		applied = append(applied, "agent_defaults")

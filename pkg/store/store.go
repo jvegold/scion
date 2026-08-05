@@ -131,6 +131,9 @@ type Store interface {
 
 	// ProjectPreStartHook operations (Project-Level Pre-Start Customization Scripts)
 	ProjectPreStartHookStore
+
+	// AgentSessionMetrics operations (Hub Metrics Reporting)
+	AgentSessionMetricsStore
 }
 
 // AgentStore defines agent-related persistence operations.
@@ -163,6 +166,9 @@ type AgentStore interface {
 	// UpdateAgentStatus updates only status-related fields.
 	// This is a partial update that doesn't require version checking.
 	UpdateAgentStatus(ctx context.Context, id string, status AgentStatusUpdate) error
+
+	// UpdateAgentExposedPorts updates only exposed port registrations.
+	UpdateAgentExposedPorts(ctx context.Context, id string, ports []ExposedPort) error
 
 	// PurgeDeletedAgents permanently removes soft-deleted agents older than cutoff.
 	// Returns the number of agents purged.
@@ -198,6 +204,11 @@ type AgentStore interface {
 	// active remote brokers are left untouched. Returns the number of projects
 	// updated.
 	ReassignProjectBroker(ctx context.Context, oldBrokerID, newBrokerID string) (int, error)
+
+	// AggregateAgentHealth returns lightweight health-oriented counts and lists
+	// for the health-summary endpoint without fetching full agent records.
+	// This avoids the O(N) deserialization cost of ListAgents on large installations.
+	AggregateAgentHealth(ctx context.Context) (*AgentHealthAggregate, error)
 }
 
 // AgentFilter defines criteria for filtering agents.
@@ -230,6 +241,27 @@ type AgentFilter struct {
 	// Labels, when non-empty, restricts results to agents whose labels
 	// contain all specified key-value pairs (AND semantics).
 	Labels map[string]string
+}
+
+// AgentHealthAggregate holds pre-computed counts and short lists used by the
+// health-summary endpoint. It avoids loading full agent records.
+type AgentHealthAggregate struct {
+	Total   int            // Total number of non-deleted agents
+	ByPhase map[string]int // Count per lifecycle phase
+
+	// Per-broker counts: map[brokerID] → {count, healthy}
+	ByBroker map[string]AgentBrokerCounts
+
+	// Names of agents in unhealthy states (capped at 100 per list).
+	StalledNames []string
+	CrashedNames []string
+	ErroredNames []string
+}
+
+// AgentBrokerCounts holds per-broker agent tallies.
+type AgentBrokerCounts struct {
+	Count   int
+	Healthy int
 }
 
 // AgentStatusUpdate contains fields for status-only updates.
@@ -318,6 +350,11 @@ type ProjectFilter struct {
 	// this value. Used with MemberProjectIDs to return "shared" projects (member
 	// but not owner).
 	ExcludeOwnerID string
+
+	// IsTemplate, when non-nil, restricts results to template projects
+	// (true) or non-template projects (false). Template projects carry the
+	// scion.io/template: "true" label.
+	IsTemplate *bool
 }
 
 // RuntimeBrokerStore defines runtime broker persistence operations.
@@ -1421,4 +1458,36 @@ type HubSettingStore interface {
 	// the origin field. Rows with updated_by="seed" get origin="seeded";
 	// all other non-_meta rows get origin="managed". Idempotent.
 	BackfillOrigin(ctx context.Context) error
+}
+
+// =============================================================================
+// Agent Session Metrics (Hub Metrics Reporting)
+// =============================================================================
+
+// AgentSessionMetricsStore defines operations for agent session metrics.
+type AgentSessionMetricsStore interface {
+	// CreateAgentSessionMetrics creates a new session metrics record.
+	CreateAgentSessionMetrics(ctx context.Context, m *AgentSessionMetrics) error
+
+	// GetAgentSessionMetrics retrieves a session metrics record by ID.
+	// Returns ErrNotFound if the record doesn't exist.
+	GetAgentSessionMetrics(ctx context.Context, id string) (*AgentSessionMetrics, error)
+
+	// ListAgentSessionMetricsByAgent returns all session metrics for an agent,
+	// ordered by started_at DESC.
+	ListAgentSessionMetricsByAgent(ctx context.Context, agentID string) ([]*AgentSessionMetrics, error)
+
+	// ListAgentSessionMetricsByProject returns all session metrics for a project,
+	// ordered by started_at DESC.
+	ListAgentSessionMetricsByProject(ctx context.Context, projectID string) ([]*AgentSessionMetrics, error)
+
+	// AggregateByAgent returns SQL-level aggregate totals for an agent's sessions.
+	AggregateByAgent(ctx context.Context, agentID string) (*AgentSessionMetricsAggregates, error)
+
+	// AggregateByProject returns SQL-level aggregate totals for a project's sessions.
+	AggregateByProject(ctx context.Context, projectID string) (*AgentSessionMetricsAggregates, error)
+
+	// CountDistinctAgentsByProject returns the number of distinct agents with
+	// session metrics in a project.
+	CountDistinctAgentsByProject(ctx context.Context, projectID string) (int, error)
 }

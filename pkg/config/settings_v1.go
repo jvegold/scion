@@ -262,6 +262,7 @@ func PrintDeprecationWarnings(warnings []string) {
 // VersionedSettings is the root configuration struct for versioned settings (v1+).
 type VersionedSettings struct {
 	SchemaVersion        string                        `json:"schema_version" yaml:"schema_version" koanf:"schema_version"`
+	ProjectType          string                        `json:"project_type,omitempty" yaml:"project_type,omitempty" koanf:"project_type"`
 	ActiveProfile        string                        `json:"active_profile,omitempty" yaml:"active_profile,omitempty" koanf:"active_profile"`
 	DefaultTemplate      string                        `json:"default_template,omitempty" yaml:"default_template,omitempty" koanf:"default_template"`
 	DefaultHarnessConfig string                        `json:"default_harness_config,omitempty" yaml:"default_harness_config,omitempty" koanf:"default_harness_config"`
@@ -284,10 +285,22 @@ type VersionedSettings struct {
 	DefaultMaxDuration   string            `json:"default_max_duration,omitempty" yaml:"default_max_duration,omitempty" koanf:"default_max_duration"`
 	DefaultResources     *api.ResourceSpec `json:"default_resources,omitempty" yaml:"default_resources,omitempty" koanf:"default_resources"`
 
+	// Default agent model settings
+	DefaultModel         string `json:"default_model,omitempty" yaml:"default_model,omitempty" koanf:"default_model"`
+	DefaultThinkingLevel *int   `json:"default_thinking_level,omitempty" yaml:"default_thinking_level,omitempty" koanf:"default_thinking_level"`
+
 	// AutoInjectGcloudADC controls whether the host's gcloud Application Default
 	// Credentials file is automatically injected into agent containers in
 	// co-located (workstation) mode.
 	AutoInjectGcloudADC bool `json:"auto_inject_gcloud_adc,omitempty" yaml:"auto_inject_gcloud_adc,omitempty" koanf:"auto_inject_gcloud_adc"`
+
+	// AutoExposePorts controls whether ports are automatically exposed in agent containers.
+	AutoExposePorts *AutoExposePortsSettings `json:"auto_expose_ports,omitempty" yaml:"auto_expose_ports,omitempty" koanf:"auto_expose_ports"`
+}
+
+// AutoExposePortsSettings holds the auto-expose ports configuration.
+type AutoExposePortsSettings struct {
+	Enabled *bool `json:"enabled,omitempty" yaml:"enabled,omitempty" koanf:"enabled"`
 }
 
 // V1ServerConfig holds server-side configuration in the versioned settings format.
@@ -325,6 +338,9 @@ type V1ServerConfig struct {
 
 	// GitHubApp configures the Hub's GitHub App integration for agent git authentication.
 	GitHubApp *V1GitHubAppConfig `json:"github_app,omitempty" yaml:"github_app,omitempty" koanf:"github_app"`
+
+	// Scheduler configures the Hub background task scheduler.
+	Scheduler *V1SchedulerConfig `json:"scheduler,omitempty" yaml:"scheduler,omitempty" koanf:"scheduler"`
 }
 
 // V1GitHubAppConfig holds the GitHub App configuration in settings.yaml format.
@@ -336,6 +352,22 @@ type V1GitHubAppConfig struct {
 	APIBaseURL      string `json:"api_base_url,omitempty" yaml:"api_base_url,omitempty" koanf:"api_base_url"`
 	WebhooksEnabled bool   `json:"webhooks_enabled,omitempty" yaml:"webhooks_enabled,omitempty" koanf:"webhooks_enabled"`
 	InstallationURL string `json:"installation_url,omitempty" yaml:"installation_url,omitempty" koanf:"installation_url"`
+}
+
+// V1SchedulerConfig holds configuration for the Hub background task scheduler.
+// Controls the tick interval and concurrency of recurring maintenance tasks
+// to allow operators to tune scheduler load to match DB capacity.
+type V1SchedulerConfig struct {
+	// IntervalSeconds is the root ticker interval in seconds. All recurring
+	// handlers fire at multiples of this interval. Default: 60 (1 minute).
+	// Increasing this value reduces DB connection pressure on small deployments.
+	IntervalSeconds int `json:"interval_seconds,omitempty" yaml:"interval_seconds,omitempty" koanf:"interval_seconds"`
+	// MaxConcurrency limits the number of recurring handlers that may run
+	// simultaneously in a single tick. When nil (unset), the scheduler uses
+	// its built-in default of 2, so the fix for issue #367 (DB connection
+	// pool saturation) is active out-of-the-box. Set to 0 for unlimited
+	// (pre-fix behavior), or a higher value for larger deployments.
+	MaxConcurrency *int `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty" koanf:"max_concurrency"`
 }
 
 // V1NotificationChannelConfig holds configuration for an external notification channel.
@@ -416,6 +448,8 @@ type V1ServerHubConfig struct {
 	SoftDeleteRetainFiles *bool `json:"soft_delete_retain_files,omitempty" yaml:"soft_delete_retain_files,omitempty" koanf:"soft_delete_retain_files"`
 	// AutoSuspendStalled controls whether stalled agents are automatically suspended.
 	AutoSuspendStalled *bool `json:"auto_suspend_stalled,omitempty" yaml:"auto_suspend_stalled,omitempty" koanf:"auto_suspend_stalled"`
+	// StalledThreshold is how long before an agent is marked stalled (e.g., "5m", "10m").
+	StalledThreshold string `json:"stalled_threshold,omitempty" yaml:"stalled_threshold,omitempty" koanf:"stalled_threshold"`
 	// DisableLegacyStorageFallback disables legacy un-namespaced storage path fallback.
 	DisableLegacyStorageFallback *bool `json:"disable_legacy_storage_fallback,omitempty" yaml:"disable_legacy_storage_fallback,omitempty" koanf:"disable_legacy_storage_fallback"`
 }
@@ -645,7 +679,7 @@ type V1HubClientConfig struct {
 	Enabled   *bool  `json:"enabled,omitempty" yaml:"enabled,omitempty" koanf:"enabled"`
 	Linked    *bool  `json:"linked,omitempty" yaml:"linked,omitempty" koanf:"linked"`
 	Endpoint  string `json:"endpoint,omitempty" yaml:"endpoint,omitempty" koanf:"endpoint"`
-	ProjectID string `json:"grove_id,omitempty" yaml:"grove_id,omitempty" koanf:"grove_id"`
+	ProjectID string `json:"project_id,omitempty" yaml:"project_id,omitempty" koanf:"project_id"`
 	LocalOnly *bool  `json:"local_only,omitempty" yaml:"local_only,omitempty" koanf:"local_only"`
 }
 
@@ -669,13 +703,15 @@ type V1TelemetryConfig struct {
 
 // V1TelemetryCloudConfig holds cloud OTLP forwarding settings.
 type V1TelemetryCloudConfig struct {
-	Enabled  *bool                   `json:"enabled,omitempty" yaml:"enabled,omitempty" koanf:"enabled"`
-	Endpoint string                  `json:"endpoint,omitempty" yaml:"endpoint,omitempty" koanf:"endpoint"`
-	Protocol string                  `json:"protocol,omitempty" yaml:"protocol,omitempty" koanf:"protocol"`
-	Headers  map[string]string       `json:"headers,omitempty" yaml:"headers,omitempty" koanf:"headers"`
-	TLS      *V1TelemetryTLSConfig   `json:"tls,omitempty" yaml:"tls,omitempty" koanf:"tls"`
-	Batch    *V1TelemetryBatchConfig `json:"batch,omitempty" yaml:"batch,omitempty" koanf:"batch"`
-	Provider string                  `json:"provider,omitempty" yaml:"provider,omitempty" koanf:"provider"`
+	Enabled      *bool                   `json:"enabled,omitempty" yaml:"enabled,omitempty" koanf:"enabled"`
+	Endpoint     string                  `json:"endpoint,omitempty" yaml:"endpoint,omitempty" koanf:"endpoint"`
+	Protocol     string                  `json:"protocol,omitempty" yaml:"protocol,omitempty" koanf:"protocol"`
+	Headers      map[string]string       `json:"headers,omitempty" yaml:"headers,omitempty" koanf:"headers"`
+	TLS          *V1TelemetryTLSConfig   `json:"tls,omitempty" yaml:"tls,omitempty" koanf:"tls"`
+	Batch        *V1TelemetryBatchConfig `json:"batch,omitempty" yaml:"batch,omitempty" koanf:"batch"`
+	Provider     string                  `json:"provider,omitempty" yaml:"provider,omitempty" koanf:"provider"`
+	GCPProjectID *string                 `json:"gcp_project_id,omitempty" yaml:"gcp_project_id,omitempty" koanf:"gcp_project_id"`
+	CloudLogging *bool                   `json:"cloud_logging,omitempty" yaml:"cloud_logging,omitempty" koanf:"cloud_logging"`
 }
 
 // V1TelemetryTLSConfig holds TLS settings for cloud OTLP export.
@@ -965,17 +1001,18 @@ func LoadVersionedSettings(projectPath string) (*VersionedSettings, error) {
 		if projectPath != globalDir {
 			if projectID, err := ReadProjectID(projectPath); err == nil && projectID != "" {
 				_ = k.Load(confmap.Provider(map[string]interface{}{
-					projectcompat.ConfigHubGroveIDKey: projectID,
+					projectcompat.ConfigHubProjectIDKey: projectID,
 				}, "."), nil)
 			}
 		}
 	}
 
-	// Remap hub.project_id to hub.grove_id for backward compatibility with V1 structs.
-	// SCION_HUB_PROJECT_ID maps to hub.project_id via versionedEnvKeyMapper.
-	if k.Exists(projectcompat.ConfigHubProjectIDKey) && !k.Exists(projectcompat.ConfigHubGroveIDKey) {
+	// Remap hub.grove_id to hub.project_id for backward compatibility.
+	// Old settings files may still use grove_id; the V1HubClientConfig struct
+	// now uses koanf:"project_id", so grove_id values must be copied across.
+	if k.Exists(projectcompat.ConfigHubGroveIDKey) && !k.Exists(projectcompat.ConfigHubProjectIDKey) {
 		_ = k.Load(confmap.Provider(map[string]interface{}{
-			projectcompat.ConfigHubGroveIDKey: k.String(projectcompat.ConfigHubProjectIDKey),
+			projectcompat.ConfigHubProjectIDKey: k.String(projectcompat.ConfigHubGroveIDKey),
 		}, "."), nil)
 	}
 
@@ -1001,7 +1038,7 @@ func versionedEnvKeyMapper(s string) string {
 	}
 	key := strings.ToLower(strings.TrimPrefix(s, "SCION_"))
 
-	// Handle nested hub keys (single level: hub.endpoint, hub.grove_id, etc.)
+	// Handle nested hub keys (single level: hub.endpoint, hub.project_id, etc.)
 	if strings.HasPrefix(key, "hub_") {
 		return "hub." + strings.TrimPrefix(key, "hub_")
 	}
@@ -1034,8 +1071,11 @@ var knownCompoundFields = []string{
 	"require_trusted_proxy_ip",
 	"soft_delete_retain_files",
 	"soft_delete_retention",
+	"stalled_threshold",
 	"authorized_domains",
 	"platform_auth_sa",
+	"interval_seconds",
+	"max_concurrency",
 	"oidc_audience",
 	"jwks_url",
 	"broker_nickname",
@@ -1130,7 +1170,8 @@ func mapEnvKeyRecursive(key string) string {
 func isSectionName(name string) bool {
 	switch name {
 	case "hub", "broker", "database", "auth", "oauth", "storage", "secrets", "cors",
-		"web", "cli", "device", "google", "github", "proxy", "iap", "transport":
+		"web", "cli", "device", "google", "github", "proxy", "iap", "transport",
+		"scheduler":
 		return true
 	}
 	return false
@@ -1142,6 +1183,7 @@ var knownTelemetryCompoundFields = []string{
 	"insecure_skip_verify",
 	"respect_debug_mode",
 	"report_interval",
+	"cloud_logging",
 	"max_size",
 }
 
@@ -1303,6 +1345,11 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		}
 		if v1.Hub.AutoSuspendStalled != nil {
 			gc.Hub.AutoSuspendStalled = *v1.Hub.AutoSuspendStalled
+		}
+		if v1.Hub.StalledThreshold != "" {
+			if d, err := time.ParseDuration(v1.Hub.StalledThreshold); err == nil {
+				gc.Hub.StalledThreshold = d
+			}
 		}
 		if v1.Hub.DisableLegacyStorageFallback != nil {
 			gc.Hub.DisableLegacyStorageFallback = *v1.Hub.DisableLegacyStorageFallback
@@ -1508,6 +1555,12 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		gc.GitHubApp.InstallationURL = v1.GitHubApp.InstallationURL
 	}
 
+	// Scheduler
+	if v1.Scheduler != nil {
+		gc.Scheduler.IntervalSeconds = v1.Scheduler.IntervalSeconds
+		gc.Scheduler.MaxConcurrency = v1.Scheduler.MaxConcurrency // both are *int; nil propagates
+	}
+
 	return &gc
 }
 
@@ -1544,6 +1597,9 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 	}
 	if gc.Hub.SoftDeleteRetention > 0 {
 		v1Hub.SoftDeleteRetention = gc.Hub.SoftDeleteRetention.String()
+	}
+	if gc.Hub.StalledThreshold > 0 {
+		v1Hub.StalledThreshold = gc.Hub.StalledThreshold.String()
 	}
 	if gc.Hub.SoftDeleteRetainFiles {
 		retainFiles := true
@@ -1659,6 +1715,14 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 			APIBaseURL:      gc.GitHubApp.APIBaseURL,
 			WebhooksEnabled: gc.GitHubApp.WebhooksEnabled,
 			InstallationURL: gc.GitHubApp.InstallationURL,
+		}
+	}
+
+	// Scheduler config
+	if gc.Scheduler.IntervalSeconds != 0 || gc.Scheduler.MaxConcurrency != nil {
+		v1.Scheduler = &V1SchedulerConfig{
+			IntervalSeconds: gc.Scheduler.IntervalSeconds,
+			MaxConcurrency:  gc.Scheduler.MaxConcurrency,
 		}
 	}
 
@@ -1937,6 +2001,23 @@ func detectHierarchyFormat(projectPath string) (hasVersioned bool, missingSchema
 	return false, false
 }
 
+// settingsCandidateDirs returns the directories that may contain user settings
+// files (global and project), used to scan for files missing schema_version.
+func settingsCandidateDirs(projectPath string) []string {
+	var dirs []string
+	globalDir, _ := GetGlobalDir()
+	if globalDir != "" {
+		dirs = append(dirs, globalDir)
+	}
+	if effectiveProjectPath := resolveEffectiveProjectPath(projectPath); effectiveProjectPath != "" {
+		// Avoid duplicates if project path == global dir.
+		if effectiveProjectPath != globalDir {
+			dirs = append(dirs, effectiveProjectPath)
+		}
+	}
+	return dirs
+}
+
 // LoadEffectiveSettings is a unified entry point that detects the settings format
 // and loads using the appropriate path.
 // - If any user file is versioned → uses LoadVersionedSettings
@@ -1956,12 +2037,42 @@ func LoadEffectiveSettings(projectPath string) (*VersionedSettings, []string, er
 		return vs, warnings, nil
 	}
 
+	// Before falling through to the legacy path, check if any settings file
+	// has real content but lacks schema_version, harnesses key, and v1 runtime
+	// indicators — such files may not load correctly in future versions.
+	var warnings []string
+	for _, dir := range settingsCandidateDirs(projectPath) {
+		path := GetSettingsPath(dir)
+		if path == "" {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		version, isLegacy := DetectSettingsFormat(data)
+		if version != "" || isLegacy {
+			// File was recognized — not silently ignored.
+			continue
+		}
+		// Parse to check for real keys.
+		var raw map[string]interface{}
+		if err := yamlv3.Unmarshal(data, &raw); err != nil || len(raw) == 0 {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"settings file %s has no schema_version field and no recognized format indicators. Add 'schema_version: \"1\"' as the first line for reliable versioned settings loading; without it, settings may not load correctly in future versions.",
+			path,
+		))
+	}
+
 	// Legacy path: load via existing loader, then adapt
 	legacy, err := LoadSettingsKoanf(projectPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading legacy settings: %w", err)
 	}
-	vs, warnings := AdaptLegacySettings(legacy)
+	vs, legacyWarnings := AdaptLegacySettings(legacy)
+	warnings = append(warnings, legacyWarnings...)
 	return vs, warnings, nil
 }
 
@@ -2010,6 +2121,23 @@ func LoadSingleFileVersioned(dir string) (*VersionedSettings, error) {
 	// Ensure schema_version is set
 	if vs.SchemaVersion == "" {
 		vs.SchemaVersion = "1"
+	}
+
+	// Backward compatibility: old settings files may use hub.grove_id instead of
+	// hub.project_id. Since the struct yaml tag is now "project_id", grove_id
+	// values are not unmarshaled automatically. Check the raw YAML and remap.
+	if vs.Hub == nil || vs.Hub.ProjectID == "" {
+		var raw map[string]interface{}
+		if err := yamlv3.Unmarshal(data, &raw); err == nil {
+			if hub, ok := raw["hub"].(map[string]interface{}); ok {
+				if gid, ok := hub["grove_id"].(string); ok && gid != "" {
+					if vs.Hub == nil {
+						vs.Hub = &V1HubClientConfig{}
+					}
+					vs.Hub.ProjectID = gid
+				}
+			}
+		}
 	}
 
 	return &vs, nil

@@ -33,6 +33,7 @@ type AccessSettings struct {
 // LifecycleSettings holds Layer-1 agent lifecycle settings.
 type LifecycleSettings struct {
 	AutoSuspendStalled    *bool  `json:"auto_suspend_stalled,omitempty"`
+	StalledThreshold      string `json:"stalled_threshold,omitempty"`
 	SoftDeleteRetention   string `json:"soft_delete_retention,omitempty"`
 	SoftDeleteRetainFiles *bool  `json:"soft_delete_retain_files,omitempty"`
 }
@@ -49,6 +50,11 @@ type TelemetrySettings struct {
 	config.V1TelemetryConfig
 }
 
+// AutoExposePortsSettings holds Layer-1 auto-expose ports configuration.
+type AutoExposePortsSettings struct {
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
 // AgentDefaultsSettings holds Layer-1 default agent configuration.
 type AgentDefaultsSettings struct {
 	DefaultTemplate      string            `json:"default_template,omitempty"`
@@ -57,6 +63,8 @@ type AgentDefaultsSettings struct {
 	DefaultMaxModelCalls int               `json:"default_max_model_calls,omitempty"`
 	DefaultMaxDuration   string            `json:"default_max_duration,omitempty"`
 	DefaultResources     *api.ResourceSpec `json:"default_resources,omitempty"`
+	DefaultModel         string            `json:"default_model,omitempty"`
+	DefaultThinkingLevel *int              `json:"default_thinking_level,omitempty"`
 }
 
 // EndpointsSettings holds Layer-1 endpoint configuration.

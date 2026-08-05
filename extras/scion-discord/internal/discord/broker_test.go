@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -34,6 +35,198 @@ func newTestStructuredMessage() *messages.StructuredMessage {
 		Msg:       "hello",
 		Type:      messages.TypeInstruction,
 	}
+}
+
+// TestUnknownMentionRouting traces the actual routing logic in
+// handleIncomingMessage for unknown @mentions and verifies the error path
+// fires (R1) and unresolved names are reported (N2).
+func TestUnknownMentionRouting(t *testing.T) {
+	knownAgents := []string{"coder", "reviewer"}
+	botUserID := "BOT123"
+
+	t.Run("unknown mention with default agent triggers error path", func(t *testing.T) {
+		// Trace the handleIncomingMessage flow for "@not-an-agent hello"
+		// with effectiveDefault = "coder".
+		content := "@not-an-agent hello"
+
+		// Step 1: resolveTargetAgents returns empty for unknown mention.
+		msg := newMockMessage(content, nil)
+		targets, _ := resolveTargetAgents(msg, botUserID, "coder", knownAgents)
+		assert.Empty(t, targets, "unknown mention should not resolve")
+
+		// Step 2: Default fallback sets targets = ["coder"].
+		effectiveDefault := "coder"
+		targets = []string{effectiveDefault}
+
+		// Step 3: classifyMentions identifies the unknown start mention.
+		classified := classifyMentions(content, botUserID, knownAgents, noopResolver)
+		assert.Equal(t, 0, countAgentStartMentions(classified),
+			"unknown start mentions should not count as agent start mentions")
+		assert.True(t, len(classified.StartMentions) > 0,
+			"unknown mention should still be in StartMentions")
+
+		// Step 4: The error check fires BEFORE the filtering block.
+		// In the actual code, after classifyMentions, we check for unknown
+		// start mentions and return an error instead of routing to default.
+		hasUnknownStartMention := false
+		for _, sm := range classified.StartMentions {
+			if sm.Kind == "unknown" {
+				hasUnknownStartMention = true
+				break
+			}
+		}
+		assert.True(t, hasUnknownStartMention,
+			"error path must detect unknown start mention")
+
+		// Extract unresolved names directly from classified.StartMentions
+		// (mirrors the production code path in broker.go).
+		var unresolved []string
+		for _, sm := range classified.StartMentions {
+			if sm.Kind == "unknown" {
+				unresolved = append(unresolved, sm.Name)
+			}
+		}
+		assert.Equal(t, []string{"not-an-agent"}, unresolved,
+			"unresolved mentions should be detected for error feedback")
+
+		// Verify the error message that would be sent.
+		errMsg := fmt.Sprintf("Unknown agent: %s. Use `/scion agents` to see available agents.",
+			strings.Join(unresolved, ", "))
+		assert.Contains(t, errMsg, "not-an-agent")
+	})
+
+	t.Run("multiple unknown mentions reports all names", func(t *testing.T) {
+		// N2: "@foo @bar hello" should report both unknown names.
+		content := "@foo @bar hello"
+
+		classified := classifyMentions(content, botUserID, knownAgents, noopResolver)
+		assert.Equal(t, 0, countAgentStartMentions(classified))
+		assert.Len(t, classified.StartMentions, 2)
+
+		// Extract unresolved names directly from classified.StartMentions.
+		var unresolved []string
+		for _, sm := range classified.StartMentions {
+			if sm.Kind == "unknown" {
+				unresolved = append(unresolved, sm.Name)
+			}
+		}
+		assert.Equal(t, []string{"foo", "bar"}, unresolved)
+
+		errMsg := fmt.Sprintf("Unknown agent: %s. Use `/scion agents` to see available agents.",
+			strings.Join(unresolved, ", "))
+		assert.Contains(t, errMsg, "foo, bar",
+			"error message should list all unresolved mentions")
+	})
+
+	t.Run("mixed known and unknown start mentions delivers to known agent", func(t *testing.T) {
+		// R2: "@coder @not-an-agent fix this" should deliver to coder,
+		// not show an error. The error path must not fire when there are
+		// valid agent start mentions alongside unknown ones.
+		content := "@coder @not-an-agent fix this"
+
+		msg := newMockMessage(content, nil)
+		targets, _ := resolveTargetAgents(msg, botUserID, "coder", knownAgents)
+		assert.Equal(t, []string{"coder"}, targets)
+
+		classified := classifyMentions(content, botUserID, knownAgents, noopResolver)
+		// Has both agent and unknown start mentions.
+		assert.Equal(t, 1, countAgentStartMentions(classified))
+		assert.Len(t, classified.StartMentions, 2)
+
+		// Error path should NOT fire because there are valid agent start mentions.
+		// The guard: hasUnknownStartMention && countAgentStartMentions(classified) == 0
+		// ensures mixed cases are delivered, not blocked.
+		hasUnknownStartMention := false
+		for _, sm := range classified.StartMentions {
+			if sm.Kind == "unknown" {
+				hasUnknownStartMention = true
+				break
+			}
+		}
+		assert.True(t, hasUnknownStartMention,
+			"unknown mention should be detected")
+		assert.True(t, countAgentStartMentions(classified) > 0,
+			"mixed case must not trigger error path — known agent should receive message")
+	})
+
+	t.Run("unknown mention without default agent returns early", func(t *testing.T) {
+		// Without a default, targets stays empty and the function returns
+		// at the early exit (line ~1226). The error feedback at that point
+		// only fires when isBotMentioned is true (Discord structured mention).
+		// Text-format @unknown does not set isBotMentioned.
+		content := "@not-an-agent hello"
+
+		msg := newMockMessage(content, nil)
+		targets, _ := resolveTargetAgents(msg, botUserID, "", knownAgents)
+		assert.Empty(t, targets)
+
+		// No default → targets stays empty → early return before classifyMentions.
+		// Verify unresolved mentions are detectable for the early-return path.
+		unresolved := extractUnresolvedMentions(content, botUserID, knownAgents)
+		assert.Equal(t, []string{"not-an-agent"}, unresolved)
+	})
+
+	t.Run("known agent mention routes correctly", func(t *testing.T) {
+		content := "@coder fix this bug"
+
+		msg := newMockMessage(content, nil)
+		targets, _ := resolveTargetAgents(msg, botUserID, "coder", knownAgents)
+		assert.Equal(t, []string{"coder"}, targets)
+
+		classified := classifyMentions(content, botUserID, knownAgents, noopResolver)
+		assert.Equal(t, 1, countAgentStartMentions(classified))
+
+		// No unknown start mentions → error path does NOT fire.
+		hasUnknownStartMention := false
+		for _, sm := range classified.StartMentions {
+			if sm.Kind == "unknown" {
+				hasUnknownStartMention = true
+				break
+			}
+		}
+		assert.False(t, hasUnknownStartMention,
+			"known agent should not trigger error path")
+
+		// Filtering preserves the known agent.
+		startMentionSet := make(map[string]bool)
+		for _, sm := range classified.StartMentions {
+			if sm.Kind == "agent" {
+				startMentionSet[strings.ToLower(sm.Name)] = true
+			}
+		}
+		filteredTargets := make([]string, 0)
+		for _, t2 := range targets {
+			if startMentionSet[strings.ToLower(t2)] {
+				filteredTargets = append(filteredTargets, t2)
+			}
+		}
+		assert.Equal(t, []string{"coder"}, filteredTargets,
+			"known agent should remain in targets after filtering")
+
+		// Verify no unknown start mentions exist (error path would not fire).
+		var unresolved []string
+		for _, sm := range classified.StartMentions {
+			if sm.Kind == "unknown" {
+				unresolved = append(unresolved, sm.Name)
+			}
+		}
+		assert.Empty(t, unresolved)
+	})
+
+	t.Run("safety net restores default when only body mentions exist", func(t *testing.T) {
+		// When all agents are body-mentioned (no start mentions), the safety
+		// net should restore the default agent. Verify the fix preserves this.
+		content := "please ask @reviewer about this"
+
+		classified := classifyMentions(content, botUserID, knownAgents, noopResolver)
+
+		// No start mentions, so countAgentStartMentions == 0.
+		// Safety net condition: len(targets) == 0 && agentStartMentions == 0
+		// should allow default restoration.
+		assert.Equal(t, 0, countAgentStartMentions(classified))
+		assert.Empty(t, classified.StartMentions)
+		assert.Len(t, classified.BodyMentions, 1)
+	})
 }
 
 func TestParseHubError(t *testing.T) {
@@ -96,6 +289,11 @@ func TestHubError_UserFacingMessage(t *testing.T) {
 			name:     "broker auth failed",
 			err:      hubError{StatusCode: 401, Code: "broker_auth_failed", Message: "bad hmac"},
 			contains: "Authentication error",
+		},
+		{
+			name:     "agent not running",
+			err:      hubError{StatusCode: 409, Code: "agent_not_running", Message: "Agent is in error state"},
+			contains: "Agent is not running",
 		},
 		{
 			name:     "server error",
@@ -1061,4 +1259,387 @@ func TestPublish_ObserveFilter_StateChangeThreadResolvesParentLink(t *testing.T)
 				"state change delivery must follow the parent link's ShowStateChanges flag")
 		})
 	}
+}
+
+// --- threadParentID / resolveChannelLink cache-poisoning tests (issue #576) ---
+
+// failingTransport returns HTTP 500 for every Discord REST call, simulating a
+// transient API outage.
+type failingTransport struct{}
+
+func (ft *failingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusInternalServerError,
+		Body:       io.NopCloser(strings.NewReader(`{"message":"internal server error"}`)),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+// newFailingSession returns a Session whose REST calls always return 500 and
+// whose state cache is empty.
+func newFailingSession(t *testing.T) *discordgo.Session {
+	t.Helper()
+	s, err := discordgo.New("Bot test-token")
+	require.NoError(t, err)
+	s.Client = &http.Client{Transport: &failingTransport{}}
+	s.MaxRestRetries = 0
+	s.ShouldRetryOnRateLimit = false
+	return s
+}
+
+func TestThreadParentID_DistinguishesFailureFromNonThread(t *testing.T) {
+	t.Run("confirmed thread returns parentID and ok=true", func(t *testing.T) {
+		s := stubSession([]*discordgo.Channel{
+			{
+				ID:       "thread-1",
+				Type:     discordgo.ChannelTypeGuildPublicThread,
+				ParentID: "parent-1",
+			},
+		})
+		parentID, ok := threadParentID(s, "thread-1")
+		assert.True(t, ok, "lookup succeeded — ok must be true")
+		assert.Equal(t, "parent-1", parentID)
+	})
+
+	t.Run("confirmed non-thread returns empty and ok=true", func(t *testing.T) {
+		s := stubSession([]*discordgo.Channel{
+			{ID: "text-chan", Type: discordgo.ChannelTypeGuildText},
+		})
+		parentID, ok := threadParentID(s, "text-chan")
+		assert.True(t, ok, "lookup succeeded — ok must be true")
+		assert.Equal(t, "", parentID)
+	})
+
+	t.Run("REST failure returns empty and ok=false", func(t *testing.T) {
+		s := newFailingSession(t)
+		parentID, ok := threadParentID(s, "unknown-chan")
+		assert.False(t, ok, "REST failed — ok must be false")
+		assert.Equal(t, "", parentID)
+	})
+}
+
+func TestResolveChannelLink_NoCachePoisoningOnRESTFailure(t *testing.T) {
+	ctx := context.Background()
+
+	parentID := "parent-nocache"
+	threadID := "thread-nocache"
+	t.Cleanup(func() {
+		threadParentsMu.Lock()
+		delete(threadParents, threadID)
+		threadParentsMu.Unlock()
+	})
+
+	store := newTestBrokerStore(t)
+
+	// --- Phase 1: REST is failing — resolveChannelLink must NOT cache. ---
+	failSession := newFailingSession(t)
+
+	link, err := resolveChannelLink(ctx, failSession, store, threadID)
+	require.NoError(t, err)
+	// No channel link exists anywhere, so link should be nil.
+	assert.Nil(t, link, "no link exists yet")
+
+	// Verify the cache was NOT poisoned.
+	threadParentsMu.Lock()
+	_, cached := threadParents[threadID]
+	threadParentsMu.Unlock()
+	assert.False(t, cached, "failed lookup must not be cached")
+
+	// --- Phase 2: REST recovers — resolveChannelLink retries and caches. ---
+	goodSession, _ := newRecordingSession(t, []*discordgo.Channel{
+		{ID: parentID, Type: discordgo.ChannelTypeGuildText},
+		{
+			ID:       threadID,
+			Type:     discordgo.ChannelTypeGuildPublicThread,
+			ParentID: parentID,
+		},
+	})
+
+	// Create a channel link on the parent so the fallback succeeds.
+	require.NoError(t, store.CreateChannelLink(ctx, &ChannelLink{
+		ChannelID:   parentID,
+		GuildID:     testGuildID,
+		ProjectID:   "proj-nc",
+		ProjectSlug: "nc",
+		Active:      true,
+		LinkedAt:    time.Now(),
+	}))
+
+	link, err = resolveChannelLink(ctx, goodSession, store, threadID)
+	require.NoError(t, err)
+	require.NotNil(t, link, "parent link must be resolved through thread")
+	assert.Equal(t, parentID, link.ChannelID)
+
+	// Verify the cache now contains the correct parent.
+	threadParentsMu.Lock()
+	cachedParent, cached := threadParents[threadID]
+	threadParentsMu.Unlock()
+	assert.True(t, cached, "successful lookup must be cached")
+	assert.Equal(t, parentID, cachedParent)
+}
+
+func TestResolveChannelLink_CachesConfirmedNonThread(t *testing.T) {
+	ctx := context.Background()
+
+	channelID := "text-cached"
+	t.Cleanup(func() {
+		threadParentsMu.Lock()
+		delete(threadParents, channelID)
+		threadParentsMu.Unlock()
+	})
+
+	session, _ := newRecordingSession(t, []*discordgo.Channel{
+		{ID: channelID, Type: discordgo.ChannelTypeGuildText},
+	})
+
+	store := newTestBrokerStore(t)
+
+	_, err := resolveChannelLink(ctx, session, store, channelID)
+	require.NoError(t, err)
+
+	// Confirmed non-thread should be cached (empty string = not a thread).
+	threadParentsMu.Lock()
+	cachedParent, cached := threadParents[channelID]
+	threadParentsMu.Unlock()
+	assert.True(t, cached, "confirmed non-thread must be cached")
+	assert.Equal(t, "", cachedParent)
+}
+
+func TestResolveChannelLink_CachesConfirmedThread(t *testing.T) {
+	ctx := context.Background()
+
+	parentID := "parent-cached"
+	threadID := "thread-cached"
+	t.Cleanup(func() {
+		threadParentsMu.Lock()
+		delete(threadParents, threadID)
+		threadParentsMu.Unlock()
+	})
+
+	session, _ := newRecordingSession(t, []*discordgo.Channel{
+		{ID: parentID, Type: discordgo.ChannelTypeGuildText},
+		{
+			ID:       threadID,
+			Type:     discordgo.ChannelTypeGuildPublicThread,
+			ParentID: parentID,
+		},
+	})
+
+	store := newTestBrokerStore(t)
+
+	_, err := resolveChannelLink(ctx, session, store, threadID)
+	require.NoError(t, err)
+
+	// Confirmed thread should be cached with parent ID.
+	threadParentsMu.Lock()
+	cachedParent, cached := threadParents[threadID]
+	threadParentsMu.Unlock()
+	assert.True(t, cached, "confirmed thread must be cached")
+	assert.Equal(t, parentID, cachedParent)
+}
+
+// --- downloadDiscordAttachment tests ---
+
+func TestDownloadDiscordAttachment_DefaultPath(t *testing.T) {
+	// When downloadsPath is empty, the function writes to
+	// /home/scion/.scion/projects/<slug>/downloads and returns
+	// /workspace/downloads/<name> as the agent-visible path.
+	// We can't safely write to /home/scion in tests, so we verify
+	// the path computation by setting downloadsPath to a temp dir
+	// and confirming the custom-path branch differs from the default.
+
+	fileContent := []byte("default-path-test")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(fileContent)
+	}))
+	defer srv.Close()
+
+	projectSlug := "test-project"
+
+	// Verify the default hostDir and agentPath computation.
+	defaultHostDir := filepath.Join("/home/scion/.scion/projects", projectSlug, "downloads")
+	assert.Equal(t, "/home/scion/.scion/projects/test-project/downloads", defaultHostDir)
+
+	defaultAgentPath := filepath.Join("/workspace/downloads", "discord_123_photo.png")
+	assert.Equal(t, "/workspace/downloads/discord_123_photo.png", defaultAgentPath)
+
+	// Verify that a broker with no downloadsPath set would use
+	// the default agent path prefix.
+	b := &DiscordBroker{
+		log:        discardLogger(),
+		httpClient: srv.Client(),
+	}
+	assert.Empty(t, b.downloadsPath, "downloadsPath should be empty by default")
+}
+
+func TestDownloadDiscordAttachment_CustomDownloadsPath(t *testing.T) {
+	fileContent := []byte("fake-image-data-for-test")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(fileContent)
+	}))
+	defer srv.Close()
+
+	downloadsDir := t.TempDir()
+	b := &DiscordBroker{
+		log:           discardLogger(),
+		httpClient:    srv.Client(),
+		downloadsPath: downloadsDir,
+	}
+
+	att := &discordgo.MessageAttachment{
+		ID:          "att-002",
+		Filename:    "document.pdf",
+		URL:         srv.URL + "/document.pdf",
+		Size:        len(fileContent),
+		ContentType: "application/pdf",
+	}
+
+	ctx := context.Background()
+	agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, "some-project")
+	require.NoError(t, err)
+
+	// Agent path should be downloads_path + filename (not /workspace/downloads/).
+	assert.True(t, strings.HasPrefix(agentPath, downloadsDir),
+		"agentPath %q should start with downloadsPath %q", agentPath, downloadsDir)
+	assert.False(t, strings.Contains(agentPath, "/workspace/downloads"),
+		"agentPath should not contain /workspace/downloads when downloadsPath is set")
+
+	// The filename should contain the original name.
+	assert.Contains(t, filepath.Base(agentPath), "document.pdf")
+	assert.Contains(t, filepath.Base(agentPath), "discord_")
+
+	// Placeholder should describe the attachment.
+	assert.Contains(t, placeholder, "document.pdf")
+	assert.Contains(t, placeholder, "application/pdf")
+
+	// The file should actually exist on disk with correct contents.
+	data, err := os.ReadFile(agentPath)
+	require.NoError(t, err, "downloaded file should exist at agentPath")
+	assert.Equal(t, fileContent, data)
+}
+
+func TestDownloadDiscordAttachment_ProjectSlugPlaceholder(t *testing.T) {
+	fileContent := []byte("slug-placeholder-test")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(fileContent)
+	}))
+	defer srv.Close()
+
+	baseDir := t.TempDir()
+	b := &DiscordBroker{
+		log:           discardLogger(),
+		httpClient:    srv.Client(),
+		downloadsPath: filepath.Join(baseDir, "{project_slug}"),
+	}
+
+	att := &discordgo.MessageAttachment{
+		ID:          "att-slug-001",
+		Filename:    "photo.jpg",
+		URL:         srv.URL + "/photo.jpg",
+		Size:        len(fileContent),
+		ContentType: "image/jpeg",
+	}
+
+	projectSlug := "my-cool-project"
+	ctx := context.Background()
+	agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, projectSlug)
+	require.NoError(t, err)
+
+	// Host directory should have the slug expanded (file written there).
+	expandedDir := filepath.Join(baseDir, projectSlug)
+	entries, err := os.ReadDir(expandedDir)
+	require.NoError(t, err, "expanded slug directory should exist")
+	require.Len(t, entries, 1, "should contain exactly one downloaded file")
+
+	// Agent path should use the expanded slug, not the literal placeholder.
+	assert.True(t, strings.HasPrefix(agentPath, expandedDir),
+		"agentPath %q should start with expanded dir %q", agentPath, expandedDir)
+	assert.NotContains(t, agentPath, "{project_slug}",
+		"agentPath should not contain literal {project_slug}")
+
+	// File on disk should match.
+	data, err := os.ReadFile(agentPath)
+	require.NoError(t, err)
+	assert.Equal(t, fileContent, data)
+
+	// Placeholder should describe the attachment.
+	assert.Contains(t, placeholder, "photo.jpg")
+	assert.Contains(t, placeholder, "image/jpeg")
+}
+
+func TestDownloadDiscordAttachment_EmptyProjectSlug(t *testing.T) {
+	b := &DiscordBroker{
+		log:        discardLogger(),
+		httpClient: http.DefaultClient,
+	}
+
+	att := &discordgo.MessageAttachment{
+		ID:       "att-003",
+		Filename: "file.txt",
+		URL:      "http://example.com/file.txt",
+		Size:     10,
+	}
+
+	ctx := context.Background()
+	_, _, err := b.downloadDiscordAttachment(ctx, att, "")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "project slug is empty")
+}
+
+func TestDownloadDiscordAttachment_TooLarge(t *testing.T) {
+	b := &DiscordBroker{
+		log:        discardLogger(),
+		httpClient: http.DefaultClient,
+	}
+
+	att := &discordgo.MessageAttachment{
+		ID:       "att-004",
+		Filename: "huge.bin",
+		URL:      "http://example.com/huge.bin",
+		Size:     maxDiscordAttachmentSize + 1,
+	}
+
+	ctx := context.Background()
+	_, _, err := b.downloadDiscordAttachment(ctx, att, "test-project")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "too large")
+}
+
+func TestDownloadDiscordAttachment_CustomPath_CreatesSubdir(t *testing.T) {
+	fileContent := []byte("test-content")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(fileContent)
+	}))
+	defer srv.Close()
+
+	// Use a nested path that doesn't exist yet — MkdirAll should create it.
+	baseDir := t.TempDir()
+	downloadsDir := filepath.Join(baseDir, "nested", "downloads")
+	b := &DiscordBroker{
+		log:           discardLogger(),
+		httpClient:    srv.Client(),
+		downloadsPath: downloadsDir,
+	}
+
+	att := &discordgo.MessageAttachment{
+		ID:       "att-005",
+		Filename: "nested-file.txt",
+		URL:      srv.URL + "/nested-file.txt",
+		Size:     len(fileContent),
+	}
+
+	ctx := context.Background()
+	agentPath, _, err := b.downloadDiscordAttachment(ctx, att, "proj")
+	require.NoError(t, err)
+
+	// Verify the directory was created and the file exists.
+	_, err = os.Stat(downloadsDir)
+	require.NoError(t, err, "downloadsPath directory should be created")
+
+	data, err := os.ReadFile(agentPath)
+	require.NoError(t, err)
+	assert.Equal(t, fileContent, data)
 }

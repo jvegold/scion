@@ -25,12 +25,15 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
 // CloneProjectRequest is the request body for POST /api/v1/projects/{id}/clone.
 type CloneProjectRequest struct {
-	Name string `json:"name"` // required
-	Slug string `json:"slug"` // optional explicit slug override
+	Name       string `json:"name"`                 // required
+	Slug       string `json:"slug"`                 // optional explicit slug override
+	AsTemplate bool   `json:"asTemplate,omitempty"` // mark clone as template
+	GitRemote  string `json:"gitRemote,omitempty"`  // override source git remote
 }
 
 // handleProjectClone clones a project's configuration into a new project.
@@ -128,6 +131,12 @@ func (s *Server) handleProjectClone(w http.ResponseWriter, r *http.Request, proj
 		GitIdentity:            src.GitIdentity,
 	}
 
+	// Allow callers to override the git remote (e.g. creating from a template
+	// with a different repository).
+	if req.GitRemote != "" {
+		clone.GitRemote = util.NormalizeGitRemote(req.GitRemote)
+	}
+
 	// Copy annotations: only keys in projectSettingKeys, preserving null semantics
 	// (§6.4: unset stays unset).
 	if src.Annotations != nil {
@@ -175,6 +184,20 @@ func (s *Server) handleProjectClone(w http.ResponseWriter, r *http.Request, proj
 			}
 			clone.Labels[store.LabelWorkspaceMode] = srcMode
 		}
+	}
+
+	// ── asTemplate: mark clone as a project template ─────────────────────
+	if req.AsTemplate {
+		// Admin-only: creating templates is a hub-management action
+		if user := GetUserIdentityFromContext(ctx); user == nil || user.Role() != "admin" {
+			Forbidden(w)
+			return
+		}
+		if clone.Labels == nil {
+			clone.Labels = make(map[string]string)
+		}
+		clone.Labels[store.LabelTemplate] = "true"
+		clone.Visibility = store.VisibilityTeam
 	}
 
 	// ── Rollback stack ───────────────────────────────────────────────────

@@ -24,7 +24,7 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
-import type { PageData, Agent, AgentPhase, AgentActivity } from '../../shared/types.js';
+import type { PageData, Agent, AgentPhase, AgentActivity, ExposedPort } from '../../shared/types.js';
 import { isTerminalAvailable } from '../../shared/types.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
@@ -32,6 +32,7 @@ import { SSEClient } from '../../client/sse-client.js';
 import type { SSEUpdateEvent } from '../../client/sse-client.js';
 import type { StatusType } from '../shared/status-badge.js';
 import '../shared/status-badge.js';
+import { showToast } from '../../utils/toast.js';
 
 // xterm.js imports are client-side only — guarded by typeof check in lifecycle
 // These will be imported dynamically in firstUpdated() since they require DOM APIs
@@ -95,10 +96,22 @@ export class ScionPageTerminal extends LitElement {
   private agent: Agent | null = null;
 
   @state()
+  private exposedPorts: ExposedPort[] = [];
+
+  @state()
   private captureAuthLoading = false;
 
   @state()
   private captureAuthConflicts: string[] | null = null;
+
+  // --- Drag-and-drop file upload state ---
+  @state() private uploadEnabled = false;
+  @state() private uploadDisabledReason = '';
+  @state() private uploadTargetDir = '';     // shared dir name (e.g. "scratchpad")
+  @state() private uploadBasePath = '';      // container path (e.g. "/scion-volumes/scratchpad")
+  @state() private isDragOver = false;
+  @state() private isUploading = false;
+  @state() private uploadStatus = '';        // progress/error message in overlay
 
   private terminal: Terminal | null = null;
   private fitAddon: FitAddon | null = null;
@@ -108,6 +121,10 @@ export class ScionPageTerminal extends LitElement {
   private resizeTimer: ReturnType<typeof setTimeout> | null = null;
   private sseClient: SSEClient | null = null;
   private sseUpdateHandler: ((e: CustomEvent<SSEUpdateEvent>) => void) | null = null;
+  private _dragCounter = 0;
+  private _errorTimer: ReturnType<typeof setTimeout> | null = null;
+  private _windowDragOver: ((e: DragEvent) => void) | null = null;
+  private _windowDrop: ((e: DragEvent) => void) | null = null;
 
   static override styles = css`
     :host {
@@ -300,6 +317,47 @@ export class ScionPageTerminal extends LitElement {
       text-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
     }
 
+    .drop-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.6);
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.75rem;
+      z-index: 11;
+      pointer-events: none;
+      border: 2px dashed transparent;
+      font-size: 1rem;
+      color: #94a3b8;
+    }
+
+    .drop-overlay.visible {
+      display: flex;
+    }
+
+    .drop-overlay.visible:not(.disabled) {
+      border-color: #60a5fa;
+    }
+
+    .drop-overlay.disabled {
+      border-color: #ef4444;
+      color: #ef4444;
+    }
+
+    .drop-overlay sl-spinner {
+      font-size: 1.5rem;
+      --indicator-color: #60a5fa;
+    }
+
+    .drop-overlay sl-icon {
+      font-size: 2rem;
+    }
+
     .loading-state,
     .error-state {
       display: flex;
@@ -355,6 +413,93 @@ export class ScionPageTerminal extends LitElement {
     .error-state button:hover {
       background: #2563eb;
     }
+
+    /* Port forwarding buttons */
+    .port-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      background: transparent;
+      border: 1px solid #2a5d2a;
+      color: #4ade80;
+      padding: 0.25rem 0.75rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      text-decoration: none;
+      white-space: nowrap;
+      transition: border-color 0.15s, background 0.15s;
+      animation: port-appear 0.3s ease-out;
+      cursor: pointer;
+    }
+
+    .port-btn:hover {
+      border-color: #22c55e;
+      background: rgba(34, 197, 94, 0.1);
+      color: #22c55e;
+    }
+
+    @keyframes port-appear {
+      from { opacity: 0; transform: scale(0.9); }
+      to   { opacity: 1; transform: scale(1); }
+    }
+
+    /* Port dropdown for 4+ ports */
+    .port-dropdown {
+      position: relative;
+      display: inline-flex;
+    }
+
+    .port-dropdown-trigger {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      background: transparent;
+      border: 1px solid #2a5d2a;
+      color: #4ade80;
+      padding: 0.25rem 0.75rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .port-dropdown-trigger:hover {
+      border-color: #22c55e;
+      background: rgba(34, 197, 94, 0.1);
+      color: #22c55e;
+    }
+
+    .port-dropdown-menu {
+      display: none;
+      position: absolute;
+      top: 100%;
+      right: 0;
+      margin-top: 4px;
+      background: var(--card-bg, #1a1a2e);
+      border: 1px solid var(--border-color, #333);
+      border-radius: 6px;
+      padding: 0.25rem 0;
+      min-width: 180px;
+      z-index: 100;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    }
+
+    .port-dropdown.open .port-dropdown-menu {
+      display: block;
+    }
+
+    .port-dropdown-menu a {
+      display: block;
+      padding: 0.5rem 0.75rem;
+      color: #4ade80;
+      text-decoration: none;
+      font-size: 0.8rem;
+      white-space: nowrap;
+    }
+
+    .port-dropdown-menu a:hover {
+      background: rgba(34, 197, 94, 0.1);
+    }
   `;
 
   override connectedCallback(): void {
@@ -367,6 +512,15 @@ export class ScionPageTerminal extends LitElement {
         this.agentId = match[1];
       }
     }
+
+    // Prevent the browser from navigating to a dropped file (which would
+    // destroy the terminal session). Must be on window, not the drop target,
+    // to catch near-miss drops outside the wrapper.
+    this._windowDragOver = (e: DragEvent) => { e.preventDefault(); };
+    this._windowDrop = (e: DragEvent) => { e.preventDefault(); };
+    window.addEventListener('dragover', this._windowDragOver);
+    window.addEventListener('drop', this._windowDrop);
+
     void this.loadAgentInfo();
   }
 
@@ -394,8 +548,14 @@ export class ScionPageTerminal extends LitElement {
       this.projectId = agent.projectId ?? '';
       this.agentPhase = agent.phase;
       this.agentActivity = agent.activity ?? '';
+      this.exposedPorts = agent.exposedPorts ?? [];
       dispatchPageTitle(this, 'Terminal', agent.name || this.agentId);
       this.connectSSE();
+
+      // Resolve upload target shared dir (best-effort, non-blocking for terminal init)
+      if (this.projectId) {
+        void this.resolveUploadTarget();
+      }
 
       if (!isTerminalAvailable(agent)) {
         this.error = agent.activity === 'offline'
@@ -433,6 +593,11 @@ export class ScionPageTerminal extends LitElement {
       const { subject, data } = e.detail;
       // Only handle events for this agent
       if (!subject.startsWith(`agent.${this.agentId}.`)) return;
+      if (subject.endsWith('.ports')) {
+        const portsData = data as { ports: ExposedPort[] };
+        this.exposedPorts = portsData.ports ?? [];
+        return;
+      }
       const delta = data as Partial<Agent>;
       if (delta.phase) this.agentPhase = delta.phase;
       if (delta.activity !== undefined) this.agentActivity = delta.activity ?? '';
@@ -730,9 +895,158 @@ export class ScionPageTerminal extends LitElement {
     }
   }
 
+  // --- Drag-and-drop file upload ---
+
+  private async resolveUploadTarget(): Promise<void> {
+    try {
+      const resp = await apiFetch(`/api/v1/projects/${this.projectId}/shared-dirs`);
+      if (!resp.ok) {
+        this.uploadEnabled = false;
+        this.uploadDisabledReason = 'Could not determine shared directories for file upload';
+        return;
+      }
+      const data = await resp.json();
+      const dirs = (data.sharedDirs ?? []) as Array<{ name: string; read_only?: boolean; in_workspace?: boolean }>;
+      // Filter: writable, non-in_workspace
+      const candidates = dirs.filter((d) => !d.read_only && !d.in_workspace);
+      const target = candidates.find((d) => d.name === 'scratchpad') || candidates[0];
+      if (target) {
+        this.uploadEnabled = true;
+        this.uploadTargetDir = target.name;
+        this.uploadBasePath = `/scion-volumes/${target.name}`;
+      } else {
+        this.uploadEnabled = false;
+        this.uploadDisabledReason = 'No writable shared directory available for file upload';
+      }
+    } catch {
+      this.uploadEnabled = false;
+      this.uploadDisabledReason = 'Could not determine shared directories for file upload';
+    }
+  }
+
+  private _onDragEnter(e: DragEvent): void {
+    e.preventDefault();
+    this._dragCounter++;
+    if (this._dragCounter === 1) {
+      if (this._errorTimer) {
+        clearTimeout(this._errorTimer);
+        this._errorTimer = null;
+        this.uploadStatus = '';
+      }
+      this.isDragOver = true;
+    }
+  }
+
+  private _onDragLeave(_e: DragEvent): void {
+    this._dragCounter = Math.max(0, this._dragCounter - 1);
+    if (this._dragCounter === 0) this.isDragOver = false;
+  }
+
+  private _onDragOver(e: DragEvent): void {
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = this.uploadEnabled ? 'copy' : 'none';
+  }
+
+  private async _onDrop(e: DragEvent): Promise<void> {
+    e.preventDefault();
+    this._dragCounter = 0;
+    this.isDragOver = false;
+    if (!this.uploadEnabled || !e.dataTransfer?.files.length) return;
+    await this._handleFileDrop(e.dataTransfer.files);
+  }
+
+  private async _handleFileDrop(files: FileList): Promise<void> {
+    // Client-side size validation
+    const MAX_FILE = 50 * 1024 * 1024;  // 50MB
+    const MAX_TOTAL = 100 * 1024 * 1024; // 100MB
+    let total = 0;
+    for (const f of files) {
+      if (f.size > MAX_FILE) {
+        this._showUploadError(`File "${f.name}" exceeds 50MB limit`);
+        return;
+      }
+      total += f.size;
+    }
+    if (total > MAX_TOTAL) {
+      this._showUploadError('Total upload exceeds 100MB limit');
+      return;
+    }
+
+    this.isUploading = true;
+    const batchId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+      ? crypto.randomUUID()
+      : Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+    const formData = new FormData();
+    const paths: string[] = [];
+
+    for (const file of files) {
+      const relPath = `.attachments/_web/${batchId}/${file.name}`;
+      formData.append(relPath, file);
+      paths.push(`${this.uploadBasePath}/.attachments/_web/${batchId}/${file.name}`);
+    }
+
+    this.uploadStatus = `Uploading ${files.length} file${files.length > 1 ? 's' : ''}...`;
+
+    try {
+      const resp = await apiFetch(
+        `/api/v1/projects/${this.projectId}/shared-dirs/${this.uploadTargetDir}/files`,
+        { method: 'POST', body: formData }
+      );
+      if (!resp.ok) {
+        if (resp.status === 409) {
+          this._showUploadError('File upload requires a co-located runtime broker');
+          this.uploadEnabled = false;
+          this.uploadDisabledReason = 'File upload requires a co-located runtime broker';
+          return;
+        }
+        const err = await extractApiError(resp, 'Upload failed');
+        this._showUploadError(err);
+        return;
+      }
+
+      // Inject paths into terminal
+      const quoted = paths.map((p) => this._quoteForShell(p));
+      this.sendData(quoted.join(' ') + ' ');
+      this.terminal?.focus();
+    } catch {
+      this._showUploadError('Upload failed: network error');
+    } finally {
+      // Only clear on success — error paths use _showUploadError which manages its own state
+      if (this.isUploading) {
+        this.isUploading = false;
+        this.uploadStatus = '';
+      }
+    }
+  }
+
+  private _quoteForShell(path: string): string {
+    if (/^[A-Za-z0-9._\/-]+$/.test(path)) return path;
+    return "'" + path.replace(/'/g, "'\\''") + "'";
+  }
+
+  private _showUploadError(msg: string): void {
+    if (this._errorTimer) clearTimeout(this._errorTimer);
+    this.uploadStatus = msg;
+    this.isUploading = false;
+    this.isDragOver = true;
+    this._errorTimer = setTimeout(() => {
+      this.uploadStatus = '';
+      this.isDragOver = false;
+      this._errorTimer = null;
+    }, 4000);
+  }
+
   private cleanup(): void {
     this.sendTmuxDetach();
     this.disconnectSSE();
+    if (this._windowDragOver) {
+      window.removeEventListener('dragover', this._windowDragOver);
+      this._windowDragOver = null;
+    }
+    if (this._windowDrop) {
+      window.removeEventListener('drop', this._windowDrop);
+      this._windowDrop = null;
+    }
     if (this.socket) {
       this.socket.close(1000, 'detach');
       this.socket = null;
@@ -748,6 +1062,10 @@ export class ScionPageTerminal extends LitElement {
     if (this.resizeTimer) {
       clearTimeout(this.resizeTimer);
       this.resizeTimer = null;
+    }
+    if (this._errorTimer) {
+      clearTimeout(this._errorTimer);
+      this._errorTimer = null;
     }
     this.fitAddon = null;
     this.clipboardAddon = null;
@@ -773,6 +1091,63 @@ export class ScionPageTerminal extends LitElement {
     this.sendData('\x02S');
     this.activeWindow = 'shell';
     this.terminal?.focus();
+  }
+
+  private renderPortButtons() {
+    if (this.exposedPorts.length === 0) return nothing;
+
+    if (this.exposedPorts.length <= 3) {
+      return this.exposedPorts.map(
+        (p) => html`
+          <a
+            class="port-btn"
+            href="/api/v1/agents/${this.agentId}/ports/${p.port}/proxy/"
+            target="_blank"
+            rel="noopener"
+            title=${p.label || `Port ${p.port}`}
+          >
+            Open :${p.port}
+          </a>
+        `
+      );
+    }
+
+    // 4+ ports: dropdown
+    return html`
+      <div class="port-dropdown">
+        <button
+          class="port-dropdown-trigger"
+          @click=${(e: Event) => {
+            e.stopPropagation();
+            const el = (e.currentTarget as HTMLElement).parentElement!;
+            const isOpen = el.classList.toggle('open');
+            if (isOpen) {
+              const close = () => {
+                el.classList.remove('open');
+                document.removeEventListener('click', close);
+              };
+              // Use setTimeout to avoid the current click triggering the close
+              setTimeout(() => document.addEventListener('click', close), 0);
+            }
+          }}
+        >
+          Ports (${this.exposedPorts.length}) ▾
+        </button>
+        <div class="port-dropdown-menu">
+          ${this.exposedPorts.map(
+            (p) => html`
+              <a
+                href="/api/v1/agents/${this.agentId}/ports/${p.port}/proxy/"
+                target="_blank"
+                rel="noopener"
+              >
+                :${p.port}${p.label ? ` — ${p.label}` : ''}
+              </a>
+            `
+          )}
+        </div>
+      </div>
+    `;
   }
 
   private get showCaptureAuth(): boolean {
@@ -801,17 +1176,19 @@ export class ScionPageTerminal extends LitElement {
 
       if (!response.ok) {
         const msg = await extractApiError(response, 'Failed to run capture auth');
-        alert(msg);
+        showToast(msg);
         return;
       }
 
       const result = await response.json() as { output: string; exitCode: number };
 
       if (result.exitCode === 0) {
-        alert(`Credentials captured successfully.\n\n${result.output}`);
+        showToast('Credentials captured successfully.', 'success');
+        if (result.output) console.log('Capture auth output:', result.output);
         await this.refreshAgentData();
       } else if (result.exitCode === 2) {
-        alert(`No credentials found yet.\n\nAuthenticate first (e.g., run 'agy' inside the container), then try again.\n\n${result.output}`);
+        showToast('No credentials found yet. Authenticate first, then try again.', 'neutral');
+        if (result.output) console.log('Capture auth output:', result.output);
       } else {
         const conflicts: string[] = [];
         for (const m of result.output.matchAll(ScionPageTerminal.SECRET_CONFLICT_RE)) {
@@ -820,12 +1197,13 @@ export class ScionPageTerminal extends LitElement {
         if (conflicts.length > 0) {
           this.captureAuthConflicts = conflicts;
         } else {
-          alert(`Capture failed (exit ${result.exitCode}).\n\n${result.output}`);
+          showToast(`Capture failed (exit ${result.exitCode}).`);
+          if (result.output) console.log('Capture auth output:', result.output);
         }
       }
     } catch (err) {
       console.error('Failed to capture auth:', err);
-      alert(err instanceof Error ? err.message : 'Failed to capture auth');
+      showToast(err instanceof Error ? err.message : 'Failed to capture auth');
     } finally {
       this.captureAuthLoading = false;
     }
@@ -954,6 +1332,7 @@ export class ScionPageTerminal extends LitElement {
           >${this.renderTerminalIcon()}</button>
         </div>
         <div class="spacer"></div>
+        ${this.renderPortButtons()}
         ${this.showCaptureAuth
           ? html`
               <button
@@ -991,13 +1370,29 @@ export class ScionPageTerminal extends LitElement {
             </div>
           `
         : ''}
-      <div class="terminal-wrapper">
+      <div
+        class="terminal-wrapper"
+        @dragenter=${(e: DragEvent) => this._onDragEnter(e)}
+        @dragleave=${(e: DragEvent) => this._onDragLeave(e)}
+        @dragover=${(e: DragEvent) => this._onDragOver(e)}
+        @drop=${(e: DragEvent) => this._onDrop(e)}
+      >
         <div class="terminal-container"></div>
         ${!this.connected && this.wasConnected
           ? html`<div class="disconnected-overlay">
               <span class="overlay-text">DISCONNECTED</span>
             </div>`
           : ''}
+        <div class="drop-overlay ${this.isDragOver || this.uploadStatus ? 'visible' : ''} ${!this.uploadEnabled ? 'disabled' : ''}">
+          ${this.isUploading
+            ? html`<sl-spinner></sl-spinner><span>${this.uploadStatus}</span>`
+            : this.uploadStatus
+              ? html`<sl-icon name="x-circle"></sl-icon><span>${this.uploadStatus}</span>`
+              : this.uploadEnabled
+                ? html`<sl-icon name="cloud-upload"></sl-icon><span>Drop files to upload</span>`
+                : html`<sl-icon name="x-circle"></sl-icon><span>${this.uploadDisabledReason}</span>`
+          }
+        </div>
       </div>
       ${this.renderCaptureAuthConflictDialog()}
     `;

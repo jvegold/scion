@@ -51,6 +51,7 @@ type CloudLogEntry struct {
 	JSONPayload    map[string]interface{} `json:"jsonPayload,omitempty"`
 	InsertID       string                 `json:"insertId"`
 	SourceLocation *LogSourceLocation     `json:"sourceLocation,omitempty"`
+	LogName        string                 `json:"logName,omitempty"` // Full Cloud Logging log name (e.g. "projects/my-project/logs/scion-server")
 }
 
 // LogSourceLocation identifies the source code location of a log entry.
@@ -71,6 +72,9 @@ type LogQueryOptions struct {
 	Until     time.Time
 	Severity  string
 	PageToken string
+	Sources   []string // optional: "hub", "broker", "agent", "messages" — restricts to matching logs/subsystems
+	Search    string   // optional: substring match on jsonPayload.message
+	HubName   string   // optional: filter by hub label to scope logs to this hub instance
 }
 
 // LogQueryResult contains the result of a log query.
@@ -163,9 +167,14 @@ func BuildLogFilter(opts LogQueryOptions, projectID ...string) string {
 	if opts.LogID != "" && len(projectID) > 0 && projectID[0] != "" {
 		parts = append(parts, fmt.Sprintf(`logName = "projects/%s/logs/%s"`, projectID[0], opts.LogID))
 	} else if len(projectID) > 0 && projectID[0] != "" {
-		// Exclude request logs from general log queries — they are high-volume
-		// server infrastructure logs that are not relevant to agent activity.
-		parts = append(parts, fmt.Sprintf(`logName != "projects/%s/logs/%s"`, projectID[0], logging.RequestLogID))
+		// Restrict to known Scion log names (whitelist). This excludes Cloud SQL,
+		// GCE audit, load balancer, and all other non-Scion logs in the project.
+		// The request log (scion_request_log) is excluded implicitly since it is
+		// not in the whitelist.
+		pid := projectID[0]
+		parts = append(parts, fmt.Sprintf(
+			`(logName = "projects/%s/logs/%s" OR logName = "projects/%s/logs/%s" OR logName = "projects/%s/logs/%s")`,
+			pid, logging.ServerLogID, pid, logging.AgentLogID, pid, logging.MessageLogID))
 	}
 	if opts.AgentID != "" && opts.LogID == logging.MessageLogID {
 		// For message logs, match where this agent is either the recipient
@@ -192,6 +201,40 @@ func BuildLogFilter(opts LogQueryOptions, projectID ...string) string {
 	if opts.Severity != "" {
 		parts = append(parts, fmt.Sprintf(`severity >= %s`, strings.ToUpper(opts.Severity)))
 	}
+	if opts.HubName != "" {
+		parts = append(parts, fmt.Sprintf(`labels.hub = %q`, opts.HubName))
+	}
+
+	if len(opts.Sources) > 0 && len(projectID) > 0 && projectID[0] != "" {
+		pid := projectID[0]
+		var srcParts []string
+		for _, src := range opts.Sources {
+			switch src {
+			case "hub":
+				srcParts = append(srcParts, fmt.Sprintf(
+					`(logName = "projects/%s/logs/%s" AND jsonPayload.subsystem =~ "^hub\\.")`, pid, logging.ServerLogID))
+			case "broker":
+				srcParts = append(srcParts, fmt.Sprintf(
+					`(logName = "projects/%s/logs/%s" AND jsonPayload.subsystem =~ "^broker\\.")`, pid, logging.ServerLogID))
+			case "agent":
+				srcParts = append(srcParts, fmt.Sprintf(
+					`logName = "projects/%s/logs/%s"`, pid, logging.AgentLogID))
+			case "messages":
+				srcParts = append(srcParts, fmt.Sprintf(
+					`logName = "projects/%s/logs/%s"`, pid, logging.MessageLogID))
+			}
+		}
+		if len(srcParts) > 0 {
+			parts = append(parts, "("+strings.Join(srcParts, " OR ")+")")
+		}
+	}
+
+	if opts.Search != "" {
+		// Escape backslashes first, then double quotes, to avoid double-escaping.
+		escaped := strings.ReplaceAll(opts.Search, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+		parts = append(parts, fmt.Sprintf(`jsonPayload.message:"%s"`, escaped))
+	}
 
 	return strings.Join(parts, " AND ")
 }
@@ -203,6 +246,7 @@ func ConvertLogEntry(entry *gcplog.Entry) CloudLogEntry {
 		Severity:  entry.Severity.String(),
 		Labels:    entry.Labels,
 		InsertID:  entry.InsertID,
+		LogName:   entry.LogName,
 	}
 
 	// Extract payload
@@ -317,6 +361,7 @@ func ConvertProtoLogEntry(entry *loggingpb.LogEntry) CloudLogEntry {
 		Severity: entry.GetSeverity().String(),
 		Labels:   entry.GetLabels(),
 		InsertID: entry.GetInsertId(),
+		LogName:  entry.GetLogName(),
 	}
 
 	if ts := entry.GetTimestamp(); ts != nil {

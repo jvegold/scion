@@ -80,6 +80,10 @@ type HubServerConfig struct {
 	// suspended (container stopped, phase set to "suspended"). Default: false.
 	AutoSuspendStalled bool `json:"autoSuspendStalled" yaml:"autoSuspendStalled" koanf:"autoSuspendStalled"`
 
+	// StalledThreshold is how long an agent can go without activity events
+	// before being marked as stalled. Default: 5 minutes.
+	StalledThreshold time.Duration `json:"stalledThreshold" yaml:"stalledThreshold" koanf:"stalledThreshold"`
+
 	// DisableLegacyStorageFallback disables the legacy un-namespaced storage
 	// path fallback introduced during GCS namespace migration. When true,
 	// only hub-scoped paths are checked; legacy paths are never consulted.
@@ -355,6 +359,23 @@ type GlobalConfig struct {
 
 	// GitHub App settings
 	GitHubApp GitHubAppConfig `json:"githubApp" yaml:"githubApp" koanf:"githubApp"`
+
+	// Scheduler settings
+	Scheduler SchedulerConfig `json:"scheduler" yaml:"scheduler" koanf:"scheduler"`
+
+	// SlowRequestThreshold is the duration after which an HTTP request is
+	// logged as slow. Default: 10s when unset/zero.
+	SlowRequestThreshold time.Duration `json:"slowRequestThreshold,omitempty" yaml:"slowRequestThreshold,omitempty" koanf:"slowRequestThreshold"`
+}
+
+// SchedulerConfig holds configuration for the Hub background task scheduler.
+type SchedulerConfig struct {
+	// IntervalSeconds is the root ticker interval in seconds. Default: 60.
+	IntervalSeconds int `json:"intervalSeconds,omitempty" yaml:"intervalSeconds,omitempty" koanf:"intervalSeconds"`
+	// MaxConcurrency limits simultaneous recurring handlers per tick.
+	// When nil (unset), the scheduler uses its built-in default of 2.
+	// Set to 0 for unlimited (pre-fix behavior).
+	MaxConcurrency *int `json:"maxConcurrency,omitempty" yaml:"maxConcurrency,omitempty" koanf:"maxConcurrency"`
 }
 
 // GitHubAppConfig holds configuration for the Hub's GitHub App integration.
@@ -759,8 +780,10 @@ var snakeCaseFields = map[string]string{
 	"publicurl":             "public_url",
 	"reportinterval":        "report_interval",
 	"respectdebugmode":      "respect_debug_mode",
+	"slowrequestthreshold":  "slow_request_threshold",
 	"softdeleteretainfiles": "soft_delete_retain_files",
 	"softdeleteretention":   "soft_delete_retention",
+	"stalledthreshold":      "stalled_threshold",
 	"useraccessmode":        "user_access_mode",
 	"webhooksenabled":       "webhooks_enabled",
 	// Layer-0 compound segments (from layer0Prefixes)
@@ -824,6 +847,7 @@ var camelCaseFields = map[string]string{
 	"readtimeout":                   "readTimeout",
 	"requiretrustedproxyip":         "requireTrustedProxyIP",
 	"runtimebroker":                 "runtimeBroker",
+	"slowrequestthreshold":          "slowRequestThreshold",
 	"softdeleteretainfiles":         "softDeleteRetainFiles",
 	"softdeleteretention":           "softDeleteRetention",
 	"telemetryenabled":              "telemetryEnabled",

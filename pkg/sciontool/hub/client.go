@@ -33,6 +33,7 @@ import (
 	"time"
 
 	state "github.com/GoogleCloudPlatform/scion/pkg/agent/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
 )
 
@@ -237,6 +238,29 @@ func (c *Client) IsConfigured() bool {
 	return c.hubURL != "" && token != "" && c.agentID != ""
 }
 
+func (c *Client) HubURL() string {
+	if c == nil {
+		return ""
+	}
+	return c.hubURL
+}
+
+func (c *Client) AgentID() string {
+	if c == nil {
+		return ""
+	}
+	return c.agentID
+}
+
+func (c *Client) AuthToken() string {
+	if c == nil {
+		return ""
+	}
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+	return c.token
+}
+
 // IsHostedMode returns true if the agent is running in hosted mode.
 func IsHostedMode() bool {
 	return os.Getenv(EnvAgentMode) == AgentModeHosted
@@ -368,6 +392,117 @@ type SetSecretResponse struct {
 	Key     string `json:"key"`
 	Scope   string `json:"scope"`
 	ScopeID string `json:"scopeId"`
+}
+
+type ExposedPort struct {
+	Port      int       `json:"port"`
+	Label     string    `json:"label,omitempty"`
+	Host      string    `json:"host,omitempty"`
+	Mode      string    `json:"mode,omitempty"`
+	ExposedAt time.Time `json:"exposedAt"`
+	ExposedBy string    `json:"exposedBy"`
+	URL       string    `json:"url"`
+	BasePath  string    `json:"basePath"`
+}
+
+type RegisterPortRequest struct {
+	Port  int    `json:"port"`
+	Label string `json:"label,omitempty"`
+	Host  string `json:"host,omitempty"`
+}
+
+type ListPortsResponse struct {
+	Ports []ExposedPort `json:"ports"`
+}
+
+func (c *Client) RegisterPort(ctx context.Context, req RegisterPortRequest) (*ExposedPort, error) {
+	if !c.IsConfigured() {
+		return nil, fmt.Errorf("hub client not configured")
+	}
+	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/ports", strings.TrimSuffix(c.hubURL, "/"), c.agentID)
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-Scion-Agent-Token", c.AuthToken())
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+	}
+	var out ExposedPort
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, err
+	}
+	out.URL = c.absoluteURL(out.URL)
+	return &out, nil
+}
+
+func (c *Client) ListPorts(ctx context.Context) ([]ExposedPort, error) {
+	if !c.IsConfigured() {
+		return nil, fmt.Errorf("hub client not configured")
+	}
+	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/ports", strings.TrimSuffix(c.hubURL, "/"), c.agentID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("X-Scion-Agent-Token", c.AuthToken())
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+	}
+	var out ListPortsResponse
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, err
+	}
+	for i := range out.Ports {
+		out.Ports[i].URL = c.absoluteURL(out.Ports[i].URL)
+	}
+	return out.Ports, nil
+}
+
+func (c *Client) DeletePort(ctx context.Context, port int) error {
+	if !c.IsConfigured() {
+		return fmt.Errorf("hub client not configured")
+	}
+	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/ports/%d", strings.TrimSuffix(c.hubURL, "/"), c.agentID, port)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("X-Scion-Agent-Token", c.AuthToken())
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNoContent {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+func (c *Client) absoluteURL(path string) string {
+	if path == "" || strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return path
+	}
+	return strings.TrimSuffix(c.hubURL, "/") + path
 }
 
 // SetSecret stores a project-scoped secret via the Hub API.
@@ -1250,6 +1385,54 @@ func (c *Client) SendOutboundMessage(ctx context.Context, msg OutboundMessage) e
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send outbound message: %w", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// selfMessageRequest is the payload for delivering a message to the current agent
+// via the hub's inbound agent message endpoint (POST /api/v1/agents/{id}/message).
+type selfMessageRequest struct {
+	StructuredMessage *messages.StructuredMessage `json:"structured_message"`
+}
+
+// SendSelfMessage delivers a structured message to the current agent via the
+// hub's inbound message endpoint. Unlike SendOutboundMessage (which targets
+// a human inbox), this delivers a message into the agent's own harness input.
+// No retries — this is a best-effort fire-and-forget call.
+func (c *Client) SendSelfMessage(ctx context.Context, msg *messages.StructuredMessage) error {
+	if !c.IsConfigured() {
+		return fmt.Errorf("hub client not configured")
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/message",
+		strings.TrimSuffix(c.hubURL, "/"), c.agentID)
+
+	payload := selfMessageRequest{StructuredMessage: msg}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal self message: %w", err)
+	}
+
+	c.tokenMu.RLock()
+	currentToken := c.token
+	c.tokenMu.RUnlock()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Scion-Agent-Token", currentToken)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send self message: %w", err)
 	}
 	respBody, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()

@@ -40,7 +40,12 @@ import (
 	scionrt "github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
+
+var tracer = otel.Tracer("scion-broker")
 
 // matchesAgent checks whether an agent matches the given id and optional projectID.
 // When projectID is provided, it must match for uniqueness across projects.
@@ -373,6 +378,10 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, span := tracer.Start(ctx, "broker.agent.create")
+	defer span.End()
+	span.SetAttributes(attribute.String("scion.agent.name", req.Name))
+
 	// Validate required fields
 	if req.Name == "" {
 		ValidationError(w, "name is required", nil)
@@ -461,6 +470,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		globalDir, err := config.GetGlobalDir()
 		if err != nil {
 			markAttemptFailed(http.StatusInternalServerError, "failed to resolve global dir")
+			span.SetStatus(codes.Error, err.Error())
 			RuntimeError(w, "Failed to get global dir: "+err.Error())
 			return
 		}
@@ -514,7 +524,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		required, secretInfo := s.extractRequiredEnvKeys(req, hydratedHCPath)
+		required, secretInfo, alternatives := s.extractRequiredEnvKeys(req, hydratedHCPath)
 		if s.config.Debug {
 			s.envSecretLog.Debug("Env-gather: evaluating env completeness",
 				"gatherEnv", req.GatherEnv,
@@ -584,12 +594,24 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 
+				// Build alternatives for needed keys only
+				var respAlternatives map[string][]string
+				for _, key := range needs {
+					if alts, ok := alternatives[key]; ok {
+						if respAlternatives == nil {
+							respAlternatives = make(map[string][]string)
+						}
+						respAlternatives[key] = alts
+					}
+				}
+
 				resp := EnvRequirementsResponse{
-					AgentID:    agentKey,
-					Required:   required,
-					HubHas:     hubHas,
-					Needs:      needs,
-					SecretInfo: respSecretInfo,
+					AgentID:      agentKey,
+					Required:     required,
+					HubHas:       hubHas,
+					Needs:        needs,
+					SecretInfo:   respSecretInfo,
+					Alternatives: respAlternatives,
 				}
 				if attempt != nil {
 					s.dispatchAttemptsMu.Lock()
@@ -640,6 +662,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	// N1-7: Ensure NFS shares are mounted before dispatch (no-op when backend=local).
 	if err := s.ensureNFSMountsReady(); err != nil {
 		markAttemptFailed(http.StatusServiceUnavailable, "NFS mount check failed: "+err.Error())
+		span.SetStatus(codes.Error, "NFS workspace storage is not available: "+err.Error())
 		writeError(w, http.StatusServiceUnavailable, "nfs_unavailable",
 			"NFS workspace storage is not available: "+err.Error(), nil)
 		return
@@ -671,6 +694,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		markAttemptFailed(http.StatusInternalServerError, err.Error())
+		span.SetStatus(codes.Error, err.Error())
 		if sce, ok := err.(*startContextError); ok && sce.IsHubError {
 			if templatecache.IsHubConnectivityError(sce.OriginalErr) {
 				HubUnreachableError(w, sce.OriginalErr.Error())
@@ -695,6 +719,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 			globalDir, err := config.GetGlobalDir()
 			if err != nil {
 				markAttemptFailed(http.StatusInternalServerError, "failed to resolve global dir")
+				span.SetStatus(codes.Error, err.Error())
 				RuntimeError(w, "Failed to get global dir: "+err.Error())
 				return
 			}
@@ -711,6 +736,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := os.MkdirAll(workspaceDir, 0755); err != nil {
 			markAttemptFailed(http.StatusInternalServerError, "failed to create workspace directory")
+			span.SetStatus(codes.Error, err.Error())
 			RuntimeError(w, "Failed to create workspace directory: "+err.Error())
 			return
 		}
@@ -718,6 +744,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		bucket := s.config.StorageBucket
 		if bucket == "" {
 			markAttemptFailed(http.StatusInternalServerError, "storage bucket not configured")
+			span.SetStatus(codes.Error, "storage bucket not configured")
 			RuntimeError(w, "Storage bucket not configured for workspace bootstrap")
 			return
 		}
@@ -733,6 +760,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 
 		if err := gcp.SyncFromGCS(ctx, bucket, req.WorkspaceStoragePath+"/files", workspaceDir); err != nil {
 			markAttemptFailed(http.StatusInternalServerError, "failed to download workspace from GCS")
+			span.SetStatus(codes.Error, err.Error())
 			RuntimeError(w, "Failed to download workspace from GCS: "+err.Error())
 			return
 		}
@@ -806,6 +834,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		cfg, err := sc.Manager.Provision(ctx, opts)
 		if err != nil {
 			markAttemptFailed(http.StatusInternalServerError, "failed to provision agent")
+			span.SetStatus(codes.Error, err.Error())
 			RuntimeError(w, "Failed to provision agent: "+err.Error())
 			return
 		}
@@ -865,6 +894,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 					"agent_id", req.ID, "project_id", req.ProjectID, "agent", opts.Name)
 			}
 		}
+		span.SetStatus(codes.Error, err.Error())
 		if errors.Is(err, agent.ErrContainerNameInUse) {
 			Conflict(w, err.Error())
 		} else {
@@ -1138,6 +1168,14 @@ func (s *Server) getAgent(w http.ResponseWriter, r *http.Request, id, projectID 
 
 func (s *Server) deleteAgent(w http.ResponseWriter, r *http.Request, id, projectID string) {
 	ctx := r.Context()
+
+	ctx, span := tracer.Start(ctx, "broker.agent.delete")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("scion.agent.id", id),
+		attribute.String("scion.project.id", projectID),
+	)
+
 	query := r.URL.Query()
 
 	deleteFiles := query.Get("deleteFiles") == "true"
@@ -1193,6 +1231,7 @@ func (s *Server) deleteAgent(w http.ResponseWriter, r *http.Request, id, project
 
 	_, err = mgr.Delete(ctx, id, deleteFiles, projectPath, removeBranch)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		if strings.Contains(err.Error(), "not found") {
 			NotFound(w, "Agent")
 			return
@@ -1251,6 +1290,13 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, p
 
 func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectID string) {
 	ctx := r.Context()
+
+	ctx, span := tracer.Start(ctx, "broker.agent.start")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("scion.agent.id", id),
+		attribute.String("scion.project.id", projectID),
+	)
 
 	// Read optional task, projectPath, projectSlug, harnessConfig, and resolvedEnv from request body
 	var startReq struct {
@@ -1318,6 +1364,7 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		HTTPRequest:     r,
 	})
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		RuntimeError(w, err.Error())
 		return
 	}
@@ -1327,6 +1374,7 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 	if startReq.ProjectPath == "" && startReq.ProjectSlug == "" && opts.ProjectPath == "" {
 		agents, err := s.manager.List(ctx, map[string]string{"scion.agent": "true"})
 		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
 			RuntimeError(w, "Failed to list agents: "+err.Error())
 			return
 		}
@@ -1367,6 +1415,7 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 	mgr := s.resolveManagerForOpts(opts)
 	agentInfo, err := mgr.Start(ctx, opts)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		s.agentLifecycleLog.Error("Agent start failed",
 			"agent_id", id, "error", err)
 		if errors.Is(err, agent.ErrContainerNameInUse) {
@@ -1494,6 +1543,13 @@ func (s *Server) projectScopedTarget(ctx context.Context, id, projectID string) 
 func (s *Server) stopAgent(w http.ResponseWriter, r *http.Request, id, projectID string) {
 	ctx := r.Context()
 
+	ctx, span := tracer.Start(ctx, "broker.agent.stop")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("scion.agent.id", id),
+		attribute.String("scion.project.id", projectID),
+	)
+
 	mgr := s.resolveManagerForAgent(ctx, id, projectID)
 
 	// Resolve the project-scoped container so that same-slug agents in
@@ -1520,6 +1576,7 @@ func (s *Server) stopAgent(w http.ResponseWriter, r *http.Request, id, projectID
 				"agent_id", id,
 				"phase", string(state.PhaseStopped))
 		} else {
+			span.SetStatus(codes.Error, err.Error())
 			RuntimeError(w, "Failed to stop agent: "+err.Error())
 			return
 		}
@@ -1630,6 +1687,10 @@ func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request, id, projec
 func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request, id, projectID string) {
 	ctx := r.Context()
 
+	ctx, span := tracer.Start(ctx, "broker.message.inject")
+	defer span.End()
+	span.SetAttributes(attribute.String("scion.agent.id", id))
+
 	var req MessageRequest
 	if err := readJSON(r, &req); err != nil {
 		BadRequest(w, "Invalid request body: "+err.Error())
@@ -1654,6 +1715,7 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request, id, project
 	isRaw := req.StructuredMessage != nil && req.StructuredMessage.Raw
 	if isRaw {
 		if err := mgr.MessageRaw(ctx, id, projectID, deliveryText); err != nil {
+			span.SetStatus(codes.Error, err.Error())
 			if strings.Contains(err.Error(), "not found") {
 				NotFound(w, "Agent")
 				return
@@ -1663,6 +1725,7 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request, id, project
 		}
 	} else {
 		if err := mgr.Message(ctx, id, projectID, deliveryText, req.Interrupt); err != nil {
+			span.SetStatus(codes.Error, err.Error())
 			if strings.Contains(err.Error(), "not found") {
 				NotFound(w, "Agent")
 				return
@@ -1962,8 +2025,8 @@ func (s *Server) checkAgentPrompt(w http.ResponseWriter, r *http.Request, id, pr
 // harness, auth type, and settings profile. It uses a multi-phase approach:
 //
 // Phase 1 (auth-aware): Resolves the harness type and auth_selected_type from
-// on-disk harness-config and settings, then calls RequiredAuthEnvKeys() to get
-// intrinsic credential requirements for the (harness, authType) pair.
+// on-disk harness-config and settings, then calls RequiredAuthEnvKeysFromConfig()
+// to get intrinsic credential requirements for the (harness, authType) pair.
 //
 // Phase 2 (settings-based): Extracts keys with empty values from settings
 // harness_configs[*].env and profiles[*].env, allowing users to declare custom
@@ -1975,8 +2038,9 @@ func (s *Server) checkAgentPrompt(w http.ResponseWriter, r *http.Request, id, pr
 // config directory that supplements the on-disk search. This allows env-gather
 // to see auth metadata from hub-managed harness-configs that haven't been
 // downloaded to the standard on-disk locations yet.
-func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessConfigPath ...string) ([]string, map[string]api.SecretKeyInfo) {
+func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessConfigPath ...string) ([]string, map[string]api.SecretKeyInfo, map[string][]string) {
 	required := make(map[string]struct{})
+	alternatives := make(map[string][]string)
 
 	var settings *config.VersionedSettings
 	settingsPath := req.ProjectPath
@@ -2117,10 +2181,8 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessC
 		// defaulting to api-key. This mirrors the auto-detect priority in each
 		// harness's ResolveAuth.
 		//
-		// Phase 3: when the harness-config carries declarative auth metadata
-		// (authMeta != nil), the *FromConfig variants drive detection. Older
-		// configs without the `auth:` block still hit the compiled fallbacks.
-		useConfigDriven := harness.AuthMetadataAvailable(&config.HarnessConfigEntry{Auth: authMeta})
+		// All auth preflight uses the config-driven path. The *FromConfig
+		// functions are safe to call with nil authMeta (they return zero values).
 		if authType == "" {
 			fileSecretNames := make(map[string]struct{})
 			for _, sec := range req.ResolvedSecrets {
@@ -2128,13 +2190,7 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessC
 					fileSecretNames[sec.Name] = struct{}{}
 				}
 			}
-			var detected string
-			if useConfigDriven {
-				detected = harness.DetectAuthTypeFromFileSecretsFromConfig(authMeta, fileSecretNames)
-			} else {
-				detected = harness.DetectAuthTypeFromFileSecrets(harnessType, fileSecretNames)
-			}
-			if detected != "" {
+			if detected := harness.DetectAuthTypeFromFileSecretsFromConfig(authMeta, fileSecretNames); detected != "" {
 				authType = detected
 			}
 		}
@@ -2156,35 +2212,18 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessC
 					}
 				}
 			}
-			var detected string
-			if useConfigDriven {
-				detected = harness.DetectAuthTypeFromEnvVarsFromConfig(authMeta, resolvedEnvKeys)
-			} else {
-				detected = harness.DetectAuthTypeFromEnvVars(harnessType, resolvedEnvKeys)
-			}
-			if detected != "" {
+			if detected := harness.DetectAuthTypeFromEnvVarsFromConfig(authMeta, resolvedEnvKeys); detected != "" {
 				authType = detected
 			}
 		}
 		if authType == "" {
-			var detected string
-			if useConfigDriven {
-				detected = harness.DetectAuthTypeFromGCPIdentityFromConfig(authMeta, gcpSAAssigned)
-			} else {
-				detected = harness.DetectAuthTypeFromGCPIdentity(harnessType, gcpSAAssigned)
-			}
-			if detected != "" {
+			if detected := harness.DetectAuthTypeFromGCPIdentityFromConfig(authMeta, gcpSAAssigned); detected != "" {
 				authType = detected
 			}
 		}
 
 		// Resolve auth key groups and check satisfaction
-		var keyGroups [][]string
-		if useConfigDriven {
-			keyGroups = harness.RequiredAuthEnvKeysFromConfig(authMeta, authType)
-		} else {
-			keyGroups = harness.RequiredAuthEnvKeys(harnessType, authType)
-		}
+		keyGroups := harness.RequiredAuthEnvKeysFromConfig(authMeta, authType)
 		if len(keyGroups) > 0 {
 			// Build lookup of already-satisfied keys
 			envKeys := make(map[string]struct{})
@@ -2218,6 +2257,11 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessC
 					canonicalKey := group[0]
 					required[canonicalKey] = struct{}{}
 					secretInfo[canonicalKey] = api.SecretKeyInfo{Source: "auth"}
+					// Record alternative key names so the hub can match
+					// as_needed env vars stored under non-canonical names.
+					if len(group) > 1 {
+						alternatives[canonicalKey] = group[1:]
+					}
 				}
 			}
 		}
@@ -2225,12 +2269,7 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessC
 		// Phase 1b: Auth-required file secrets (e.g. ADC for vertex-ai).
 		// When a GCP service account is assigned, the metadata server provides
 		// credentials, so the ADC file is not required.
-		var authSecrets []api.RequiredSecret
-		if useConfigDriven {
-			authSecrets = harness.RequiredAuthSecretsFromConfig(authMeta, authType, gcpSAAssigned)
-		} else {
-			authSecrets = harness.RequiredAuthSecrets(harnessType, authType, gcpSAAssigned)
-		}
+		authSecrets := harness.RequiredAuthSecretsFromConfig(authMeta, authType, gcpSAAssigned)
 		if len(authSecrets) > 0 {
 			// Build lookup of file-type resolved secrets by Name and Target suffix
 			fileSecrets := make(map[string]struct{})
@@ -2372,7 +2411,7 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessC
 	for k := range required {
 		keys = append(keys, k)
 	}
-	return keys, secretInfo
+	return keys, secretInfo, alternatives
 }
 
 // resolveHarnessConfigForEnvGather determines the harness-config name for the

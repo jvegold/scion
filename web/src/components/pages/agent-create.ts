@@ -409,7 +409,9 @@ export class ScionPageAgentCreate extends LitElement {
       }
 
       if (settingsRes.ok) {
-        const data = (await settingsRes.json()) as { telemetryEnabled?: boolean };
+        const data = (await settingsRes.json()) as {
+          telemetryEnabled?: boolean;
+        };
         this.telemetryEnabled = data.telemetryEnabled ?? false;
       }
 
@@ -417,7 +419,9 @@ export class ScionPageAgentCreate extends LitElement {
         const data = (await harnessConfigsRes.json()) as {
           harnessConfigs?: HarnessConfigEntry[];
         };
-        this.harnessConfigs = data.harnessConfigs || [];
+        this.harnessConfigs = (data.harnessConfigs || []).sort((a, b) =>
+          (a.displayName || a.name).localeCompare(b.displayName || b.name)
+        );
       }
 
       // If returning from configure page, populate form from existing agent
@@ -537,11 +541,10 @@ export class ScionPageAgentCreate extends LitElement {
       }
 
       // Pass config options
-      const config: Record<string, unknown> = {
-        env: {
-          SCION_TELEMETRY_ENABLED: this.telemetryEnabled ? 'true' : 'false',
-        },
+      const env: Record<string, string> = {
+        SCION_TELEMETRY_ENABLED: this.telemetryEnabled ? 'true' : 'false',
       };
+      const config: Record<string, unknown> = { env };
 
       body.config = config;
 
@@ -878,7 +881,9 @@ private selectBrokerForProject(): void {
       const res = await apiFetch(url);
       if (res.ok) {
         const data = (await res.json()) as { harnessConfigs?: HarnessConfigEntry[] };
-        this.harnessConfigs = data.harnessConfigs || [];
+        this.harnessConfigs = (data.harnessConfigs || []).sort((a, b) =>
+          (a.displayName || a.name).localeCompare(b.displayName || b.name)
+        );
       }
     } catch (err) {
       console.error('Failed to load harness configs:', err);

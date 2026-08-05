@@ -49,6 +49,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dbmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dispatchmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/hubmetrics"
+	"github.com/GoogleCloudPlatform/scion/pkg/observability/hubtracing"
 	scionplugin "github.com/GoogleCloudPlatform/scion/pkg/plugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin/grpcbroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
@@ -58,6 +59,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
+	gcputil "github.com/GoogleCloudPlatform/scion/pkg/util/gcp"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	"github.com/GoogleCloudPlatform/scion/web"
 	"github.com/knadh/koanf/v2"
@@ -253,6 +255,24 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 			log.Fatalf("Hub server failed to start: %v", hubInitErr)
 		}
 
+		// Wire hub OTel tracing export to Cloud Trace.
+		if os.Getenv("SCION_TRACING_ENABLED") == "true" && cfg.Hub.GCPProjectID != "" {
+			tp, tpErr := hubtracing.NewTracerProvider(ctx, cfg.Hub.GCPProjectID,
+				hubtracing.WithHubID(hubSrv.HubID()),
+				hubtracing.WithHubName(cfg.Hub.ResolveHubName()),
+			)
+			if tpErr != nil {
+				log.Printf("WARNING: hub tracing export disabled: %v", tpErr)
+			} else {
+				defer func() {
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					_ = tp.Shutdown(shutdownCtx)
+				}()
+				log.Printf("Hub OTel tracing enabled (project: %s)", cfg.Hub.GCPProjectID)
+			}
+		}
+
 		// Wire hub OTel metrics export to Cloud Monitoring.
 		if cfg.Hub.GCPProjectID != "" {
 			mp, mpErr := hubmetrics.NewMeterProvider(ctx, cfg.Hub.GCPProjectID,
@@ -374,6 +394,9 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 
 	// 13. Start Broker
 	if cfg.RuntimeBroker.Enabled {
+		if err := requireImageRegistryForBroker(); err != nil {
+			return err
+		}
 		if err := startRuntimeBroker(ctx, cmd, cfg, hubSrv, webSrv, s, hubEndpoint, devAuthToken, brokerSettings, globalDir, requestLogger, messageLogger, &wg, errCh); err != nil {
 			return err
 		}
@@ -648,6 +671,7 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 	}
 
 	hubName := resolveHubNameFromEnv()
+	hubID := resolveHubIDFromEnv()
 
 	// Initialize OTel logging
 	ctx := context.Background()
@@ -663,14 +687,30 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 	// If Cloud Logging becomes unavailable (e.g. during a metadata
 	// service outage), the circuit breaker opens and the hub falls back to
 	// local-only logging automatically.
+	// Check env var first (SCION_CLOUD_LOGGING), then fall back to settings.
+	// When the env var is set (even to "false"), it takes precedence over
+	// the settings value. Only consult settings when the env var is unset.
+	var cloudLoggingEnabled bool
+	if os.Getenv(logging.EnvCloudLogging) != "" {
+		cloudLoggingEnabled = logging.IsCloudLoggingEnabled()
+	} else {
+		projectPath := ""
+		if globalMode {
+			projectPath = "global"
+		}
+		if vs, err := config.LoadVersionedSettings(projectPath); err == nil && vs.Telemetry != nil && vs.Telemetry.Cloud != nil && vs.Telemetry.Cloud.CloudLogging != nil {
+			cloudLoggingEnabled = *vs.Telemetry.Cloud.CloudLogging
+		}
+	}
 	var cloudHandler slog.Handler
-	if logging.IsCloudLoggingEnabled() {
+	if cloudLoggingEnabled {
 		logLevel := logging.ResolveLogLevel(enableDebug)
-		cfg := logging.CloudLoggingConfig{
+		logCfg := logging.CloudLoggingConfig{
 			Component: component,
 			HubName:   hubName,
+			HubID:     hubID,
 		}
-		ch, cloudLogCleanup, cloudErr := logging.NewCloudHandler(ctx, cfg, logLevel)
+		ch, cloudLogCleanup, cloudErr := logging.NewCloudHandler(ctx, logCfg, logLevel)
 		if cloudErr != nil {
 			log.Printf("Warning: failed to initialize Cloud Logging: %v", cloudErr)
 		} else {
@@ -692,6 +732,7 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 		FilePath:   os.Getenv(logging.EnvRequestLogPath),
 		Component:  component,
 		HubName:    hubName,
+		HubID:      hubID,
 		UseGCP:     useGCP,
 		Foreground: serverStartForeground,
 		Level:      logging.ResolveLogLevel(enableDebug),
@@ -714,6 +755,7 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 	msgLogCfg := logging.MessageLoggerConfig{
 		Component: component,
 		HubName:   hubName,
+		HubID:     hubID,
 		UseGCP:    useGCP,
 		Level:     logging.ResolveLogLevel(enableDebug),
 	}
@@ -1251,6 +1293,16 @@ func parseAdminEmails(cfg *config.GlobalConfig) []string {
 	return adminEmailList
 }
 
+// resolveHubIDFromEnv resolves the hub instance ID from environment variables,
+// falling back to the deterministic hostname-derived default. This is used
+// during early logging init before the full config is loaded.
+func resolveHubIDFromEnv() string {
+	if v := os.Getenv("SCION_SERVER_HUB_HUBID"); v != "" {
+		return v
+	}
+	return config.DefaultHubID()
+}
+
 // resolveHubNameFromEnv resolves the hub display name from environment variables,
 // falling back to os.Hostname(). This is used during early logging init before
 // the full config is loaded. SCION_SERVER_HUB_HUBNAME (the standard koanf-derived
@@ -1311,10 +1363,14 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 		AdminEmails:                  adminEmailList,
 		UserAccessMode:               cfg.Auth.UserAccessMode,
 		HubEndpoint:                  hubEndpoint,
+		SlowRequestThreshold:         cfg.SlowRequestThreshold,
+		StalledThreshold:             cfg.Hub.StalledThreshold,
 		SoftDeleteRetention:          cfg.Hub.SoftDeleteRetention,
 		SoftDeleteRetainFiles:        cfg.Hub.SoftDeleteRetainFiles,
 		AdminMode:                    adminMode,
 		MaintenanceMessage:           maintenanceMessage,
+		SchedulerIntervalSeconds:     cfg.Scheduler.IntervalSeconds,
+		SchedulerMaxConcurrency:      cfg.Scheduler.MaxConcurrency, // *int: nil = use default, *0 = unlimited
 		Workstation:                  !hostedMode,
 		DevUserConfig: hub.DevUserConfig{
 			Username:    cfg.Auth.Username,
@@ -1389,6 +1445,21 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 	if hostedMode && hubCfg.SharedSigningSecret == "" {
 		log.Println("WARNING: hosted mode is enabled but no session secret is configured. " +
 			"Set --session-secret or SCION_SERVER_SESSION_SECRET to avoid cross-replica session failures.")
+	}
+
+	// Derive TelemetryProjectID using a priority chain:
+	// 1. Explicit telemetry.cloud.gcp_project_id setting (highest priority)
+	// 2. Derived from scion-telemetry-gcp-credentials SA key JSON
+	// 3. Existing GCPProjectID fallback (SA minting project, handled in server.go)
+	if pid := telemetryGCPProjectFromSettings(cfg); pid != "" {
+		hubCfg.TelemetryProjectID = pid
+		log.Printf("Telemetry project ID from settings: %s", pid)
+	}
+	if hubCfg.TelemetryProjectID == "" && secretBackend != nil {
+		if pid := telemetryGCPProjectFromSecret(ctx, secretBackend, cfg.Hub.ResolveHubID()); pid != "" {
+			hubCfg.TelemetryProjectID = pid
+			log.Printf("Telemetry project ID derived from SA credentials: %s", pid)
+		}
 	}
 
 	// Construct proxy authenticator when auth mode is "proxy"
@@ -1909,21 +1980,22 @@ func initWebServer(ctx context.Context, cfg *config.GlobalConfig, hubSrv *hub.Se
 	}
 
 	webCfg := hub.WebServerConfig{
-		Port:               webPort,
-		Host:               webHost,
-		AssetsDir:          webAssetsDir,
-		Debug:              enableDebug,
-		SessionSecret:      sessionSecret,
-		BaseURL:            baseURL,
-		DevAuthToken:       devAuthToken,
-		AuthMode:           cfg.Auth.Mode,
-		AuthorizedDomains:  webAuthorizedDomains,
-		AdminEmails:        webAdminEmails,
-		UserAccessMode:     cfg.Auth.UserAccessMode,
-		AdminMode:          adminMode,
-		MaintenanceMessage: maintenanceMessage,
-		EnableTestLogin:    enableTestLogin,
-		ProxyAuthenticator: webProxyAuth,
+		Port:                 webPort,
+		Host:                 webHost,
+		AssetsDir:            webAssetsDir,
+		Debug:                enableDebug,
+		SessionSecret:        sessionSecret,
+		BaseURL:              baseURL,
+		DevAuthToken:         devAuthToken,
+		AuthMode:             cfg.Auth.Mode,
+		AuthorizedDomains:    webAuthorizedDomains,
+		AdminEmails:          webAdminEmails,
+		UserAccessMode:       cfg.Auth.UserAccessMode,
+		AdminMode:            adminMode,
+		MaintenanceMessage:   maintenanceMessage,
+		EnableTestLogin:      enableTestLogin,
+		ProxyAuthenticator:   webProxyAuth,
+		SlowRequestThreshold: cfg.SlowRequestThreshold,
 	}
 	if enableTestLogin {
 		slog.Warn("Test login endpoint is enabled (--enable-test-login). This allows bypass of authentication and MUST NOT be used in production!")
@@ -2136,6 +2208,7 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		CORSMaxAge:                    cfg.RuntimeBroker.CORSMaxAge,
 		AllowContainerScriptHarnesses: cfg.RuntimeBroker.AllowContainerScriptHarnesses,
 		Debug:                         enableDebug,
+		SlowRequestThreshold:          cfg.SlowRequestThreshold,
 
 		HubEnabled:           hubEndpointForRH != "",
 		HubToken:             devAuthToken,
@@ -2542,6 +2615,38 @@ func resolveMaintenanceConfig(cfg *config.GlobalConfig) hub.MaintenanceConfig {
 	return mc
 }
 
+// requireImageRegistryForBroker checks that an image registry is available from
+// at least one source before starting the runtime broker. The broker needs a
+// registry to pull agent container images; without one, image pulls fail with
+// opaque 404 errors at dispatch time. This check fails fast at startup with an
+// actionable error instead.
+//
+// Sources checked (in priority order):
+//  1. SCION_IMAGE_REGISTRY env var
+//  2. SCION_MAINTENANCE_IMAGE_REGISTRY env var
+//  3. image_registry in versioned settings (settings.yaml)
+func requireImageRegistryForBroker() error {
+	if v := os.Getenv("SCION_IMAGE_REGISTRY"); v != "" {
+		return nil
+	}
+	if v := os.Getenv("SCION_MAINTENANCE_IMAGE_REGISTRY"); v != "" {
+		return nil
+	}
+	vs, _, err := config.LoadEffectiveSettings("")
+	if err != nil {
+		slog.Debug("Failed to load settings while checking image registry", "error", err)
+	}
+	if err == nil && vs != nil && vs.IsImageRegistryConfigured("") {
+		return nil
+	}
+	return fmt.Errorf("image_registry is not configured, but the runtime broker requires it.\n\n" +
+		"The runtime broker pulls container images to run agents. Without a registry,\n" +
+		"image pulls will fail. To fix this:\n\n" +
+		"  Option 1: scion config set --global image_registry <your-registry>\n" +
+		"  Option 2: export SCION_IMAGE_REGISTRY=<your-registry>\n\n" +
+		"See image-build/README.md for instructions on building and pushing images")
+}
+
 // migrateInlineSecrets performs a one-shot migration of secret config keys found
 // in the raw inline settings.yaml config into the secret backend. This prevents
 // existing users who followed the Telegram/Discord READMEs (which have
@@ -2655,4 +2760,26 @@ func injectPluginSecretsIntoConfig(ctx context.Context, sb secret.SecretBackend,
 		cfg[m.ConfigKey] = sv.Value
 	}
 	return cfg
+}
+
+// telemetryGCPProjectFromSettings returns the explicit telemetry.cloud.gcp_project_id
+// setting value, or "" if not configured.
+func telemetryGCPProjectFromSettings(cfg *config.GlobalConfig) string {
+	if cfg.TelemetryConfig == nil || cfg.TelemetryConfig.Cloud == nil {
+		return ""
+	}
+	if cfg.TelemetryConfig.Cloud.GCPProjectID == nil {
+		return ""
+	}
+	return *cfg.TelemetryConfig.Cloud.GCPProjectID
+}
+
+// telemetryGCPProjectFromSecret reads the scion-telemetry-gcp-credentials hub
+// secret and extracts the project_id from the SA key JSON.
+func telemetryGCPProjectFromSecret(ctx context.Context, sb secret.SecretBackend, hubID string) string {
+	sw, err := sb.Get(ctx, "scion-telemetry-gcp-credentials", secret.ScopeHub, hubID)
+	if err != nil || sw == nil || sw.Value == "" {
+		return ""
+	}
+	return gcputil.ParseProjectID([]byte(sw.Value))
 }

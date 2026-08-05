@@ -60,8 +60,15 @@ type ServerConfigResponse struct {
 	DefaultMaxDuration   string            `json:"default_max_duration,omitempty"`
 	DefaultResources     *api.ResourceSpec `json:"default_resources,omitempty"`
 
+	// Default agent model settings
+	DefaultModel         string `json:"default_model,omitempty"`
+	DefaultThinkingLevel *int   `json:"default_thinking_level,omitempty"`
+
 	// AutoInjectGcloudADC controls whether gcloud ADC is injected into agent containers.
 	AutoInjectGcloudADC bool `json:"auto_inject_gcloud_adc,omitempty"`
+
+	// AutoExposePorts controls whether ports are automatically exposed in agent containers.
+	AutoExposePorts *config.AutoExposePortsSettings `json:"auto_expose_ports,omitempty"`
 
 	// EnvOverrides lists koanf keys overridden by SCION_SERVER_* env vars
 	// on this node. Present in both file-mode and DB-mode responses so the
@@ -89,8 +96,15 @@ type ServerConfigUpdateRequest struct {
 	DefaultMaxDuration   *string           `json:"default_max_duration,omitempty"`
 	DefaultResources     *api.ResourceSpec `json:"default_resources,omitempty"`
 
+	// Default agent model settings
+	DefaultModel         *string `json:"default_model,omitempty"`
+	DefaultThinkingLevel *int    `json:"default_thinking_level,omitempty"`
+
 	// AutoInjectGcloudADC controls whether gcloud ADC is injected into agent containers.
 	AutoInjectGcloudADC *bool `json:"auto_inject_gcloud_adc,omitempty"`
+
+	// AutoExposePorts controls whether ports are automatically exposed in agent containers.
+	AutoExposePorts *config.AutoExposePortsSettings `json:"auto_expose_ports,omitempty"`
 }
 
 // handleAdminServerConfig handles GET/PUT /api/v1/admin/server-config.
@@ -242,7 +256,10 @@ func (s *Server) handleGetServerConfig(w http.ResponseWriter) {
 		DefaultMaxModelCalls: vs.DefaultMaxModelCalls,
 		DefaultMaxDuration:   vs.DefaultMaxDuration,
 		DefaultResources:     vs.DefaultResources,
+		DefaultModel:         vs.DefaultModel,
+		DefaultThinkingLevel: vs.DefaultThinkingLevel,
 		AutoInjectGcloudADC:  vs.AutoInjectGcloudADC,
+		AutoExposePorts:      vs.AutoExposePorts,
 	}
 
 	// Env overrides — detect SCION_SERVER_* env vars so the admin UI can
@@ -441,11 +458,32 @@ func applySettingsUpdates(raw map[string]interface{}, req *ServerConfigUpdateReq
 	if req.DefaultResources != nil {
 		raw["default_resources"] = marshalToMap(req.DefaultResources)
 	}
+	if req.DefaultModel != nil {
+		if *req.DefaultModel != "" {
+			raw["default_model"] = *req.DefaultModel
+		} else {
+			delete(raw, "default_model")
+		}
+	}
+	if req.DefaultThinkingLevel != nil {
+		if *req.DefaultThinkingLevel > 0 {
+			raw["default_thinking_level"] = *req.DefaultThinkingLevel
+		} else {
+			delete(raw, "default_thinking_level")
+		}
+	}
 	if req.AutoInjectGcloudADC != nil {
 		if *req.AutoInjectGcloudADC {
 			raw["auto_inject_gcloud_adc"] = true
 		} else {
 			delete(raw, "auto_inject_gcloud_adc")
+		}
+	}
+	if req.AutoExposePorts != nil {
+		if req.AutoExposePorts.Enabled != nil {
+			raw["auto_expose_ports"] = marshalToMap(req.AutoExposePorts)
+		} else {
+			delete(raw, "auto_expose_ports")
 		}
 	}
 }

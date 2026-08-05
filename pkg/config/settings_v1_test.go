@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/stretchr/testify/assert"
@@ -141,6 +142,49 @@ default_template: claude
 
 	assert.Equal(t, "prod", vs.ActiveProfile)
 	assert.Equal(t, "claude", vs.DefaultTemplate)
+}
+
+// TestLoadVersionedSettings_GlobalHarnessConfigNotOverriddenByProjectDefaults
+// verifies that when a user sets default_harness_config and default_template in
+// their global settings, initializing a project (which writes the embedded
+// project defaults into the project settings file) does not override those
+// global values.
+//
+// Regression test for GoogleCloudPlatform/scion#212.
+func TestLoadVersionedSettings_GlobalHarnessConfigNotOverriddenByProjectDefaults(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	t.Setenv("HOME", tmpDir)
+
+	// Set up global settings with custom default_harness_config and default_template.
+	globalScionDir := filepath.Join(tmpDir, ".scion")
+	require.NoError(t, os.MkdirAll(globalScionDir, 0755))
+
+	globalSettings := `
+schema_version: "1"
+default_harness_config: opencode
+default_template: my-template
+`
+	require.NoError(t, os.WriteFile(filepath.Join(globalScionDir, "settings.yaml"), []byte(globalSettings), 0644))
+
+	// Set up a project directory with the embedded project defaults — this is
+	// exactly what scion init writes into the project settings file.
+	projectDir := filepath.Join(tmpDir, "my-project", ".scion")
+	require.NoError(t, os.MkdirAll(projectDir, 0755))
+
+	projectDefaults, err := GetProjectDefaultSettingsYAML()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(projectDir, "settings.yaml"), projectDefaults, 0644))
+
+	// Load merged settings. The project defaults must NOT override the user's
+	// global preferences for default_harness_config and default_template.
+	vs, err := LoadVersionedSettings(projectDir)
+	require.NoError(t, err)
+
+	assert.Equal(t, "opencode", vs.DefaultHarnessConfig,
+		"global default_harness_config should not be overridden by project defaults (issue #212)")
+	assert.Equal(t, "my-template", vs.DefaultTemplate,
+		"global default_template should not be overridden by project defaults")
 }
 
 func TestLoadVersionedSettings_GroveOverride(t *testing.T) {
@@ -664,6 +708,80 @@ func TestLoadEffectiveSettings_NoUserFiles(t *testing.T) {
 	// Defaults flow through legacy path since no user files, so we get harness warnings
 	// from the adaptation of embedded defaults
 	_ = warnings
+}
+
+func TestLoadEffectiveSettings_WarnOnIgnoredSettingsFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	originalHome := os.Getenv("HOME")
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
+	_ = os.Setenv("HOME", tmpDir)
+
+	projectDir := filepath.Join(tmpDir, "my-project", ".scion")
+	require.NoError(t, os.MkdirAll(projectDir, 0755))
+
+	t.Run("non-empty file without schema_version produces warning", func(t *testing.T) {
+		// Write settings with real keys but no schema_version, no harnesses,
+		// and no v1 runtime indicators — this file will be silently ignored.
+		settingsContent := "default_template: my-template\n"
+		settingsPath := filepath.Join(projectDir, "settings.yaml")
+		require.NoError(t, os.WriteFile(settingsPath, []byte(settingsContent), 0644))
+		defer func() { _ = os.Remove(settingsPath) }()
+
+		_, warnings, err := LoadEffectiveSettings(projectDir)
+		require.NoError(t, err)
+
+		found := false
+		for _, w := range warnings {
+			if strings.Contains(w, "no schema_version field") && strings.Contains(w, settingsPath) {
+				found = true
+				break
+			}
+		}
+		assert.True(t, found, "expected warning about missing schema_version, got warnings: %v", warnings)
+	})
+
+	t.Run("empty file does not produce warning", func(t *testing.T) {
+		settingsPath := filepath.Join(projectDir, "settings.yaml")
+		require.NoError(t, os.WriteFile(settingsPath, []byte(""), 0644))
+		defer func() { _ = os.Remove(settingsPath) }()
+
+		_, warnings, err := LoadEffectiveSettings(projectDir)
+		require.NoError(t, err)
+
+		for _, w := range warnings {
+			assert.NotContains(t, w, "no schema_version field",
+				"empty file should not produce schema_version warning")
+		}
+	})
+
+	t.Run("file with only comments does not produce warning", func(t *testing.T) {
+		settingsPath := filepath.Join(projectDir, "settings.yaml")
+		require.NoError(t, os.WriteFile(settingsPath, []byte("# just a comment\n"), 0644))
+		defer func() { _ = os.Remove(settingsPath) }()
+
+		_, warnings, err := LoadEffectiveSettings(projectDir)
+		require.NoError(t, err)
+
+		for _, w := range warnings {
+			assert.NotContains(t, w, "no schema_version field",
+				"comment-only file should not produce schema_version warning")
+		}
+	})
+
+	t.Run("legacy format file does not produce warning", func(t *testing.T) {
+		// Write a file with harnesses key (legacy format)
+		settingsPath := filepath.Join(projectDir, "settings.yaml")
+		require.NoError(t, os.WriteFile(settingsPath, []byte("harnesses:\n  claude:\n    image: test\n"), 0644))
+		defer func() { _ = os.Remove(settingsPath) }()
+
+		_, warnings, err := LoadEffectiveSettings(projectDir)
+		require.NoError(t, err)
+		for _, w := range warnings {
+			assert.NotContains(t, w, "no schema_version field",
+				"legacy format file should not produce schema_version warning")
+		}
+	})
 }
 
 // --- Default settings compatibility tests ---
@@ -3013,8 +3131,8 @@ hub:
 	version, _ := DetectSettingsFormat(data)
 	assert.Equal(t, "1", version, "legacy file should be migrated to v1 after UpdateSetting")
 
-	// Verify the update was applied
-	assert.Contains(t, string(data), "grove_id: my-grove-id")
+	// Verify the update was applied (struct tags now use project_id)
+	assert.Contains(t, string(data), "project_id: my-grove-id")
 
 	// Verify original values were preserved
 	assert.Contains(t, string(data), "active_profile: local")
@@ -4000,8 +4118,109 @@ func TestWorkspaceStorageConfig_BackendUnset_IsLocal(t *testing.T) {
 	assert.Nil(t, ws.NFS, "no NFS block when backend is local/empty")
 }
 
+// ============================================================================
+// Scheduler Config Tests
+// ============================================================================
+
+func TestConvertV1ServerToGlobalConfig_Scheduler(t *testing.T) {
+	v1 := &V1ServerConfig{
+		Scheduler: &V1SchedulerConfig{
+			IntervalSeconds: 120,
+			MaxConcurrency:  intPtr(3),
+		},
+	}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	assert.Equal(t, 120, gc.Scheduler.IntervalSeconds)
+	require.NotNil(t, gc.Scheduler.MaxConcurrency)
+	assert.Equal(t, 3, *gc.Scheduler.MaxConcurrency)
+}
+
+func TestConvertV1ServerToGlobalConfig_SchedulerNil(t *testing.T) {
+	v1 := &V1ServerConfig{}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	assert.Equal(t, 0, gc.Scheduler.IntervalSeconds, "nil scheduler should leave defaults (zero)")
+	assert.Nil(t, gc.Scheduler.MaxConcurrency, "nil scheduler should leave MaxConcurrency nil (use scheduler default)")
+}
+
+func TestConvertGlobalToV1ServerConfig_Scheduler(t *testing.T) {
+	gc := DefaultGlobalConfig()
+	gc.Scheduler.IntervalSeconds = 180
+	gc.Scheduler.MaxConcurrency = intPtr(2)
+	v1 := ConvertGlobalToV1ServerConfig(&gc)
+	require.NotNil(t, v1.Scheduler)
+	assert.Equal(t, 180, v1.Scheduler.IntervalSeconds)
+	require.NotNil(t, v1.Scheduler.MaxConcurrency)
+	assert.Equal(t, 2, *v1.Scheduler.MaxConcurrency)
+}
+
+func TestConvertGlobalToV1ServerConfig_SchedulerZeroOmitted(t *testing.T) {
+	gc := DefaultGlobalConfig()
+	// Zero/nil values — scheduler block should not be emitted
+	v1 := ConvertGlobalToV1ServerConfig(&gc)
+	assert.Nil(t, v1.Scheduler, "zero-value scheduler should be omitted in V1")
+}
+
+func TestSchedulerMaxConcurrency_ExplicitZeroRoundTrips(t *testing.T) {
+	// Regression: explicit max_concurrency=0 (unlimited) must survive the
+	// V1 → Global → V1 round-trip and not be confused with "unset".
+	v1 := &V1ServerConfig{
+		Scheduler: &V1SchedulerConfig{
+			MaxConcurrency: intPtr(0),
+		},
+	}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	require.NotNil(t, gc.Scheduler.MaxConcurrency, "explicit 0 must not be nil")
+	assert.Equal(t, 0, *gc.Scheduler.MaxConcurrency)
+
+	v1Out := ConvertGlobalToV1ServerConfig(gc)
+	require.NotNil(t, v1Out.Scheduler, "scheduler block must be emitted for explicit 0")
+	require.NotNil(t, v1Out.Scheduler.MaxConcurrency)
+	assert.Equal(t, 0, *v1Out.Scheduler.MaxConcurrency)
+}
+
+func TestVersionedEnvKeyMapper_Scheduler(t *testing.T) {
+	tests := []struct {
+		env  string
+		want string
+	}{
+		{"SCION_SERVER_SCHEDULER_INTERVAL_SECONDS", "server.scheduler.interval_seconds"},
+		{"SCION_SERVER_SCHEDULER_MAX_CONCURRENCY", "server.scheduler.max_concurrency"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.env, func(t *testing.T) {
+			got := versionedEnvKeyMapper(tt.env)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestConvertV1ServerToGlobalConfig_StalledThresholdValid(t *testing.T) {
+	v1 := &V1ServerConfig{
+		Hub: &V1ServerHubConfig{
+			StalledThreshold: "10m",
+		},
+	}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	assert.Equal(t, 10*time.Minute, gc.Hub.StalledThreshold)
+}
+
+func TestConvertV1ServerToGlobalConfig_StalledThresholdInvalidIgnored(t *testing.T) {
+	v1 := &V1ServerConfig{
+		Hub: &V1ServerHubConfig{
+			StalledThreshold: "not-a-duration",
+		},
+	}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	// Invalid duration string should be ignored; StalledThreshold stays at zero value.
+	assert.Equal(t, time.Duration(0), gc.Hub.StalledThreshold)
+}
+
 // --- Helper ---
 
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+func intPtr(i int) *int {
+	return &i
 }

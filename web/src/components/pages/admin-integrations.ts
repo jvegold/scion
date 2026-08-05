@@ -61,6 +61,8 @@ interface PlatformFieldDef {
   description: string;
   defaultValue: string;
   placeholder?: string;
+  type?: 'text' | 'select' | 'toggle';  // default 'text'
+  options?: { value: string; label: string }[];  // for 'select' type
 }
 
 interface PlatformSecretDef {
@@ -68,6 +70,21 @@ interface PlatformSecretDef {
   label: string;
   description: string;
   required?: boolean;
+}
+
+/** Shape of a project entry in the projects_json flat config value. */
+interface A2AProjectEntry {
+  slug: string;
+  default_template: string;
+  auto_provision: boolean;
+  exposed_agents: string[];
+}
+
+/** Lightweight project info from GET /api/v1/projects. */
+interface ProjectInfo {
+  id: string;
+  name: string;
+  slug?: string;
 }
 
 const PLATFORM_SECRETS: Record<string, PlatformSecretDef[]> = {
@@ -83,6 +100,9 @@ const PLATFORM_SECRETS: Record<string, PlatformSecretDef[]> = {
     { key: 'app_token', label: 'App Token', description: 'Slack app-level token for Socket Mode (xapp-...)' },
     { key: 'signing_secret', label: 'Signing Secret', description: 'Slack signing secret for HTTP mode' },
   ],
+  a2a: [
+    { key: 'api_key', label: 'API Key', description: 'Static API key for apiKey/bearer auth schemes' },
+  ],
 };
 
 function resolvePlatform(name: string): string {
@@ -91,6 +111,7 @@ function resolvePlatform(name: string): string {
     case 'discord': return 'discord';
     case 'slack': return 'slack';
     case 'chat-app': return 'gchat';
+    case 'a2a-bridge': return 'a2a';
     default: return name;
   }
 }
@@ -117,6 +138,49 @@ const PLATFORM_FIELDS: Record<string, PlatformFieldDef[]> = {
     { key: 'listen_address', label: 'Listen Address', description: 'HTTP listen address (HTTP mode only)', defaultValue: ':3000' },
     { key: 'db_path', label: 'Database Path', description: 'Path to SQLite database', defaultValue: '~/.scion/scion-slack.db' },
     { key: 'agent_cache_ttl', label: 'Agent Cache TTL', description: 'How long to cache agent info', defaultValue: '5m' },
+  ],
+  a2a: [
+    { key: 'external_url', label: 'External URL',
+      description: 'Public URL where the bridge serves agent cards and JSON-RPC',
+      defaultValue: '', placeholder: 'https://a2a.example.com' },
+    { key: 'auth_scheme', label: 'Auth Scheme',
+      description: 'Authentication method for A2A clients',
+      defaultValue: 'none',
+      type: 'select',
+      options: [
+        { value: 'none', label: 'None' },
+        { value: 'apiKey', label: 'API Key' },
+        { value: 'bearer', label: 'Bearer Token' },
+        { value: 'hubUAT', label: 'Hub UAT' },
+        { value: 'hubJWT', label: 'Hub JWT' },
+      ] },
+    { key: 'rate_limit_enabled', label: 'Rate Limiting',
+      description: 'Enable request rate limiting',
+      defaultValue: 'false', type: 'toggle' },
+    { key: 'rate_limit_rps', label: 'Rate Limit (req/s)',
+      description: 'Maximum requests per second',
+      defaultValue: '10', placeholder: '10' },
+    { key: 'rate_limit_burst', label: 'Rate Limit Burst',
+      description: 'Maximum burst size for rate limiter',
+      defaultValue: '20', placeholder: '20' },
+    { key: 'send_message_timeout', label: 'Send Message Timeout',
+      description: 'Timeout for sending messages to agents',
+      defaultValue: '120s', placeholder: '120s' },
+    { key: 'sse_keepalive', label: 'SSE Keepalive Interval',
+      description: 'Interval for SSE keepalive pings',
+      defaultValue: '30s', placeholder: '30s' },
+    { key: 'push_retry_max', label: 'Push Notification Retries',
+      description: 'Maximum retries for push notification delivery',
+      defaultValue: '3', placeholder: '3' },
+    { key: 'provider_org', label: 'Provider Organization',
+      description: 'Organization name for agent card metadata',
+      defaultValue: '', placeholder: 'My Organization' },
+    { key: 'provider_url', label: 'Provider URL',
+      description: 'Organization URL for agent card metadata',
+      defaultValue: '', placeholder: 'https://example.com' },
+    { key: 'uat_cache_ttl', label: 'UAT Cache TTL',
+      description: 'How long to cache UAT validation results',
+      defaultValue: '60s', placeholder: '60s' },
   ],
 };
 
@@ -146,6 +210,10 @@ export class ScionPageAdminIntegrations extends LitElement {
   // Available integrations for install
   @state() private availableIntegrations: AvailableIntegration[] = [];
   @state() private installingName: string | null = null;
+
+  // Available projects for A2A project selector
+  @state() private availableProjects: ProjectInfo[] = [];
+
 
   static override styles = css`
     :host {
@@ -480,6 +548,37 @@ export class ScionPageAdminIntegrations extends LitElement {
       font-size: 0.75rem;
       color: var(--scion-text-muted, #64748b);
     }
+
+    /* ── A2A Projects Editor ── */
+
+    .project-card {
+      border: 1px solid var(--scion-border, #e2e8f0);
+      border-radius: var(--scion-radius, 0.5rem);
+      padding: 1rem;
+      margin-bottom: 0.75rem;
+      background: var(--scion-bg-subtle, #f8fafc);
+    }
+
+    .project-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0.75rem;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--scion-text-muted, #64748b);
+    }
+
+    .project-card .form-grid {
+      gap: 0.75rem;
+    }
+
+    .projects-empty {
+      padding: 1.5rem;
+      text-align: center;
+      color: var(--scion-text-muted, #64748b);
+      font-size: 0.875rem;
+    }
   `;
 
   private get currentName(): string | null {
@@ -541,10 +640,28 @@ export class ScionPageAdminIntegrations extends LitElement {
         ...(this.detail.settings || {}),
       };
       this.editedSecrets = {};
+
+      // For A2A integrations, fetch the project list for the projects editor.
+      if (resolvePlatform(name) === 'a2a') {
+        void this.loadAvailableProjects();
+      }
     } catch {
       this.error = 'Failed to connect to server';
     } finally {
       this.loading = false;
+    }
+  }
+
+  /** Fetch the hub project list for the A2A project selector. */
+  private async loadAvailableProjects(): Promise<void> {
+    try {
+      const res = await apiFetch('/api/v1/projects');
+      if (res.ok) {
+        const body = (await res.json()) as { projects: ProjectInfo[] };
+        this.availableProjects = body.projects ?? [];
+      }
+    } catch {
+      // Non-fatal: the editor still works, but the dropdown will be empty.
     }
   }
 
@@ -877,8 +994,10 @@ export class ScionPageAdminIntegrations extends LitElement {
 
       ${this.renderStatusSection(d.status)}
       ${this.renderSetupBanner(d)}
+      ${this.renderA2ASetupSection(d)}
       ${this.renderSecretsSection(d)}
       ${this.renderConfigSection(d)}
+      ${this.renderA2AProjectsSection(d)}
       ${this.renderDiscordInviteLink(d)}
       ${this.renderActionsSection()}
     `;
@@ -969,7 +1088,14 @@ export class ScionPageAdminIntegrations extends LitElement {
     const platform = resolvePlatform(d.name);
     const fieldDefs = PLATFORM_FIELDS[platform] || [];
     const definedKeys = new Set(fieldDefs.map((f) => f.key));
-    const extraKeys = Object.keys(d.settings || {}).filter((k) => !definedKeys.has(k));
+    // Filter out keys that have dedicated editors (e.g. projects_json for A2A).
+    const hiddenExtraKeys = new Set<string>();
+    if (platform === 'a2a') {
+      hiddenExtraKeys.add('projects_json');
+    }
+    const extraKeys = Object.keys(d.settings || {}).filter(
+      (k) => !definedKeys.has(k) && !hiddenExtraKeys.has(k),
+    );
     const hasFields = fieldDefs.length > 0 || extraKeys.length > 0;
 
     if (!hasFields && Object.keys(d.settings || {}).length === 0) {
@@ -989,16 +1115,7 @@ export class ScionPageAdminIntegrations extends LitElement {
             (field) => html`
               <div class="form-field">
                 <label>${field.label}</label>
-                <sl-input
-                  .value=${this.editedSettings[field.key] ?? field.defaultValue}
-                  placeholder=${field.placeholder ?? field.defaultValue}
-                  @sl-change=${(e: Event) => {
-                    this.editedSettings = {
-                      ...this.editedSettings,
-                      [field.key]: (e.target as HTMLInputElement).value,
-                    };
-                  }}
-                ></sl-input>
+                ${this.renderFieldInput(field)}
                 <span class="hint">${field.description}</span>
               </div>
             `
@@ -1024,6 +1141,301 @@ export class ScionPageAdminIntegrations extends LitElement {
     `;
   }
 
+  private renderFieldInput(field: PlatformFieldDef) {
+    const fieldType = field.type ?? 'text';
+
+    if (fieldType === 'select' && field.options) {
+      const currentValue = this.editedSettings[field.key] ?? field.defaultValue;
+      return html`
+        <sl-select
+          .value=${currentValue}
+          @sl-change=${(e: Event) => {
+            this.editedSettings = {
+              ...this.editedSettings,
+              [field.key]: (e.target as HTMLSelectElement).value,
+            };
+          }}
+        >
+          ${field.options.map(
+            (opt) => html`<sl-option value=${opt.value}>${opt.label}</sl-option>`
+          )}
+        </sl-select>
+      `;
+    }
+
+    if (fieldType === 'toggle') {
+      const currentValue = this.editedSettings[field.key] ?? field.defaultValue;
+      const isChecked = currentValue === 'true';
+      return html`
+        <sl-switch
+          ?checked=${isChecked}
+          @sl-change=${(e: Event) => {
+            this.editedSettings = {
+              ...this.editedSettings,
+              [field.key]: (e.target as HTMLInputElement).checked ? 'true' : 'false',
+            };
+          }}
+        ></sl-switch>
+      `;
+    }
+
+    // Default: text input
+    return html`
+      <sl-input
+        .value=${this.editedSettings[field.key] ?? field.defaultValue}
+        placeholder=${field.placeholder ?? field.defaultValue}
+        @sl-change=${(e: Event) => {
+          this.editedSettings = {
+            ...this.editedSettings,
+            [field.key]: (e.target as HTMLInputElement).value,
+          };
+        }}
+      ></sl-input>
+    `;
+  }
+
+  // ── A2A Projects & Agent Exposure Editor ──
+
+  /** Parse the projects_json flat config value into an array of project entries. */
+  private parseProjectsJSON(): { projects: A2AProjectEntry[]; warning: string | null } {
+    const raw = this.editedSettings['projects_json'] ?? '';
+    if (!raw || raw === '[]') {
+      return { projects: [], warning: null };
+    }
+    try {
+      const parsed = JSON.parse(raw) as A2AProjectEntry[];
+      if (!Array.isArray(parsed)) {
+        return { projects: [], warning: null };
+      }
+      return { projects: parsed, warning: null };
+    } catch (e) {
+      console.warn('Could not parse projects_json configuration:', e);
+      return { projects: [], warning: 'Warning: Could not parse existing projects configuration.' };
+    }
+  }
+
+  /** Serialize the project entries back to the projects_json flat config value. */
+  private serializeProjectsJSON(projects: A2AProjectEntry[]): void {
+    this.editedSettings = {
+      ...this.editedSettings,
+      projects_json: JSON.stringify(projects),
+    };
+  }
+
+  private renderA2AProjectsSection(d: IntegrationDetail) {
+    const platform = resolvePlatform(d.name);
+    if (platform !== 'a2a') return nothing;
+
+    const { projects, warning } = this.parseProjectsJSON();
+
+    // Slugs already used — for duplicate-prevention in the dropdown.
+    const usedSlugs = new Set(projects.map((p) => p.slug));
+
+    return html`
+      <div class="section">
+        <h3 class="section-title">Projects & Agent Exposure</h3>
+        ${warning
+          ? html`<div class="warning-message" style="color: var(--sl-color-warning-600); margin-bottom: 0.5rem;">
+              <sl-icon name="exclamation-triangle" style="margin-right: 0.25rem;"></sl-icon>
+              ${warning}
+            </div>`
+          : nothing}
+        ${projects.length === 0
+          ? html`
+              <div class="projects-empty">
+                <p>No projects configured. Add a project to expose its agents via A2A.</p>
+              </div>
+            `
+          : projects.map((proj, idx) =>
+              this.renderProjectCard(proj, idx, projects, usedSlugs),
+            )}
+        <sl-button
+          variant="default"
+          size="small"
+          style="margin-top: 0.5rem;"
+          @click=${() => this.handleAddProject(projects)}
+        >
+          <sl-icon slot="prefix" name="plus-lg"></sl-icon>
+          Add Project
+        </sl-button>
+      </div>
+    `;
+  }
+
+  private renderProjectCard(
+    proj: A2AProjectEntry,
+    idx: number,
+    allProjects: A2AProjectEntry[],
+    usedSlugs: Set<string>,
+  ) {
+    // Build project display name for the header.
+    const matchedProject = this.availableProjects.find(
+      (p) => (p.slug ?? p.id) === proj.slug,
+    );
+    const headerLabel = matchedProject
+      ? `${matchedProject.name} (${proj.slug})`
+      : proj.slug || 'New Project';
+
+    return html`
+      <div class="project-card">
+        <div class="project-card-header">
+          <span>Project ${idx + 1}: ${headerLabel}</span>
+          <sl-button
+            variant="danger"
+            size="small"
+            outline
+            @click=${() => this.handleRemoveProject(allProjects, idx)}
+          >
+            Remove
+          </sl-button>
+        </div>
+        <div class="form-grid">
+          <div class="form-field">
+            <label>Project</label>
+            ${this.availableProjects.length > 0
+              ? html`
+                  <sl-select
+                    .value=${proj.slug}
+                    placeholder="Select a project"
+                    @sl-change=${(e: Event) =>
+                      this.handleProjectFieldChange(
+                        allProjects,
+                        idx,
+                        'slug',
+                        (e.target as HTMLSelectElement).value,
+                      )}
+                  >
+                    ${this.availableProjects.map((p) => {
+                      const slug = p.slug ?? p.id;
+                      const disabled = usedSlugs.has(slug) && slug !== proj.slug;
+                      return html`
+                        <sl-option value=${slug} ?disabled=${disabled}>
+                          ${p.name} (${slug})
+                        </sl-option>
+                      `;
+                    })}
+                  </sl-select>
+                `
+              : html`
+                  <sl-input
+                    .value=${proj.slug}
+                    placeholder="project-slug"
+                    @sl-change=${(e: Event) =>
+                      this.handleProjectFieldChange(
+                        allProjects,
+                        idx,
+                        'slug',
+                        (e.target as HTMLInputElement).value,
+                      )}
+                  ></sl-input>
+                `}
+            <span class="hint">Project to expose via A2A</span>
+          </div>
+
+          <div class="form-field">
+            <label>Default Template</label>
+            <sl-input
+              .value=${proj.default_template}
+              placeholder="default"
+              @sl-change=${(e: Event) =>
+                this.handleProjectFieldChange(
+                  allProjects,
+                  idx,
+                  'default_template',
+                  (e.target as HTMLInputElement).value,
+                )}
+            ></sl-input>
+            <span class="hint">Agent template for auto-provisioned agents</span>
+          </div>
+
+          <div class="form-field">
+            <label>Auto Provision</label>
+            <sl-switch
+              ?checked=${proj.auto_provision}
+              @sl-change=${(e: Event) =>
+                this.handleProjectFieldChange(
+                  allProjects,
+                  idx,
+                  'auto_provision',
+                  (e.target as HTMLInputElement).checked,
+                )}
+            ></sl-switch>
+            <span class="hint">Automatically create agents from A2A requests</span>
+          </div>
+
+          <div class="form-field">
+            <label>Exposed Agents</label>
+            <sl-input
+              .value=${(proj.exposed_agents ?? []).join(', ')}
+              placeholder="Leave empty to expose all agents"
+              @sl-change=${(e: Event) =>
+                this.handleProjectFieldChange(
+                  allProjects,
+                  idx,
+                  'exposed_agents',
+                  (e.target as HTMLInputElement).value,
+                )}
+            ></sl-input>
+            <span class="hint">Comma-separated agent names. Leave empty to expose all agents.</span>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private handleAddProject(currentProjects: A2AProjectEntry[]): void {
+    const updated = [
+      ...currentProjects,
+      {
+        slug: '',
+        default_template: 'default',
+        auto_provision: false,
+        exposed_agents: [] as string[],
+      },
+    ];
+    this.serializeProjectsJSON(updated);
+  }
+
+  private handleRemoveProject(
+    currentProjects: A2AProjectEntry[],
+    idx: number,
+  ): void {
+    const updated = currentProjects.filter((_, i) => i !== idx);
+    this.serializeProjectsJSON(updated);
+  }
+
+  private handleProjectFieldChange(
+    currentProjects: A2AProjectEntry[],
+    idx: number,
+    field: keyof A2AProjectEntry,
+    value: string | boolean,
+  ): void {
+    const updated = currentProjects.map((p, i) => {
+      if (i !== idx) return { ...p };
+      const copy = { ...p };
+      switch (field) {
+        case 'slug':
+          copy.slug = value as string;
+          break;
+        case 'default_template':
+          copy.default_template = value as string;
+          break;
+        case 'auto_provision':
+          copy.auto_provision = value as boolean;
+          break;
+        case 'exposed_agents': {
+          const raw = (value as string).trim();
+          copy.exposed_agents = raw
+            ? raw.split(',').map((s) => s.trim()).filter((s) => s !== '')
+            : [];
+          break;
+        }
+      }
+      return copy;
+    });
+    this.serializeProjectsJSON(updated);
+  }
+
   private renderDiscordInviteLink(d: IntegrationDetail) {
     const platform = resolvePlatform(d.name);
     if (platform !== 'discord') return nothing;
@@ -1042,7 +1454,7 @@ export class ScionPageAdminIntegrations extends LitElement {
             <div>
               <p class="invite-link-description">Add the bot to your Discord server</p>
               <p class="invite-link-permissions">
-                Grants required permissions: Send Messages, Read Message History, View Channels, Embed Links, Manage Webhooks
+                Grants required permissions: View Channels, Send Messages, Send Messages in Threads, Create Public Threads, Manage Threads, Read Message History, Embed Links, Add Reactions, Manage Webhooks
               </p>
             </div>
           </div>
@@ -1056,6 +1468,45 @@ export class ScionPageAdminIntegrations extends LitElement {
             <sl-icon slot="prefix" name="box-arrow-up-right"></sl-icon>
             Invite Bot to Server
           </sl-button>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderA2ASetupSection(d: IntegrationDetail) {
+    const platform = resolvePlatform(d.name);
+    if (platform !== 'a2a') return nothing;
+
+    // Only show the setup section when the bridge is not connected.
+    if (d.status?.connected) return nothing;
+
+    const binaryName = 'scion-a2a-bridge';
+    const configFile = '~/.scion/scion-a2a-bridge.yaml';
+    const startCommand = `${binaryName} -config ${configFile}`;
+
+    return html`
+      <div class="section">
+        <h3 class="section-title">Bridge Setup</h3>
+        <div class="setup-banner">
+          <sl-icon name="info-circle"></sl-icon>
+          <div>
+            <strong>The A2A bridge process is not connected</strong>
+            Start the bridge process and click Reconnect to activate.
+          </div>
+        </div>
+        <div style="font-size: 0.875rem; display: flex; flex-direction: column; gap: 0.5rem;">
+          <div class="status-row">
+            <span class="status-label">Binary</span>
+            <span style="font-family: var(--sl-font-mono, monospace); font-size: 0.8125rem;">${binaryName}</span>
+          </div>
+          <div class="status-row">
+            <span class="status-label">Config File</span>
+            <span style="font-family: var(--sl-font-mono, monospace); font-size: 0.8125rem;">${configFile}</span>
+          </div>
+          <div class="status-row">
+            <span class="status-label">Start Command</span>
+            <span style="font-family: var(--sl-font-mono, monospace); font-size: 0.8125rem;">${startCommand}</span>
+          </div>
         </div>
       </div>
     `;
@@ -1094,13 +1545,20 @@ export class ScionPageAdminIntegrations extends LitElement {
       ...secretKeys.filter((k) => !secretDefMap.has(k)),
     ];
 
+    // For A2A, the api_key secret is only relevant when auth_scheme is apiKey or bearer.
+    const authScheme = platform === 'a2a' ? (this.editedSettings['auth_scheme'] ?? 'none') : '';
+    const apiKeyRelevant = authScheme === 'apiKey' || authScheme === 'bearer';
+
     return html`
       <div class="section">
         <h3 class="section-title">Secrets</h3>
         ${sortedKeys.map((key) => {
+          // Conditionally hide api_key for A2A when scheme doesn't need it.
+          if (platform === 'a2a' && key === 'api_key' && !apiKeyRelevant) return nothing;
           const def = secretDefMap.get(key);
           const label = def?.label ?? key;
-          const isRequired = def?.required ?? false;
+          // For A2A, mark api_key as required when the scheme needs it.
+          const isRequired = platform === 'a2a' && key === 'api_key' ? apiKeyRelevant : (def?.required ?? false);
           const isConfigured = d.has_secrets?.[key];
           return html`
             <div class="secret-row">
@@ -1138,6 +1596,7 @@ export class ScionPageAdminIntegrations extends LitElement {
   private renderActionsSection() {
     const mode = this.detail?.deployment_mode ?? 'plugin';
     const showUpdate = this.detail && mode !== 'external';
+    const restartLabel = mode === 'external' ? 'Reconnect' : 'Restart';
     return html`
       <div class="actions">
         <sl-button
@@ -1153,7 +1612,7 @@ export class ScionPageAdminIntegrations extends LitElement {
           @click=${() => { void this.handleRestart(); }}
         >
           <sl-icon slot="prefix" name="arrow-clockwise"></sl-icon>
-          Restart
+          ${restartLabel}
         </sl-button>
         ${showUpdate
           ? html`
@@ -1255,6 +1714,8 @@ export class ScionPageAdminIntegrations extends LitElement {
         return 'Slack';
       case 'gchat':
         return 'Google Chat';
+      case 'a2a':
+        return 'A2A Bridge';
       default:
         return platform;
     }

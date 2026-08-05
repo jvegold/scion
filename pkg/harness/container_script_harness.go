@@ -263,63 +263,87 @@ func (c *ContainerScriptHarness) ResolveAuth(auth api.AuthConfig) (*api.Resolved
 		resolved.EnvVars["SCION_HARNESS_SELECTED_AUTH"] = auth.SelectedType
 	}
 
-	// Forward any explicit auth env vars to the container. The script may
-	// move them into final harness-native files. Harness-config metadata
-	// could also drive this declaratively, but keeping it permissive at the
-	// staging layer matches the design's "stage all candidates" guidance.
-	addIfPresent := func(key, val string) {
-		if val != "" {
-			resolved.EnvVars[key] = val
-		}
+	// Forward GCP shared fields that have multi-source fallback resolution.
+	if auth.GoogleCloudProject != "" {
+		resolved.EnvVars["GOOGLE_CLOUD_PROJECT"] = auth.GoogleCloudProject
 	}
-	addIfPresent("ANTHROPIC_API_KEY", auth.AnthropicAPIKey)
-	addIfPresent("CLAUDE_CODE_OAUTH_TOKEN", auth.ClaudeOAuthToken)
-	addIfPresent("OPENAI_API_KEY", auth.OpenAIAPIKey)
-	addIfPresent("GEMINI_API_KEY", auth.GeminiAPIKey)
-	addIfPresent("GOOGLE_API_KEY", auth.GoogleAPIKey)
-	addIfPresent("GOOGLE_CLOUD_PROJECT", auth.GoogleCloudProject)
-	addIfPresent("GOOGLE_CLOUD_REGION", auth.GoogleCloudRegion)
-	addIfPresent("CODEX_API_KEY", auth.CodexAPIKey)
+	if auth.GoogleCloudRegion != "" {
+		resolved.EnvVars["GOOGLE_CLOUD_REGION"] = auth.GoogleCloudRegion
+	}
 
-	// Forward config-driven auth env vars. These come from harness config
-	// metadata (auth.types[*].required_env) and are gathered by
-	// GatherAuthWithEnv. They are additive — hardcoded fields above take
-	// precedence if the same key appears in both.
+	// Forward all config-driven auth env vars gathered from harness config
+	// metadata (auth.types[*].required_env).
 	for k, v := range auth.EnvVars {
 		if _, exists := resolved.EnvVars[k]; !exists {
 			resolved.EnvVars[k] = v
 		}
 	}
 
+	// GCP ADC file (first-class GCP shared field)
 	if auth.GoogleAppCredentials != "" {
 		resolved.Files = append(resolved.Files, api.FileMapping{
 			SourcePath:    auth.GoogleAppCredentials,
 			ContainerPath: "~/.config/gcloud/application_default_credentials.json",
 		})
 	}
-	if auth.ClaudeAuthFile != "" {
-		resolved.Files = append(resolved.Files, api.FileMapping{
-			SourcePath:    auth.ClaudeAuthFile,
-			ContainerPath: "~/.claude/.credentials.json",
-		})
+
+	// Forward config-driven file credentials. The Files map uses field names
+	// as keys (e.g. "ClaudeAuthFile") and host paths as values. We map the
+	// field names to their container target paths using the harness config's
+	// required_files entries. A seen set keyed by Field prevents duplicate
+	// mappings when the same field appears in multiple auth types.
+	if c.entry.Auth != nil {
+		seenFields := make(map[string]struct{})
+		for _, authType := range c.entry.Auth.Types {
+			for _, rf := range authType.RequiredFiles {
+				if rf.Field == "" || rf.TargetSuffix == "" {
+					continue
+				}
+				if _, dup := seenFields[rf.Field]; dup {
+					continue
+				}
+				seenFields[rf.Field] = struct{}{}
+				hostPath := auth.Files[rf.Field]
+				if hostPath == "" {
+					continue
+				}
+				// Normalize TargetSuffix to ensure it starts with "/" before
+				// prepending "~" (e.g. ".claude/foo" → "~/.claude/foo").
+				suffix := rf.TargetSuffix
+				if !strings.HasPrefix(suffix, "/") {
+					suffix = "/" + suffix
+				}
+				containerPath := "~" + suffix
+				resolved.Files = append(resolved.Files, api.FileMapping{
+					SourcePath:    hostPath,
+					ContainerPath: containerPath,
+				})
+			}
+		}
 	}
-	if auth.CodexAuthFile != "" {
-		resolved.Files = append(resolved.Files, api.FileMapping{
-			SourcePath:    auth.CodexAuthFile,
-			ContainerPath: "~/.codex/auth.json",
-		})
-	}
-	if auth.OpenCodeAuthFile != "" {
-		resolved.Files = append(resolved.Files, api.FileMapping{
-			SourcePath:    auth.OpenCodeAuthFile,
-			ContainerPath: "~/.local/share/opencode/auth.json",
-		})
-	}
-	if auth.OAuthCreds != "" {
-		resolved.Files = append(resolved.Files, api.FileMapping{
-			SourcePath:    auth.OAuthCreds,
-			ContainerPath: "~/.scion/oauth_creds.json",
-		})
+
+	// For the Claude harness with vertex-ai auth, translate GCP env vars into
+	// the Anthropic-specific env vars that Claude Code requires. This is
+	// normally done by the Python provisioner (provision.py), but when the
+	// provisioner type is "builtin" (no command), the Python script never
+	// runs and the translation must happen here on the Go side.
+	if c.entry.Harness == "claude" {
+		selectedAuth := auth.SelectedType
+		if selectedAuth == "" {
+			// Infer vertex-ai from presence of GCP project credential
+			if auth.GoogleCloudProject != "" {
+				selectedAuth = "vertex-ai"
+			}
+		}
+		if selectedAuth == "vertex-ai" {
+			if proj := resolved.EnvVars["GOOGLE_CLOUD_PROJECT"]; proj != "" {
+				resolved.EnvVars["ANTHROPIC_VERTEX_PROJECT_ID"] = proj
+			}
+			if region := resolved.EnvVars["GOOGLE_CLOUD_REGION"]; region != "" {
+				resolved.EnvVars["CLOUD_ML_REGION"] = region
+			}
+			resolved.EnvVars["CLAUDE_CODE_USE_VERTEX"] = "1"
+		}
 	}
 
 	// The auth_candidates manifest written during Provision() captures the full
@@ -504,6 +528,25 @@ func (c *ContainerScriptHarness) ApplyAuthSettings(agentHome string, resolved *a
 	if err != nil {
 		return err
 	}
+
+	// Discover existing secrets on disk to preserve them across restarts.
+	// File-type secrets (CODEX_AUTH, CLAUDE_AUTH) are always merged when not
+	// already overridden by the new resolution, because they may not be
+	// re-resolved on restart. Env-type secrets are only merged when the new
+	// resolution produced none, to prevent stale credentials from leaking
+	// during credential rotation. See issue #723.
+	existingEnvSecrets, existingFileSecrets := c.discoverExistingSecretFiles(agentHome)
+	if len(envSecretFiles) == 0 {
+		for k, v := range existingEnvSecrets {
+			envSecretFiles[k] = v
+		}
+	}
+	for k, v := range existingFileSecrets {
+		if _, exists := fileSecretFiles[k]; !exists {
+			fileSecretFiles[k] = v
+		}
+	}
+
 	// Remove staged-as-secret FileMappings from resolved so the runtime does
 	// not also bind-mount them (which would create a read-only overlay that
 	// prevents the container-side script from writing the file).
@@ -515,8 +558,14 @@ func (c *ContainerScriptHarness) ApplyAuthSettings(agentHome string, resolved *a
 	// auth method correctly on both create and resume; the config
 	// metadata may be empty or stale, causing the container-side
 	// provisioner to auto-detect and potentially pick a wrong method.
+	//
+	// Guard: reject harness implementation names that may have leaked
+	// into SCION_HARNESS_SELECTED_AUTH via a prior data-corruption bug
+	// (the run.go backfill incorrectly wrote resolved.Method instead of
+	// the auth type). These are never valid auth types and would crash
+	// the container-side provisioner.
 	explicitType := c.entry.AuthSelectedType
-	if st := resolved.EnvVars["SCION_HARNESS_SELECTED_AUTH"]; st != "" {
+	if st := resolved.EnvVars["SCION_HARNESS_SELECTED_AUTH"]; st != "" && !IsHarnessImplementationName(st) {
 		explicitType = st
 	}
 
@@ -534,6 +583,22 @@ func (c *ContainerScriptHarness) ApplyAuthSettings(agentHome string, resolved *a
 		return fmt.Errorf("marshal auth candidates: %w", err)
 	}
 	return c.stageInputFile(agentHome, "auth-candidates.json", data)
+}
+
+// IsHarnessImplementationName returns true if s is a known harness
+// implementation or method name rather than a valid auth type. These
+// values can leak into SCION_HARNESS_SELECTED_AUTH via data-corruption
+// bugs and must never be used as an auth type or explicit_type.
+//
+// The list covers both Implementation values ("container-script",
+// "generic") and Method values ("container-script", "passthrough"),
+// plus the legacy "builtin" provisioner type.
+func IsHarnessImplementationName(s string) bool {
+	switch s {
+	case "container-script", "generic", "builtin", "passthrough":
+		return true
+	}
+	return false
 }
 
 // stageFileSecretFiles reads the content of each FileMapping whose ContainerPath
@@ -692,6 +757,60 @@ func isSafeEnvName(name string) bool {
 		}
 	}
 	return true
+}
+
+// discoverExistingSecretFiles scans the secrets directory for files left by a
+// previous successful ApplyAuthSettings call. It returns two maps of secret
+// name to container-relative path: one for env-type secrets and one for
+// file-type secrets (distinguished via isRequiredFileSecret). This enables
+// auth-candidates.json to reference existing secrets when the current auth
+// resolution produced empty env vars (e.g. on restart).
+func (c *ContainerScriptHarness) discoverExistingSecretFiles(agentHome string) (map[string]string, map[string]string) {
+	dir := filepath.Join(agentHome, ".scion", "harness", "secrets")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil
+	}
+	envSecrets := map[string]string{}
+	fileSecrets := map[string]string{}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !isSafeEnvName(name) {
+			continue
+		}
+		// Verify the file has non-empty content
+		info, err := e.Info()
+		if err != nil || info.Size() == 0 {
+			continue
+		}
+		path := "$HOME/.scion/harness/secrets/" + name
+		if c.isRequiredFileSecret(name) {
+			fileSecrets[name] = path
+		} else {
+			envSecrets[name] = path
+		}
+	}
+	return envSecrets, fileSecrets
+}
+
+// isRequiredFileSecret returns true if name matches a required_files
+// declaration in any auth type of the harness config. These are file-type
+// secrets (e.g. CODEX_AUTH, CLAUDE_AUTH) as opposed to env-type secrets.
+func (c *ContainerScriptHarness) isRequiredFileSecret(name string) bool {
+	if c.entry.Auth == nil {
+		return false
+	}
+	for _, authType := range c.entry.Auth.Types {
+		for _, rf := range authType.RequiredFiles {
+			if rf.Name == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ApplyMCPSettings stages the universal mcp_servers map into

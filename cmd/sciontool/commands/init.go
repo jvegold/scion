@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
@@ -25,11 +26,14 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/autoexpose"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks/handlers"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hub"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/metadata"
+	scionportforward "github.com/GoogleCloudPlatform/scion/pkg/sciontool/portforward"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/services"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/supervisor"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/telemetry"
@@ -124,30 +128,6 @@ func runInit(args []string) int {
 		}
 	}
 
-	// Start telemetry pipeline if configured
-	var telemetryPipeline *telemetry.Pipeline
-	if pipeline := telemetry.New(); pipeline != nil {
-		telemetryCtx, telemetryCancel := context.WithCancel(context.Background())
-		if err := pipeline.Start(telemetryCtx); err != nil {
-			log.Error("Failed to start telemetry: %v", err)
-			telemetryCancel()
-			// Continue anyway - telemetry failure shouldn't block agent
-		} else {
-			telemetryPipeline = pipeline
-			log.Info("Telemetry pipeline started")
-		}
-		defer func() {
-			if telemetryPipeline != nil {
-				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := telemetryPipeline.Stop(shutdownCtx); err != nil {
-					log.Error("Failed to stop telemetry: %v", err)
-				}
-				shutdownCancel()
-			}
-			telemetryCancel()
-		}()
-	}
-
 	// Resolve the scion user's home directory early. Init runs as root
 	// (HOME=/root), but agent-info.json and other agent state files live
 	// in the scion user's home directory. This must happen before the
@@ -173,7 +153,9 @@ func runInit(args []string) int {
 	// serializes file and variable secrets into this single base64 blob
 	// instead of bind-mounting them from the host filesystem. We decode and
 	// write them before anything else so they are available to hooks and
-	// the harness.
+	// the harness. This must happen before telemetry pipeline initialization
+	// because the GCP credentials file (pointed to by SCION_OTEL_GCP_CREDENTIALS)
+	// must exist on disk when the telemetry pipeline starts.
 	if encoded := os.Getenv(stagedsecrets.EnvVar); encoded != "" {
 		staged, err := stagedsecrets.Decode(encoded)
 		if err != nil {
@@ -187,6 +169,30 @@ func runInit(args []string) int {
 		_ = os.Unsetenv(stagedsecrets.EnvVar)
 		log.Info("Staged %d file secret(s) and %d variable secret(s)",
 			len(staged.FileSecrets), len(staged.VariableSecrets))
+	}
+
+	// Start telemetry pipeline if configured. This must happen after
+	// staged secrets are written so that the GCP credentials file
+	// referenced by SCION_OTEL_GCP_CREDENTIALS exists on disk.
+	var telemetryPipeline *telemetry.Pipeline
+	if pipeline := telemetry.New(); pipeline != nil {
+		telemetryCtx, telemetryCancel := context.WithCancel(context.Background())
+		if err := pipeline.Start(telemetryCtx); err != nil {
+			log.Error("Failed to start telemetry: %v", err)
+			telemetryCancel()
+			// Continue anyway - telemetry failure shouldn't block agent
+		} else {
+			telemetryPipeline = pipeline
+			log.Info("Telemetry pipeline started")
+			defer func() {
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := telemetryPipeline.Stop(shutdownCtx); err != nil {
+					log.Error("Failed to stop telemetry: %v", err)
+				}
+				shutdownCancel()
+				telemetryCancel()
+			}()
+		}
 	}
 
 	// Initialize lifecycle hooks manager
@@ -270,17 +276,83 @@ func runInit(args []string) int {
 	_, projectHookStatErr := os.Stat(projectHookPath)
 	projectHookStaged := projectHookStatErr == nil
 
+	// Clone git workspace BEFORE pre-start hooks so that provisioners
+	// (e.g. antigravity) see the populated workspace rather than an empty
+	// one.  The clone depends only on environment variables and agent
+	// config — not on anything produced by pre-start hooks.  Running it
+	// first also prevents provisioner-created files (e.g. .agents/) from
+	// causing isWorkspaceEmpty to return false and skipping the clone.
+	// See: https://github.com/ptone/scion/issues/739
+	if err := gitCloneWorkspace(targetUID, targetGID, agentHome); err != nil {
+		log.Error("Git clone failed: %v", err)
+
+		// Update local agent-info.json to error state so local status readers
+		// and the broker heartbeat see the failure and error message.
+		errMsg := fmt.Sprintf("git clone failed: %v", err)
+		_ = statusHandler.UpdatePhase(state.PhaseError, "", "")
+		_ = statusHandler.SetMessage(errMsg)
+
+		// Report error to Hub directly so the agent doesn't stay stuck in "cloning" state.
+		// This is best-effort; the broker heartbeat will also pick up the error from
+		// agent-info.json as a fallback if this call fails (e.g. network unreachable).
+		if hubClient := hub.NewClient(); hubClient != nil && hubClient.IsConfigured() {
+			hubCtx, hubCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if hubErr := hubClient.ReportState(hubCtx, state.PhaseError, "", errMsg); hubErr != nil {
+				log.Error("Failed to report clone error to Hub: %v", hubErr)
+			}
+			hubCancel()
+		} else {
+			log.Info("Hub client not configured, clone error will be relayed via broker heartbeat")
+		}
+		return 1
+	}
+
 	// Run pre-start hooks (after setup, before child process)
 	log.Info("Running pre-start hooks...")
 	if err := lifecycleManager.RunPreStart(); err != nil {
 		log.Error("Pre-start hooks failed: %v", err)
 		if harnessReq.Required || projectHookStaged {
-			log.Error("Pre-start provisioning is required; aborting startup")
-			_ = statusHandler.UpdatePhase(state.PhaseError, "", "")
-			_ = statusHandler.SetMessage(fmt.Sprintf("pre-start hook failed: %v", err))
-			return 1
+			// On restart, check for an existing env overlay from a previous
+			// successful run. If it exists, we can fall through and let
+			// LoadEnvOverlay use the existing file instead of aborting.
+			// This makes restarts resilient to transient provisioner failures
+			// while still requiring success on first creation.
+			var fallbackExists bool
+			if harnessReq.EnvOverlayPath != "" {
+				existingOverlay := hooks.ResolveContainerPath(harnessReq.EnvOverlayPath, agentHome)
+				if _, statErr := os.Stat(existingOverlay); statErr == nil {
+					log.Info("WARNING: Pre-start provisioning failed but previous env overlay exists at %s, using fallback", existingOverlay)
+					fallbackExists = true
+				}
+			}
+			if !fallbackExists {
+				log.Error("Pre-start provisioning is required; aborting startup")
+				_ = statusHandler.UpdatePhase(state.PhaseError, "", "")
+				_ = statusHandler.SetMessage(fmt.Sprintf("pre-start hook failed: %v", err))
+				return 1
+			}
 		}
 		// Continue anyway — non-required harness hooks failing shouldn't prevent startup
+	}
+
+	// After pre-start hooks, fix up ownership of any files provisioners
+	// created as root. Provisioning runs before privilege drop, so scripts
+	// may write files owned by root:root into the bind-mounted workspace
+	// or the agent home directory. The non-root broker cannot delete
+	// root-owned files later, so we chown them now.
+	if targetUID != 0 && os.Geteuid() == 0 {
+		workspacePath := os.Getenv("SCION_WORKSPACE_PATH")
+		if workspacePath == "" {
+			workspacePath = "/workspace"
+		}
+		for _, dir := range []string{workspacePath, agentHome} {
+			if dir == "" {
+				continue
+			}
+			if err := chownTreeRootOwned(dir, targetUID, targetGID); err != nil {
+				log.Error("Failed to chown %s after pre-start hooks: %v", dir, err)
+			}
+		}
 	}
 
 	// Load the env overlay produced by the pre-start provisioner. Resolve
@@ -305,31 +377,6 @@ func runInit(args []string) int {
 			harnessEnvOverlay = overlay
 			log.Info("Loaded %d env overlay entries from %s", len(overlay), overlayPath)
 		}
-	}
-
-	// Clone git workspace if configured (hub-first git projects)
-	if err := gitCloneWorkspace(targetUID, targetGID, agentHome); err != nil {
-		log.Error("Git clone failed: %v", err)
-
-		// Update local agent-info.json to error state so local status readers
-		// and the broker heartbeat see the failure and error message.
-		errMsg := fmt.Sprintf("git clone failed: %v", err)
-		_ = statusHandler.UpdatePhase(state.PhaseError, "", "")
-		_ = statusHandler.SetMessage(errMsg)
-
-		// Report error to Hub directly so the agent doesn't stay stuck in "cloning" state.
-		// This is best-effort; the broker heartbeat will also pick up the error from
-		// agent-info.json as a fallback if this call fails (e.g. network unreachable).
-		if hubClient := hub.NewClient(); hubClient != nil && hubClient.IsConfigured() {
-			hubCtx, hubCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if hubErr := hubClient.ReportState(hubCtx, state.PhaseError, "", errMsg); hubErr != nil {
-				log.Error("Failed to report clone error to Hub: %v", hubErr)
-			}
-			hubCancel()
-		} else {
-			log.Info("Hub client not configured, clone error will be relayed via broker heartbeat")
-		}
-		return 1
 	}
 
 	// Configure git credentials for shared-workspace projects (git-workspace hybrid).
@@ -381,6 +428,22 @@ func runInit(args []string) int {
 	// Initialize hubClient early so the metadata server's fetch callbacks
 	// can use it without data races or startup race conditions.
 	hubClient := hub.NewClient()
+
+	// Wire the OnSessionEnd callback so the aggregator sends finalized
+	// session metrics to the Hub when a session completes. The closure
+	// captures hubClient, which is already initialized above.
+	if telemetryHandler != nil && hubClient != nil && hubClient.IsConfigured() {
+		telemetryHandler.OnSessionEnd = func(summary telemetry.SessionSummary) {
+			payload := hub.SummaryToMetricsPayload(summary)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := hubClient.ReportMetrics(ctx, payload); err != nil {
+				log.Error("Failed to report session metrics to hub: %v", err)
+			} else {
+				log.Info("Session metrics reported to hub for session %s", summary.SessionID)
+			}
+		}
+	}
 
 	// Start GCP metadata server if configured
 	var metadataServer *metadata.Server
@@ -560,6 +623,17 @@ func runInit(args []string) int {
 				},
 			})
 			log.Info("Started Hub heartbeat loop (interval: %s)", hub.DefaultHeartbeatInterval)
+
+			go scionportforward.NewManager(hubClient).Run(ctx)
+			log.Info("Started port-forward tunnel manager")
+
+			// Auto-expose: detect and register listening ports
+			if autoExposeCfg := autoexpose.ConfigFromEnv(); autoExposeCfg.Enabled && hubClient != nil {
+				reconciler := autoexpose.NewReconciler(hubClient, autoExposeCfg)
+				reconciler.SetMessageClient(&hubMessageAdapter{client: hubClient})
+				go reconciler.Run(ctx)
+				log.Info("Started auto-expose port scanner (interval: %s, mode: %s)", autoExposeCfg.Interval, autoExposeCfg.FilterMode)
+			}
 
 			// Read the agent token from the canonical token file (written by
 			// the host-side agent manager before the container started).
@@ -1668,6 +1742,34 @@ func gitCloneWorkspace(uid, gid int, agentHome string) error {
 	return nil
 }
 
+// chownTreeRootOwned recursively chowns files owned by root (UID 0) to
+// the specified uid:gid. Files already owned by the target user are
+// skipped for efficiency. This is called after pre-start hooks to fix up
+// files created by provisioners running as root, which would otherwise be
+// undeletable by the non-root broker.
+func chownTreeRootOwned(root string, uid, gid int) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// Skip permission errors on walk (e.g., lost+found).
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil
+		}
+		if stat.Uid == 0 {
+			if chErr := os.Lchown(path, uid, gid); chErr != nil {
+				log.Error("chownTreeRootOwned: failed to chown %s: %v", path, chErr)
+			}
+		}
+		return nil
+	})
+}
+
 func ensureWorkspaceOwnership(workspacePath string, uid, gid, currentEUID int, chown func(string, int, int) error) {
 	// Only root can successfully chown a mounted workspace. In restricted
 	// Kubernetes pods the init process may already be running as the scion
@@ -1789,7 +1891,7 @@ func formatCloneError(sanitizedStderr, token string) error {
 	if guidance := gitErr.UserGuidance(); guidance != "" {
 		return fmt.Errorf("git clone failed (%s): %s", guidance, sanitizedStderr)
 	}
-	return fmt.Errorf("git clone failed (GITHUB_TOKEN may be invalid or lack Contents read access): %s", sanitizedStderr)
+	return fmt.Errorf("git clone failed (unclassified error): %s", sanitizedStderr)
 }
 
 // detectDefaultBranch uses `git ls-remote --symref origin HEAD` to discover
@@ -1931,7 +2033,7 @@ func isWorkspaceEmpty(path string) bool {
 	// Filter out known marker entries that don't indicate a real workspace
 	for _, e := range entries {
 		switch e.Name() {
-		case ".scion", ".scion-volumes":
+		case ".scion", ".scion-volumes", ".agents":
 			// Provisioning marker / shared-dir mount directory — ignore
 			continue
 		default:
@@ -1940,6 +2042,20 @@ func isWorkspaceEmpty(path string) bool {
 		}
 	}
 	return true
+}
+
+// hubMessageAdapter adapts the Hub client to the autoexpose.MessageClient interface
+// so the reconciler can notify the agent about auto-exposed ports.
+type hubMessageAdapter struct {
+	client *hub.Client
+}
+
+func (a *hubMessageAdapter) SendSelfMessage(ctx context.Context, msg string, metadata map[string]string) error {
+	if a.client == nil {
+		return fmt.Errorf("hub client is nil")
+	}
+	recipient := "agent:" + a.client.AgentID()
+	return a.client.SendSelfMessage(ctx, messages.NewSystemMessage("system", recipient, msg, metadata["system_category"]))
 }
 
 // cleanGcloudConfigForMetadata removes gcloud configuration state files from

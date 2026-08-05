@@ -38,6 +38,7 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -140,6 +141,7 @@ type HTTPAgentDispatcher struct {
 	authzService      *AuthzService        // Optional authz service for progeny secret verification
 	githubAppMinter   GitHubAppTokenMinter // Optional GitHub App token minter
 	hubEndpoint       string               // Hub endpoint URL for agents to call back
+	hubName           string               // Hub display name for agent log labeling
 	hubID             string               // Hub instance ID for hub-scoped queries
 	devAuthToken      string               // Dev auth token to inject into agent env (dev-auth mode only)
 	transportMinter   TransportTokenMinter // Optional transport token minter for OIDC dispatch
@@ -202,6 +204,13 @@ func (d *HTTPAgentDispatcher) SetTokenGenerator(gen AgentTokenGenerator) {
 // SetHubEndpoint sets the Hub endpoint URL that agents will use to call back.
 func (d *HTTPAgentDispatcher) SetHubEndpoint(endpoint string) {
 	d.hubEndpoint = endpoint
+}
+
+// SetHubName sets the hub display name for agent log labeling.
+// When set, agents receive SCION_HUB_NAME so their Cloud Logging entries
+// carry a "hub" label matching the hub-scoped log query filter.
+func (d *HTTPAgentDispatcher) SetHubName(name string) {
+	d.hubName = name
 }
 
 // SetSecretBackend sets the secret backend for resolving secrets.
@@ -524,6 +533,12 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 	injectModelEnv(req.ResolvedEnv, agent.AppliedConfig)
 	injectThinkingLevelEnv(req.ResolvedEnv, agent.AppliedConfig)
 
+	// Inject hub name so agents can label their Cloud Logging entries with the
+	// hub identity, matching the hub-scoped log query filter (labels.hub).
+	if d.hubName != "" {
+		req.ResolvedEnv["SCION_HUB_NAME"] = d.hubName
+	}
+
 	// Resolve env vars from Hub storage (user/project/broker scopes) and merge.
 	// Storage env vars fill in keys not already set (with a non-empty value)
 	// by explicit config env vars. Empty-value config entries are passthrough
@@ -668,8 +683,10 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 
 	// Collect project-scope secrets for provision-time credential resolution.
 	// These are NOT merged into ResolvedEnv and will not appear in the container env.
-	// Skipped for NoAuth agents just as ResolvedSecrets are skipped.
-	if !noAuth && agent.ProjectID != "" && d.secretBackend != nil {
+	// NOT gated on noAuth: provisionCredentials serve skill resolution (gh://
+	// convention tokens like GH_{OWNER}), not harness auth. Suppressing them under
+	// noAuth starves the GitHubSkillResolver of credentials for private repos.
+	if agent.ProjectID != "" && d.secretBackend != nil {
 		projectSecrets, listErr := d.secretBackend.List(ctx, secret.Filter{
 			Scope:   secret.ScopeProject,
 			ScopeID: agent.ProjectID,
@@ -877,17 +894,27 @@ func (d *HTTPAgentDispatcher) applyBrokerResponse(agent *store.Agent, resp *Remo
 
 // DispatchAgentCreate creates and starts an agent on the runtime broker.
 func (d *HTTPAgentDispatcher) DispatchAgentCreate(ctx context.Context, agent *store.Agent) error {
+	ctx, span := tracer.Start(ctx, "hub.dispatch.create")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("scion.agent.id", agent.ID),
+		attribute.String("scion.broker.id", agent.RuntimeBrokerID),
+	)
+
 	if err := requireRuntimeBrokerAssigned(agent); err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
 	endpoint, err := d.getBrokerEndpoint(ctx, agent.RuntimeBrokerID)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
 	req, err := d.buildCreateRequest(ctx, agent, "DispatchAgentCreate")
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
@@ -898,6 +925,7 @@ func (d *HTTPAgentDispatcher) DispatchAgentCreate(ctx context.Context, agent *st
 		}
 	}
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
@@ -991,20 +1019,36 @@ func (d *HTTPAgentDispatcher) DispatchAgentCreateWithGather(ctx context.Context,
 		}
 	}
 	if errors.Is(err, ErrLifecycleDeferred) {
-		return d.deferredCreateWithGather(ctx, agent)
-	}
-	if err != nil {
+		envReqs, err = d.deferredCreateWithGather(ctx, agent)
+		if err != nil {
+			return nil, err
+		}
+		// Fall through to the second-pass as_needed resolution below.
+	} else if err != nil {
 		return nil, err
-	}
-
-	if envReqs != nil {
-		return envReqs, nil
-	}
-
-	if resp != nil {
+	} else if resp != nil {
 		d.applyBrokerResponse(agent, resp)
 	}
-	return nil, nil
+
+	// Second pass: if the broker reported needed keys, check whether any can
+	// be satisfied by as_needed env vars or secrets. If so, finalize them
+	// transparently without requiring CLI intervention.
+	if envReqs != nil && len(envReqs.Needs) > 0 {
+		asNeededEnv := d.resolveAsNeededForKeys(ctx, agent, envReqs.Needs, envReqs.Alternatives)
+		if len(asNeededEnv) > 0 {
+			err := d.DispatchFinalizeEnv(ctx, agent, asNeededEnv)
+			if err == nil {
+				return nil, nil // All needs satisfied by as_needed entries
+			}
+			var stillMissing *ErrEnvStillMissing
+			if errors.As(err, &stillMissing) {
+				return stillMissing.Requirements, nil // Partial; remaining needs returned
+			}
+			return nil, err
+		}
+	}
+
+	return envReqs, nil
 }
 
 // deferredCreateWithGather handles a cross-node create-with-gather via durable dispatch.
@@ -1076,6 +1120,27 @@ func (d *HTTPAgentDispatcher) DispatchFinalizeEnv(ctx context.Context, agent *st
 	}
 
 	if envReqs != nil && len(envReqs.Needs) > 0 {
+		// Second pass: try to satisfy remaining needs with as_needed entries,
+		// mirroring the pattern in DispatchAgentCreateWithGather.
+		asNeededEnv := d.resolveAsNeededForKeys(ctx, agent, envReqs.Needs, envReqs.Alternatives)
+		if len(asNeededEnv) > 0 {
+			for k, v := range asNeededEnv {
+				req.ResolvedEnv[k] = v
+			}
+			resp2, envReqs2, err2 := d.client.CreateAgentWithGather(
+				ctx, agent.RuntimeBrokerID, endpoint, req,
+			)
+			if err2 != nil {
+				return err2
+			}
+			if envReqs2 != nil && len(envReqs2.Needs) > 0 {
+				return &ErrEnvStillMissing{Requirements: envReqs2}
+			}
+			if resp2 != nil {
+				d.applyBrokerResponse(agent, resp2)
+			}
+			return nil
+		}
 		return &ErrEnvStillMissing{Requirements: envReqs}
 	}
 
@@ -1388,11 +1453,168 @@ func (d *HTTPAgentDispatcher) resolveEnvFromStorage(ctx context.Context, agent *
 			d.log.Debug("resolveEnvFromStorage: scope", "scope", filter.Scope, "scope_id", filter.ScopeID, "count", len(vars), "keys", keys)
 		}
 		for _, v := range vars {
+			if v.InjectionMode == store.InjectionModeAsNeeded {
+				continue
+			}
 			result[v.Key] = v.Value
 		}
 	}
 
 	return result, nil
+}
+
+// resolveAsNeededForKeys resolves as_needed env vars and environment-type
+// secrets whose key/target matches one of the requested keys. It returns a
+// map suitable for passing to DispatchFinalizeEnv.
+//
+// This is the second pass of the two-pass env-gather resolution: the first
+// pass (resolveEnvFromStorage + resolveSecrets) skips as_needed entries, then
+// the broker reports which keys are still needed, and this function checks
+// whether any of those keys can be satisfied by as_needed entries.
+//
+// Known limitation: file-type as_needed secrets are not handled here because
+// DispatchFinalizeEnv only accepts a string key=value map. File-type secrets
+// that need on-demand injection would require a different mechanism.
+func (d *HTTPAgentDispatcher) resolveAsNeededForKeys(
+	ctx context.Context,
+	agent *store.Agent,
+	keys []string,
+	alternatives map[string][]string,
+) map[string]string {
+	result := make(map[string]string)
+	keySet := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		keySet[k] = struct{}{}
+	}
+
+	// Expand keySet with alternatives and build a reverse map so that when
+	// a stored var is keyed by an alternative name, we store its value under
+	// the canonical key (which is what the broker expects).
+	var altToCanonical map[string]string
+	resultIsCanonical := make(map[string]bool)
+	resultScopeIdx := make(map[string]int)
+	if len(alternatives) > 0 {
+		altToCanonical = make(map[string]string)
+		for canonical, alts := range alternatives {
+			for _, alt := range alts {
+				keySet[alt] = struct{}{}
+				altToCanonical[alt] = canonical
+			}
+		}
+	}
+
+	// 1. Check env_vars table (all scopes, in precedence order so last-wins).
+	for _, filter := range d.envScopesInPrecedenceOrder(agent) {
+		vars, err := d.store.ListEnvVars(ctx, filter)
+		if err != nil {
+			if d.debug {
+				d.log.Warn("resolveAsNeededForKeys: failed to list env vars",
+					"scope", filter.Scope, "scope_id", filter.ScopeID, "error", err)
+			}
+			continue
+		}
+		for _, v := range vars {
+			if v.InjectionMode != store.InjectionModeAsNeeded {
+				continue
+			}
+			if _, needed := keySet[v.Key]; needed {
+				canonical, isAlt := altToCanonical[v.Key]
+				resultKey := v.Key
+				if isAlt {
+					resultKey = canonical
+				}
+				currentScopeIdx := slices.Index(envScopePrecedence, filter.Scope)
+				isCanonical := !isAlt
+				storedScopeIdx, alreadySet := resultScopeIdx[resultKey]
+				if !alreadySet || currentScopeIdx > storedScopeIdx {
+					result[resultKey] = v.Value
+					resultIsCanonical[resultKey] = isCanonical
+					resultScopeIdx[resultKey] = currentScopeIdx
+				} else if currentScopeIdx == storedScopeIdx {
+					if isCanonical && !resultIsCanonical[resultKey] {
+						result[resultKey] = v.Value
+						resultIsCanonical[resultKey] = true
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Check secrets (all scopes via backend.Resolve).
+	// Only environment-type secrets can be mapped to env key=value pairs.
+	if d.secretBackend != nil {
+		var resolveOpts *secret.ResolveOpts
+		if len(agent.Ancestry) > 1 && d.authzService != nil {
+			agentID := agent.ID
+			ancestry := agent.Ancestry
+			resolveOpts = &secret.ResolveOpts{
+				AgentAncestry: ancestry,
+				AuthzCheck: func(s secret.SecretMeta) bool {
+					decision := d.authzService.CheckAccess(ctx, &agentIdentityWrapper{
+						AgentTokenClaims: &AgentTokenClaims{
+							Claims:    jwt.Claims{Subject: agentID},
+							ProjectID: agent.ProjectID,
+							Ancestry:  ancestry,
+						},
+					}, Resource{
+						Type: "secret",
+						ID:   s.ID,
+					}, ActionRead)
+					return decision.Allowed
+				},
+			}
+		}
+
+		resolved, err := d.secretBackend.Resolve(
+			ctx, agent.OwnerID, agent.ProjectID, agent.RuntimeBrokerID, resolveOpts)
+		if err != nil {
+			if d.debug {
+				d.log.Warn("resolveAsNeededForKeys: failed to resolve secrets", "error", err)
+			}
+		} else {
+			// Iterate in reverse: resolved is ordered lowest-precedence first
+			// (hub < user < project < runtime_broker), so walking backwards
+			// lets higher-precedence secrets win.
+			for i := len(resolved) - 1; i >= 0; i-- {
+				sv := resolved[i]
+				if sv.InjectionMode != store.InjectionModeAsNeeded {
+					continue
+				}
+				// Only environment-type secrets map to env vars.
+				if sv.SecretType != store.SecretTypeEnvironment && sv.SecretType != "" {
+					continue
+				}
+				target := sv.Target
+				if target == "" {
+					target = sv.Name
+				}
+				if _, needed := keySet[target]; needed {
+					// Store under the canonical key if this was an alternative match
+					resultKey := target
+					if canonical, isAlt := altToCanonical[target]; isAlt {
+						if _, already := result[canonical]; already {
+							continue // canonical key already matched; don't overwrite
+						}
+						resultKey = canonical
+					}
+					if _, alreadySet := result[resultKey]; !alreadySet {
+						result[resultKey] = sv.Value
+					}
+				}
+			}
+		}
+	}
+
+	if d.debug && len(result) > 0 {
+		resolvedKeys := make([]string, 0, len(result))
+		for k := range result {
+			resolvedKeys = append(resolvedKeys, k)
+		}
+		d.log.Debug("resolveAsNeededForKeys: resolved as_needed entries",
+			"count", len(result), "keys", resolvedKeys)
+	}
+
+	return result
 }
 
 // buildEnvSources creates a map of env key -> scope for reporting to the CLI.
@@ -1417,6 +1639,9 @@ func (d *HTTPAgentDispatcher) buildEnvSources(ctx context.Context, agent *store.
 		}
 		label := envScopeSourceLabel(filter.Scope)
 		for _, v := range vars {
+			if v.InjectionMode == store.InjectionModeAsNeeded {
+				continue
+			}
 			if _, inResolved := resolvedEnv[v.Key]; inResolved {
 				sources[v.Key] = label
 			}
@@ -1441,12 +1666,21 @@ func (d *HTTPAgentDispatcher) buildEnvSources(ctx context.Context, agent *store.
 // of truth for resume: callers compute it from the agent's stored phase
 // (suspended → resume).
 func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *store.Agent, task string, resume bool) error {
+	ctx, span := tracer.Start(ctx, "hub.dispatch.start")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("scion.agent.id", agent.ID),
+		attribute.String("scion.broker.id", agent.RuntimeBrokerID),
+	)
+
 	if err := requireRuntimeBrokerAssigned(agent); err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
 	endpoint, err := d.getBrokerEndpoint(ctx, agent.RuntimeBrokerID)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
@@ -1530,6 +1764,11 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 	// brokers. Including it here ensures the broker always has the endpoint.
 	if d.hubEndpoint != "" {
 		resolvedEnv["SCION_HUB_ENDPOINT"] = d.hubEndpoint
+	}
+	// Include hub name so agents can label their Cloud Logging entries with
+	// the hub identity, matching the hub-scoped log query filter (labels.hub).
+	if d.hubName != "" {
+		resolvedEnv["SCION_HUB_NAME"] = d.hubName
 	}
 
 	// Inject canonical workspace sharing mode and git-ness so the broker can
@@ -1689,6 +1928,7 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 		})
 	}
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
@@ -1729,10 +1969,56 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 		return err
 	}
 
-	// Build resolved env with fresh auth token and identity vars so the
-	// restarted container retains Hub connectivity. Without this, the
-	// broker's restartAgent handler has no token to inject.
+	// Build resolved env with all env vars, secrets, and a fresh auth token
+	// so the restarted container has full credentials and Hub connectivity.
+	// This mirrors the resolution in DispatchAgentStart — without it, env vars
+	// like GOOGLE_CLOUD_PROJECT are missing and auth provisioning fails.
 	resolvedEnv := make(map[string]string)
+
+	// Start with agent's applied config env (template/config-level vars) —
+	// same as DispatchAgentStart.
+	if agent.AppliedConfig != nil {
+		for k, v := range agent.AppliedConfig.Env {
+			resolvedEnv[k] = v
+		}
+	}
+
+	injectModelEnv(resolvedEnv, agent.AppliedConfig)
+	injectThinkingLevelEnv(resolvedEnv, agent.AppliedConfig)
+
+	// Merge env vars from Hub storage; storage vars fill in keys not already
+	// set (with a non-empty value) — same precedence as DispatchAgentStart.
+	envFromStorage, err := d.resolveEnvFromStorage(ctx, agent)
+	if err != nil {
+		if d.debug {
+			d.log.Warn("DispatchAgentRestart: failed to resolve env from storage", "error", err)
+		}
+	} else if len(envFromStorage) > 0 {
+		for k, v := range envFromStorage {
+			if existing, exists := resolvedEnv[k]; !exists || existing == "" {
+				resolvedEnv[k] = v
+			}
+		}
+	}
+
+	// Resolve type-aware secrets and inject environment-type secrets —
+	// same as DispatchAgentStart.
+	resolvedSecrets, secretErr := d.resolveSecrets(ctx, agent)
+	if secretErr != nil {
+		if d.debug {
+			d.log.Warn("DispatchAgentRestart: failed to resolve secrets", "error", secretErr)
+		}
+	} else {
+		for _, s := range resolvedSecrets {
+			if (s.Type == "environment" || s.Type == "") && s.Target != "" {
+				if existing, exists := resolvedEnv[s.Target]; !exists || existing == "" {
+					resolvedEnv[s.Target] = s.Value
+				}
+			}
+		}
+	}
+
+	// Identity vars at highest precedence (set after storage/secrets merge).
 	if agent.ID != "" {
 		resolvedEnv["SCION_AGENT_ID"] = agent.ID
 	}
@@ -1745,6 +2031,11 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 	}
 	if d.hubEndpoint != "" {
 		resolvedEnv["SCION_HUB_ENDPOINT"] = d.hubEndpoint
+	}
+	// Include hub name so agents can label their Cloud Logging entries with
+	// the hub identity, matching the hub-scoped log query filter (labels.hub).
+	if d.hubName != "" {
+		resolvedEnv["SCION_HUB_NAME"] = d.hubName
 	}
 
 	// Inject canonical workspace sharing mode and git-ness so the broker can
@@ -1767,8 +2058,17 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 		}
 	}
 
-	injectModelEnv(resolvedEnv, agent.AppliedConfig)
-	injectThinkingLevelEnv(resolvedEnv, agent.AppliedConfig)
+	// Inject GCP identity env vars so the broker can configure the
+	// metadata-server sidecar correctly on restart — same as DispatchAgentStart.
+	if agent.AppliedConfig != nil {
+		if gcpID := agent.AppliedConfig.GCPIdentity; gcpID != nil {
+			resolvedEnv["SCION_METADATA_MODE"] = gcpID.MetadataMode
+			if gcpID.MetadataMode == store.GCPMetadataModeAssign {
+				resolvedEnv["SCION_METADATA_SA_EMAIL"] = gcpID.ServiceAccountEmail
+				resolvedEnv["SCION_METADATA_PROJECT_ID"] = gcpID.ProjectID
+			}
+		}
+	}
 
 	if d.tokenGenerator != nil {
 		var additionalScopes []AgentTokenScope
@@ -1803,6 +2103,42 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 			resolvedEnv["SCION_TRANSPORT_TOKEN_EXPIRY"] = tExpiry.UTC().Format(time.RFC3339)
 			if d.transportMode != "" {
 				resolvedEnv["SCION_TRANSPORT_MODE"] = d.transportMode
+			}
+		}
+	}
+
+	// GitHub App token minting for agent restart — same as DispatchAgentStart.
+	if d.githubAppMinter != nil && agent.ProjectID != "" {
+		project, projectErr := d.store.GetProject(ctx, agent.ProjectID)
+		if projectErr == nil {
+			mintProject := project
+			if project.GitHubInstallationID == nil {
+				if sourceProjectID := agent.Labels["scion.dev/github-token-source-project"]; sourceProjectID != "" {
+					if sg, sgErr := d.store.GetProject(ctx, sourceProjectID); sgErr == nil && sg.GitHubInstallationID != nil {
+						mintProject = sg
+					}
+				}
+			}
+			if mintProject.GitHubInstallationID != nil {
+				if resolvedEnv["GITHUB_TOKEN"] == "" {
+					token, expiry, mintErr := d.githubAppMinter.MintGitHubAppTokenForProject(ctx, mintProject)
+					if mintErr != nil {
+						if d.debug {
+							d.log.Warn("DispatchAgentRestart: GitHub App token minting failed",
+								"error", mintErr, "project_id", agent.ProjectID)
+						}
+					} else if token != "" {
+						resolvedEnv["GITHUB_TOKEN"] = token
+						resolvedEnv["SCION_GITHUB_APP_ENABLED"] = "true"
+						resolvedEnv["SCION_GITHUB_TOKEN_EXPIRY"] = expiry
+						resolvedEnv["SCION_GITHUB_TOKEN_PATH"] = "/tmp/.github-token"
+					}
+				} else {
+					d.log.Warn("DispatchAgentRestart: user GITHUB_TOKEN takes precedence over GitHub App token — user token will be used for gh CLI, GitHub App for git credential helper",
+						"project_id", agent.ProjectID)
+					resolvedEnv["SCION_USER_GITHUB_TOKEN"] = "true"
+					resolvedEnv["SCION_GITHUB_APP_ENABLED"] = "true"
+				}
 			}
 		}
 	}
@@ -2221,16 +2557,23 @@ func (d *HTTPAgentDispatcher) resolveSecrets(ctx context.Context, agent *store.A
 	if err != nil {
 		return nil, err
 	}
-	result := make([]ResolvedSecret, len(resolved))
-	for i, sv := range resolved {
-		result[i] = ResolvedSecret{
+	result := make([]ResolvedSecret, 0, len(resolved))
+	for _, sv := range resolved {
+		// Only skip as_needed environment-type secrets (handled by the
+		// two-pass env-gather flow). File-type and variable-type secrets
+		// should always be placed regardless of injection mode — the
+		// as_needed concept does not apply to them.
+		if sv.InjectionMode == store.InjectionModeAsNeeded && (sv.SecretType == store.SecretTypeEnvironment || sv.SecretType == "") {
+			continue
+		}
+		result = append(result, ResolvedSecret{
 			Name:   sv.Name,
 			Type:   sv.SecretType,
 			Target: sv.Target,
 			Value:  sv.Value,
 			Source: sv.Scope,
 			Ref:    sv.SecretRef,
-		}
+		})
 	}
 	if d.debug {
 		names := make([]string, len(result))

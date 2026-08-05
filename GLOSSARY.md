@@ -19,7 +19,7 @@ A namespace and collection of agents and configuration, represented by a `.scion
 _Avoid_: grove, group, repo, workspace
 
 **Template**:
-A harness-agnostic folder resource defining a generic agent — its system prompt, agent instructions, skills, services, and more — containing nothing specific to any one harness. A default harness-config may optionally be named, but is not required.
+A harness-agnostic folder resource defining a generic agent — its system prompt, agent instructions, skills, services, and more — containing nothing specific to any one harness. Templates can live locally (in project or global scopes) or be managed as fully fledged Hub-level resources with CRUD, CLI, SDK, and Web UI support. A default harness-config may optionally be named, but is not required.
 _Avoid_: role, blueprint, profile, config
 _See also_: Harness-config (its harness-specific counterpart), Skill
 
@@ -62,11 +62,20 @@ An out-of-process extension built on `hashicorp/go-plugin` (gRPC) that supplies 
 _Avoid_: extension, addon, module, skill
 _See also_: Broker plugin, Message Broker
 
+**Pre-Start Hook**:
+A project-scoped or Hub-scoped shell script executed synchronously inside the agent container during initialization before the main harness starts up (via the `EventPreStart` hook point, staged at `.scion/hooks/pre-start.d/30-project-custom`). If the script exits non-zero, agent startup is aborted. Provides a blocking initialization mechanism for project owners and Hub administrators.
+_Avoid_: startup script, provision hook, lifecycle script
+
 **sciontool**:
 The helper utility injected into every agent container for status reporting, metadata access, and task management.
 _Avoid_: agent tool, scion-tool
 
 ## Runtime & Workspace
+
+**Agent Port Forwarding**:
+A feature that allows exposing local HTTP ports running inside an agent container through the Hub as authenticated, reverse-proxied URLs. Built on an outbound WebSocket reverse tunnel.
+_Avoid_: agent tunnel, port proxy, hub reverse tunnel, web access
+_See also_: sciontool
 
 **Runtime**:
 The container technology that executes an agent's container: Docker, Podman, Apple Container, or Kubernetes.
@@ -143,7 +152,7 @@ _Avoid_: environment, runtime config, preset, runtime profile
 _See also_: Runtime Broker, Runtime
 
 **Message Broker**:
-The pluggable system that brokers messages between Scion actors (agents and users) and messaging surfaces — built-in brokers such as the web UI Messages view, and broker plugins to external systems like Telegram and Google Chat (Discord and Slack planned). Backs the `scion message` command. Always write in full; "broker" alone is forbidden because it collides with Runtime Broker.
+The pluggable system that brokers messages between Scion actors (agents and users) and messaging surfaces — built-in brokers such as the web UI Messages view, and broker plugins to external systems like Telegram, Discord, Slack, and Google Chat. Backs the `scion message` command. Always write in full; "broker" alone is forbidden because it collides with Runtime Broker.
 _Avoid_: broker, message bus, queue, pub/sub
 _See also_: Broker plugin, Built-in broker, Plugin, Event Bus (distinct), Runtime Broker (distinct, same word)
 
@@ -172,6 +181,11 @@ _Avoid_: hub-native, hub-native project, hub workspace, hub-project, hosted proj
 A project whose workspace is a pre-existing path on a broker machine, linked to a Hub for cross-broker visibility — as opposed to a Hub-managed project. May be plain or git-backed.
 _Avoid_: local project, imported project, registered project
 
+**Shadowed project**:
+A local directory associated with a Hub project purely for CLI routing, with no workspace content, no provider registration, and no broker involvement — as opposed to a *Linked project*, whose workspace is a real pre-existing path on a broker machine.
+_Avoid_: linked, mounted, cloned
+_See also_: Hub-managed project
+
 **Server**:
 The `scion server` command group, and the single combined process it manages — one or more server components run together as a background daemon (or with `--foreground`) via `start`/`stop`/`restart`/`status`.
 _Avoid_: daemon, service, backend
@@ -189,12 +203,36 @@ A credential made available to an agent at runtime (e.g. API keys, tokens). A ha
 _Avoid_: credential, vault, secret store, env secret
 _See also_: Harness-config, Profile
 
+**Port Forwarding**:
+The feature that allows users, developers, and external systems to access HTTP services running inside agent containers securely via the Hub's reverse proxy. Requests are routed over a persistent, authenticated WebSocket-based reverse tunnel established from within the container to the Hub.
+_Avoid_: tunnel, docker proxy, ingress
+_See also_: Auto-Expose, Hub
+
+**Auto-Expose**:
+A sub-feature of port forwarding where `sciontool` periodically scans for listening TCP sockets inside the agent container (by reading `/proc/net/tcp` and `/proc/net/tcp6`), filters them by policy, and registers them with the Hub using the `auto-scan` label. Stale registrations are automatically cleaned up when the service stops listening.
+_Avoid_: auto-port, automatic scan, port exposure
+_See also_: Port Forwarding, sciontool
+
+**A2A Protocol**:
+An open standard (developed by Google) for secure, structured communication between independent artificial agents. It defines a lightweight JSON-RPC 2.0 dialect over HTTP, alongside standard discovery mechanics ("Agent Cards") for advertising capabilities.
+_See also_: A2A Protocol Bridge
+
+**A2A Protocol Bridge**:
+A standalone, self-managed service that translates standard A2A JSON-RPC payloads into Scion Hub API calls and vice versa. It exposes Scion agents as standard A2A-compliant JSON-RPC endpoints, enabling multi-agent orchestration, third-party platform integrations, and desktop client federation.
+_Avoid_: A2A bridge, A2A adapter, A2A proxy
+_See also_: A2A Protocol, Hub
+
 ## Users & Access
 
 **Group**:
 A named collection of Hub users (and nested groups) used by the Hub permissions system to assign access. This is the primary meaning of "group" in Scion.
 _Avoid_: team, org, role
 _See also_: Message Group (different concept — message recipients, not users)
+
+**User Access Token (UAT)**:
+A scoped, revocable bearer token (prefixed with `scion_pat_`) linked to a user account and used for non-interactive Hub authentication (e.g., CLI, CI/CD pipelines, desktop app integration). Every UAT is scoped to a single project and carries a specific list of action permissions (scopes).
+_Avoid_: personal access token (PAT), API key, secret token
+_See also_: Hub
 
 ## Messaging
 
@@ -305,6 +343,10 @@ _See also_: Infrastructure metrics (the other family), Telemetry pipeline
 The in-container OTLP receiver and forwarding pipeline (`pkg/sciontool/telemetry`) that collects traces, metrics, and logs from the harness and exports them to a cloud backend (GCP Cloud Monitoring, Cloud Trace, Cloud Logging). Requires the `scion-telemetry-gcp-credentials` secret for cloud export; runs in local-only mode without it.
 _Avoid_: metrics pipeline, collector, OTel collector
 _See also_: Agent metrics
+
+**Session Metrics**:
+Database-backed summaries and aggregations computed on agent session-end (aggregated by `sciontool` and delivered as a `MetricsPayload` in the StatusUpdate protocol) and stored in the Hub's `agent_session_metrics` SQL table. They provide an IDOR-safe structural view of token usage (input, output, cached, reasoning), tool execution counts, session duration, and model usage, queried via dedicated summary API endpoints and displayed in the Web Dashboard. Contrast with raw OpenTelemetry time-series metrics.
+_Avoid_: OTel metrics (for these DB summaries), raw telemetry
 
 ## Potential Future Additions
 

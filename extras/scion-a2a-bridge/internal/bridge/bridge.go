@@ -53,6 +53,7 @@ type Bridge struct {
 	hubClient hubclient.Client
 	minter    *identity.TokenMinter
 	config    *Config
+	snapshot  *SnapshotHolder // atomic snapshot of effective config (hot-apply)
 	broker    *BrokerServer
 	streams   *StreamManager
 	push      *PushDispatcher
@@ -139,7 +140,7 @@ func New(store *state.Store, hubClient hubclient.Client, minter *identity.TokenM
 func (b *Bridge) janitor() {
 	defer b.wg.Done()
 
-	maxAge := 2 * b.config.Timeouts.SendMessage
+	maxAge := 2 * b.effectiveConfig().Timeouts.SendMessage
 	if maxAge == 0 {
 		maxAge = 4 * time.Minute
 	}
@@ -231,6 +232,21 @@ func (b *Bridge) Shutdown() {
 // SetBroker wires the broker server for subscription management.
 func (b *Bridge) SetBroker(broker *BrokerServer) {
 	b.broker = broker
+}
+
+// SetSnapshot wires the atomic config snapshot for hot-apply support.
+func (b *Bridge) SetSnapshot(snap *SnapshotHolder) {
+	b.snapshot = snap
+}
+
+// effectiveConfig returns the effective config from the snapshot if available,
+// or the static config as fallback.
+func (b *Bridge) effectiveConfig() *Config {
+	if b.snapshot != nil {
+		snap := b.snapshot.Load()
+		return &snap.Config
+	}
+	return b.config
 }
 
 // SetSDKRequestHandler stores the SDK RequestHandler for multi-transport access.
@@ -366,7 +382,7 @@ func (b *Bridge) SendMessage(ctx context.Context, projectSlug, agentSlug, contex
 		b.log.Error("failed to update task state", "error", err, "task_id", taskID)
 	}
 
-	timeout := b.config.Timeouts.SendMessage
+	timeout := b.effectiveConfig().Timeouts.SendMessage
 	if timeout == 0 {
 		timeout = 120 * time.Second
 	}
@@ -477,7 +493,7 @@ func (b *Bridge) sendFollowUp(ctx context.Context, projectSlug, agentSlug, taskI
 			return nil, fmt.Errorf("send follow-up to agent: %w", err)
 		}
 
-		timeout := b.config.Timeouts.SendMessage
+		timeout := b.effectiveConfig().Timeouts.SendMessage
 		if timeout == 0 {
 			timeout = 120 * time.Second
 		}
@@ -794,13 +810,15 @@ func (b *Bridge) dispatchToWaiter(taskID string, msg *messages.StructuredMessage
 	if !ok {
 		return false
 	}
-	if msg.Type == messages.TypeStateChange {
+	if msg.Type == messages.TypeStateChange || msg.Type == messages.TypeSystem {
 		// Terminal state-changes must still be persisted to the DB even though
 		// we skip the waiter — otherwise the task's stored state is never updated.
-		if taskState := MapActivityToTaskState(msg.Msg); IsTerminalState(taskState) {
-			if err := b.store.UpdateTaskState(taskID, taskState); err != nil {
-				b.log.Error("failed to persist terminal state from waiter path",
-					"task_id", taskID, "state", taskState, "error", err)
+		if msg.Type == messages.TypeStateChange {
+			if taskState := MapActivityToTaskState(msg.Msg); IsTerminalState(taskState) {
+				if err := b.store.UpdateTaskState(taskID, taskState); err != nil {
+					b.log.Error("failed to persist terminal state from waiter path",
+						"task_id", taskID, "state", taskState, "error", err)
+				}
 			}
 		}
 		return true
@@ -841,6 +859,12 @@ func (b *Bridge) dispatchToActiveTask(ctx context.Context, taskID, agentSlug str
 			b.unregisterActiveTask(taskID, aKey)
 			b.streams.CloseAll(taskID)
 		}
+		return
+	}
+
+	// System messages are non-conversational — log and skip content dispatch.
+	if msg.Type == messages.TypeSystem {
+		b.log.Debug("skipping system message in A2A bridge", "task_id", taskID, "sender", msg.Sender)
 		return
 	}
 
@@ -969,7 +993,8 @@ func (b *Bridge) subscribeAdminUserTopics(projectID string) {
 // GenerateAgentCard builds an agent card for the given project and agent,
 // enriching it with metadata from the Hub API when available.
 func (b *Bridge) GenerateAgentCard(ctx context.Context, projectSlug, agentSlug string) map[string]interface{} {
-	baseURL := strings.TrimRight(b.config.Bridge.ExternalURL, "/")
+	cfg := b.effectiveConfig()
+	baseURL := strings.TrimRight(cfg.Bridge.ExternalURL, "/")
 	agentURL := fmt.Sprintf("%s/projects/%s/agents/%s", baseURL, projectSlug, agentSlug)
 
 	name := agentSlug
@@ -1022,10 +1047,10 @@ func (b *Bridge) GenerateAgentCard(ctx context.Context, projectSlug, agentSlug s
 		"skills":             skills,
 	}
 
-	if b.config.Bridge.Provider.Organization != "" {
+	if cfg.Bridge.Provider.Organization != "" {
 		card["provider"] = map[string]string{
-			"organization": b.config.Bridge.Provider.Organization,
-			"url":          b.config.Bridge.Provider.URL,
+			"organization": cfg.Bridge.Provider.Organization,
+			"url":          cfg.Bridge.Provider.URL,
 		}
 	}
 
@@ -1087,10 +1112,11 @@ func (b *Bridge) evictStaleAgentCache() {
 // GetProjectConfig returns the configuration for a project slug, or nil if not configured.
 // Returns a pointer to a copy to avoid aliasing the live config slice.
 func (b *Bridge) GetProjectConfig(projectSlug string) *ProjectConfig {
-	for i := range b.config.Projects {
-		if b.config.Projects[i].Slug == projectSlug {
-			cfg := b.config.Projects[i]
-			return &cfg
+	cfg := b.effectiveConfig()
+	for i := range cfg.Projects {
+		if cfg.Projects[i].Slug == projectSlug {
+			pc := cfg.Projects[i]
+			return &pc
 		}
 	}
 	return nil
