@@ -155,6 +155,7 @@ type DiscordBroker struct {
 	webhooks  *WebhookManager
 
 	gatewayConnected bool // set true in handleReady, false on disconnect
+	bootstrapDone    bool // set true after first successful bootstrap subscription
 
 	threadParents map[string]string // channelID -> parentID (cached thread lookups)
 
@@ -219,6 +220,36 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 	// Phase 1: Bot token configuration.
 	botToken, hasBotToken := config["bot_token"]
 	if hasBotToken && botToken != "" {
+		// Close old session, store, and sendQueue if they exist (handles Restart/reconfigure).
+		// Clearing subs ensures Subscribe("*") triggers startGateway() on the new session.
+		if b.session != nil {
+			oldSession := b.session
+			oldStore := b.store
+			oldSendQueue := b.sendQueue
+			b.session = nil
+			b.store = nil
+			b.sendQueue = nil
+			b.subs = make(map[string]bool)
+			b.gatewayConnected = false
+			b.bootstrapDone = false
+			// Release lock while closing old resources — session.Close() sleeps
+			// for 1s internally, and store/sendQueue may block on cleanup.
+			// Matches the pattern in Close() (lines 802-831).
+			b.mu.Unlock()
+			if closeErr := oldSession.Close(); closeErr != nil {
+				b.log.Warn("Failed to close old discord session on reconfigure", "error", closeErr)
+			}
+			if oldSendQueue != nil {
+				oldSendQueue.Close()
+			}
+			if oldStore != nil {
+				if closeErr := oldStore.Close(); closeErr != nil {
+					b.log.Warn("Failed to close old store on reconfigure", "error", closeErr)
+				}
+			}
+			b.mu.Lock()
+		}
+
 		// Create a discordgo session but do NOT open the gateway yet.
 		// Gateway connection happens on first Subscribe().
 		session, err := discordgo.New("Bot " + botToken)
@@ -383,24 +414,31 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 		// Subscribe(), which triggers startGateway() on the first call.
 		// Host callbacks are wired after Configure() returns, so we defer
 		// the request in a goroutine that retries until they're available.
-		go func() {
-			for i := 0; i < 20; i++ {
-				time.Sleep(500 * time.Millisecond)
-				b.mu.RLock()
-				hc := b.hostCallbacks
-				b.mu.RUnlock()
-				if hc == nil {
-					continue
+		if !b.bootstrapDone {
+			b.bootstrapDone = true // set immediately to prevent duplicate goroutines
+			go func() {
+				for i := 0; i < 20; i++ {
+					time.Sleep(500 * time.Millisecond)
+					b.mu.RLock()
+					hc := b.hostCallbacks
+					b.mu.RUnlock()
+					if hc == nil {
+						continue
+					}
+					if err := hc.RequestSubscription(projectcompat.AllProjectsPattern()); err != nil {
+						b.log.Warn("Failed to request bootstrap subscription", "error", err)
+						continue
+					}
+					b.log.Info("Requested bootstrap subscription for Discord Gateway")
+					return
 				}
-				if err := hc.RequestSubscription(projectcompat.AllProjectsPattern()); err != nil {
-					b.log.Warn("Failed to request bootstrap subscription", "error", err)
-					continue
-				}
-				b.log.Info("Requested bootstrap subscription for Discord Gateway")
-				return
-			}
-			b.log.Error("Bootstrap subscription timed out — host callbacks never became available")
-		}()
+				b.log.Error("Bootstrap subscription timed out — host callbacks never became available")
+				// Reset flag so a future Configure can retry bootstrap.
+				b.mu.Lock()
+				b.bootstrapDone = false
+				b.mu.Unlock()
+			}()
+		}
 	}
 
 	return nil
@@ -1363,7 +1401,7 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		if att == nil || att.URL == "" {
 			continue
 		}
-		agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, link.ProjectSlug)
+		agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, link.ProjectSlug, link.ProjectID)
 		if err != nil {
 			b.log.Error("Failed to download Discord attachment",
 				"filename", att.Filename, "error", err)
@@ -1982,15 +2020,15 @@ func (b *DiscordBroker) resolveProjectSlug(ctx context.Context, projectID string
 const maxDiscordAttachmentSize = 25 * 1024 * 1024 // 25 MB
 
 // downloadDiscordAttachment downloads a file from a Discord message attachment
-// and saves it to the agent's workspace downloads directory. Returns the
-// agent-relative path and a placeholder string for the message body.
+// and saves it so the agent can access it. Returns the agent-visible path and
+// a placeholder string for the message body.
 //
-// NOTE: This writes to the host filesystem at /home/scion/.scion/projects/<slug>/downloads/.
-// The agent container must share this volume mount for the file to be visible
-// at /workspace/downloads/. This works in single-VM / shared-dir setups but
-// will NOT work when agents and the plugin run in separate pods with isolated
-// volumes. See #397 for the tracked fix.
-func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *discordgo.MessageAttachment, projectSlug string) (agentPath, placeholder string, err error) {
+// The function uses a three-tier fallback for the destination directory:
+//  1. downloadsPath config (highest priority, supports {project_slug} placeholder)
+//  2. Shared dir infrastructure via config.SharedDirHostPath — writes to the host
+//     and exposes the file at /scion-volumes/scratchpad/.attachments/_discord/
+//  3. Legacy /home/scion/.scion/projects/<slug>/downloads/ (last resort)
+func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *discordgo.MessageAttachment, projectSlug, projectID string) (agentPath, placeholder string, err error) {
 	if projectSlug == "" {
 		return "", "", fmt.Errorf("project slug is empty")
 	}
@@ -2018,14 +2056,31 @@ func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *disc
 	if fileName == "" || fileName == "." || fileName == "/" {
 		fileName = att.ID
 	}
-	timestamp := time.Now().Unix()
+	timestamp := time.Now().UnixNano()
 	destName := fmt.Sprintf("discord_%d_%s", timestamp, fileName)
 
-	// Use configured downloads_path if set; otherwise default to project dir.
+	// Route attachments through the shared dir infrastructure so container-based
+	// agents can access them at /scion-volumes/scratchpad/.attachments/_discord/.
+	// Use configured downloads_path as highest-priority override for edge cases.
 	var hostDir string
+	var useSharedDir bool
 	if b.downloadsPath != "" {
 		hostDir = strings.ReplaceAll(b.downloadsPath, "{project_slug}", projectSlug)
-	} else {
+	} else if projectID != "" {
+		home, homeErr := os.UserHomeDir()
+		if homeErr == nil {
+			// NOTE: SharedDirHostPath is a pure path computation; it does not verify that
+			// "scratchpad" is actually configured on the project. If it is not configured,
+			// the file will be written to the host but won't be visible inside the agent
+			// container. Projects using container-based agents should always have
+			// scratchpad configured.
+			sharedDirBase := config.SharedDirHostPath(home, projectSlug, projectID, "scratchpad")
+			hostDir = filepath.Join(sharedDirBase, ".attachments", "_discord")
+			useSharedDir = true
+		}
+	}
+	if hostDir == "" {
+		// Fallback to legacy path when shared dir resolution fails.
 		hostDir = filepath.Join("/home/scion/.scion/projects", projectSlug, "downloads")
 	}
 	if err := os.MkdirAll(hostDir, 0o755); err != nil {
@@ -2045,14 +2100,15 @@ func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *disc
 		return "", "", fmt.Errorf("write file: %w", err)
 	}
 
-	// Derive the agent-visible path from the same base used to save the file.
-	// When a custom downloads_path is configured, the agent sees that path
-	// directly; otherwise it sees the conventional /workspace/downloads mount.
+	// Derive the agent-visible path.
 	if b.downloadsPath != "" {
 		agentPath = filepath.Join(strings.ReplaceAll(b.downloadsPath, "{project_slug}", projectSlug), destName)
+	} else if useSharedDir {
+		agentPath = filepath.Join("/scion-volumes/scratchpad/.attachments/_discord", destName)
 	} else {
 		agentPath = filepath.Join("/workspace/downloads", destName)
 	}
+	agentPath = filepath.ToSlash(agentPath)
 	contentType := att.ContentType
 	if contentType == "" {
 		contentType = "file"

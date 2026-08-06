@@ -1497,7 +1497,7 @@ func TestDownloadDiscordAttachment_CustomDownloadsPath(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, "some-project")
+	agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, "some-project", "test-project-id")
 	require.NoError(t, err)
 
 	// Agent path should be downloads_path + filename (not /workspace/downloads/).
@@ -1545,7 +1545,7 @@ func TestDownloadDiscordAttachment_ProjectSlugPlaceholder(t *testing.T) {
 
 	projectSlug := "my-cool-project"
 	ctx := context.Background()
-	agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, projectSlug)
+	agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, projectSlug, "test-project-id")
 	require.NoError(t, err)
 
 	// Host directory should have the slug expanded (file written there).
@@ -1584,7 +1584,7 @@ func TestDownloadDiscordAttachment_EmptyProjectSlug(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, _, err := b.downloadDiscordAttachment(ctx, att, "")
+	_, _, err := b.downloadDiscordAttachment(ctx, att, "", "test-project-id")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "project slug is empty")
 }
@@ -1603,7 +1603,7 @@ func TestDownloadDiscordAttachment_TooLarge(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, _, err := b.downloadDiscordAttachment(ctx, att, "test-project")
+	_, _, err := b.downloadDiscordAttachment(ctx, att, "test-project", "test-project-id")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "too large")
 }
@@ -1632,7 +1632,7 @@ func TestDownloadDiscordAttachment_CustomPath_CreatesSubdir(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	agentPath, _, err := b.downloadDiscordAttachment(ctx, att, "proj")
+	agentPath, _, err := b.downloadDiscordAttachment(ctx, att, "proj", "test-project-id")
 	require.NoError(t, err)
 
 	// Verify the directory was created and the file exists.
@@ -1642,4 +1642,173 @@ func TestDownloadDiscordAttachment_CustomPath_CreatesSubdir(t *testing.T) {
 	data, err := os.ReadFile(agentPath)
 	require.NoError(t, err)
 	assert.Equal(t, fileContent, data)
+}
+
+func TestDownloadDiscordAttachment_SharedDirPath(t *testing.T) {
+	// When projectID is non-empty and downloadsPath is empty, the function
+	// should route through the shared dir infrastructure.
+	fileContent := []byte("shared-dir-test-data")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(fileContent)
+	}))
+	defer srv.Close()
+
+	// Point HOME to a temp dir so SharedDirHostPath resolves there.
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	b := &DiscordBroker{
+		log:        discardLogger(),
+		httpClient: srv.Client(),
+		// downloadsPath intentionally empty
+	}
+
+	att := &discordgo.MessageAttachment{
+		ID:          "att-shared-001",
+		Filename:    "shared-photo.png",
+		URL:         srv.URL + "/shared-photo.png",
+		Size:        len(fileContent),
+		ContentType: "image/png",
+	}
+
+	ctx := context.Background()
+	agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, "my-project", "abcd1234-ef56-7890-abcd-ef1234567890")
+	require.NoError(t, err)
+
+	// Agent path should use the shared dir prefix.
+	assert.True(t, strings.HasPrefix(agentPath, "/scion-volumes/scratchpad/.attachments/_discord/"),
+		"agentPath %q should start with shared dir prefix", agentPath)
+	assert.Contains(t, agentPath, "shared-photo.png")
+	assert.Contains(t, placeholder, "shared-photo.png")
+
+	// Verify the file was actually written to the host-side shared dir path.
+	// SharedDirHostPath returns <home>/.scion/project-configs/<slug>__<shortUUID>/shared-dirs/scratchpad
+	expectedHostBase := filepath.Join(fakeHome, ".scion", "project-configs", "my-project__abcd1234", "shared-dirs", "scratchpad", ".attachments", "_discord")
+	entries, err := os.ReadDir(expectedHostBase)
+	require.NoError(t, err, "shared dir host path should exist")
+	require.Len(t, entries, 1)
+	assert.Contains(t, entries[0].Name(), "shared-photo.png")
+}
+
+func TestDownloadDiscordAttachment_EmptyProjectID_LegacyPath(t *testing.T) {
+	// When projectID is empty and downloadsPath is empty, the function should
+	// fall back to the legacy /workspace/downloads/ agent path.
+	fileContent := []byte("legacy-fallback-test")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(fileContent)
+	}))
+	defer srv.Close()
+
+	// Point HOME to a temp dir. Even though projectID is empty, the legacy
+	// path uses /home/scion/.scion/projects/<slug>/downloads on the host, so
+	// we set HOME so the file write succeeds somewhere writable.
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	b := &DiscordBroker{
+		log:        discardLogger(),
+		httpClient: srv.Client(),
+	}
+
+	att := &discordgo.MessageAttachment{
+		ID:       "att-legacy-001",
+		Filename: "legacy.txt",
+		URL:      srv.URL + "/legacy.txt",
+		Size:     len(fileContent),
+	}
+
+	ctx := context.Background()
+	agentPath, _, err := b.downloadDiscordAttachment(ctx, att, "test-slug", "")
+	require.NoError(t, err)
+
+	// Legacy agent path should be /workspace/downloads/<name>.
+	assert.True(t, strings.HasPrefix(agentPath, "/workspace/downloads/"),
+		"agentPath %q should start with legacy prefix", agentPath)
+	assert.Contains(t, agentPath, "legacy.txt")
+}
+
+func TestDownloadDiscordAttachment_DownloadsPathOverridesSharedDir(t *testing.T) {
+	// When downloadsPath is set, it takes priority over shared dir even if
+	// projectID is non-empty.
+	fileContent := []byte("downloads-path-priority")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(fileContent)
+	}))
+	defer srv.Close()
+
+	customDir := t.TempDir()
+	b := &DiscordBroker{
+		log:           discardLogger(),
+		httpClient:    srv.Client(),
+		downloadsPath: customDir,
+	}
+
+	att := &discordgo.MessageAttachment{
+		ID:       "att-priority-001",
+		Filename: "priority.txt",
+		URL:      srv.URL + "/priority.txt",
+		Size:     len(fileContent),
+	}
+
+	ctx := context.Background()
+	agentPath, _, err := b.downloadDiscordAttachment(ctx, att, "my-project", "abcd1234-ef56-7890-abcd-ef1234567890")
+	require.NoError(t, err)
+
+	// Agent path should use the custom downloads path, not shared dir.
+	assert.True(t, strings.HasPrefix(agentPath, customDir),
+		"agentPath %q should start with custom dir %q", agentPath, customDir)
+	assert.NotContains(t, agentPath, "/scion-volumes/scratchpad/")
+	assert.Contains(t, agentPath, "priority.txt")
+}
+
+// --- RPC bootstrap regression tests ---
+
+func TestConfigure_SessionReplacement_ClearsSubs(t *testing.T) {
+	b := &DiscordBroker{
+		log:              discardLogger(),
+		session:          &discordgo.Session{}, // simulate existing session
+		subs:             map[string]bool{"*": true},
+		sentIDs:          make(map[string]time.Time),
+		gatewayConnected: true,
+		bootstrapDone:    true,
+	}
+
+	// Calling Configure with bot_token should close old session and clear subs.
+	err := b.Configure(map[string]string{
+		"bot_token": "Bot fake-token-for-test",
+	})
+	require.NoError(t, err)
+
+	// After Phase 1 reconfigure:
+	// - Old subs should be cleared (so Subscribe("*") would trigger startGateway)
+	// - gatewayConnected should be reset
+	// - bootstrapDone should be reset
+	assert.Empty(t, b.subs, "subs should be cleared after session replacement")
+	assert.False(t, b.gatewayConnected, "gatewayConnected should be reset")
+	assert.False(t, b.bootstrapDone, "bootstrapDone should be reset")
+	assert.NotNil(t, b.session, "new session should be created")
+}
+
+func TestConfigure_BootstrapSkippedWhenDone(t *testing.T) {
+	b := &DiscordBroker{
+		log:           discardLogger(),
+		subs:          make(map[string]bool),
+		sentIDs:       make(map[string]time.Time),
+		bootstrapDone: true,
+		hubURL:        "http://localhost:8080",
+		hmacKey:       "test-key",
+		brokerID:      "test-broker",
+	}
+
+	// Configure Phase 2 (hub_url present) should skip bootstrap goroutine
+	// because bootstrapDone is already true.
+	err := b.Configure(map[string]string{
+		"hub_url":  "http://localhost:8080",
+		"hmac_key": "test-key",
+	})
+	require.NoError(t, err)
+
+	// bootstrapDone should still be true (not reset by Phase 2 alone).
+	assert.True(t, b.bootstrapDone, "bootstrapDone should remain true when no session replacement")
 }
