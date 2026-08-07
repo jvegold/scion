@@ -432,7 +432,7 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 					b.log.Info("Requested bootstrap subscription for Discord Gateway")
 					return
 				}
-				b.log.Error("Bootstrap subscription timed out — host callbacks never became available")
+				b.log.Warn("Bootstrap subscription timed out — this is expected in standalone gRPC mode where the Hub drives subscriptions via Subscribe() RPC")
 				// Reset flag so a future Configure can retry bootstrap.
 				b.mu.Lock()
 				b.bootstrapDone = false
@@ -1174,6 +1174,20 @@ func (b *DiscordBroker) handleInteractionCreate(s *discordgo.Session, i *discord
 			go func() {
 				HandleModalSubmit(s, i, store, b.deliverInbound, b.log)
 			}()
+		} else if strings.HasPrefix(data.CustomID, "secret:") {
+			if commands == nil {
+				return
+			}
+			// Secret modal submission — defer then process async.
+			_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Flags: discordgo.MessageFlagsEphemeral,
+				},
+			})
+			go func() {
+				commands.HandleSecretModalSubmit(s, i)
+			}()
 		}
 
 	case discordgo.InteractionApplicationCommandAutocomplete:
@@ -1650,38 +1664,6 @@ func (b *DiscordBroker) getProjectAgents(ctx context.Context, projectID string) 
 	}
 
 	return slugs
-}
-
-// --- Dynamic subscription management ---
-
-func (b *DiscordBroker) subscribeForProject(projectID string) {
-	pattern := projectcompat.ProjectPattern(projectID)
-
-	b.mu.RLock()
-	hc := b.hostCallbacks
-	b.mu.RUnlock()
-
-	if hc != nil {
-		if err := hc.RequestSubscription(pattern); err != nil {
-			b.log.Warn("Failed to request subscription via host callbacks",
-				"pattern", pattern, "error", err)
-		}
-	}
-}
-
-func (b *DiscordBroker) unsubscribeForProject(projectID string) {
-	pattern := projectcompat.ProjectPattern(projectID)
-
-	b.mu.RLock()
-	hc := b.hostCallbacks
-	b.mu.RUnlock()
-
-	if hc != nil {
-		if err := hc.CancelSubscription(pattern); err != nil {
-			b.log.Warn("Failed to cancel subscription via host callbacks",
-				"pattern", pattern, "error", err)
-		}
-	}
 }
 
 // --- Routing helpers ---
