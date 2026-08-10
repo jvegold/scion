@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
@@ -54,6 +55,11 @@ type AuthConfig struct {
 	ProxyUserProvisioner func(ctx context.Context, info *ProxyUserInfo) (UserIdentity, error)
 	// AuthMode is the exclusive human auth mode: "oauth", "proxy", "dev".
 	AuthMode string
+	// FederationAuth points to the server's atomic.Pointer for the
+	// FederationAuthenticator. nil when federation was never configured.
+	// The middleware loads from this pointer on each request to see
+	// hot-reloaded authenticators.
+	FederationAuth *atomic.Pointer[FederationAuthenticator]
 	// Debug enables verbose logging
 	Debug bool
 	// Logger is the subsystem logger for auth middleware (defaults to slog.Default())
@@ -138,6 +144,39 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 					}
 				}
 				// Bearer token wasn't an agent token, continue to user auth
+			}
+
+			// Step 1.5: Federation OIDC token (X-Scion-Federation-Token header)
+			if federationToken := r.Header.Get(FederationTokenHeader); federationToken != "" {
+				var fedAuth *FederationAuthenticator
+				if cfg.FederationAuth != nil {
+					fedAuth = cfg.FederationAuth.Load()
+				}
+				if fedAuth == nil {
+					// Header present but federation not enabled — reject, don't silently ignore
+					writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
+						"federation authentication is not configured", nil)
+					return
+				}
+				identity, err := fedAuth.Authenticate(federationToken)
+				if err != nil {
+					if cfg.Debug {
+						log.Debug("Federation token validation failed", "error", err)
+					}
+					writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
+						"invalid federation token", nil)
+					return
+				}
+				ctx = contextWithIdentity(ctx, identity)
+				ctx = contextWithAuthType(ctx, AuthTypeFederation)
+				if cfg.Debug {
+					log.Debug("Federated identity authenticated",
+						"issuer", identity.IssuerURL(),
+						"type", identity.Type(),
+						"id", identity.ID())
+				}
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
 			}
 
 			// Step 2: Check for broker HMAC authentication (X-Scion-Broker-ID header)
@@ -380,6 +419,10 @@ func isUnauthenticatedEndpoint(path string) bool {
 	case "/api/v1/webhooks/github": // GitHub App webhook (uses webhook signature verification)
 		return true
 	case "/github-app/setup": // GitHub App post-installation callback (browser redirect)
+		return true
+	case "/.well-known/openid-configuration": // OIDC discovery document (public metadata)
+		return true
+	case "/.well-known/jwks.json": // OIDC JSON Web Key Set (public keys)
 		return true
 	}
 	return false

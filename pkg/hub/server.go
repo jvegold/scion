@@ -38,6 +38,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
@@ -231,6 +232,20 @@ type ServerConfig struct {
 	Workstation bool
 	// DevUserConfig holds optional identity overrides for the development user.
 	DevUserConfig DevUserConfig
+
+	// OIDCConfig holds configuration for the OIDC Identity Provider feature.
+	// When Enabled, the hub initializes an OIDCKeyManager and exposes OIDC endpoints.
+	OIDCConfig config.OIDCProviderConfig
+
+	// Federation holds configuration for hub-hub federation authentication.
+	// When Federation.Enabled is true, the server initializes a FederationAuthenticator
+	// and injects it into the auth middleware.
+	Federation config.FederationConfig
+
+	// Mode is the server mode (e.g. "workstation", "dev", "hosted").
+	// Used by the federation authenticator to enforce HTTPS on issuer URLs
+	// in non-dev/non-workstation modes.
+	Mode string
 }
 
 // MaintenanceConfig holds configuration for routine maintenance operation executors.
@@ -700,6 +715,12 @@ type Server struct {
 	transportAudience string
 	transportMode     string
 
+	// OIDC identity provider (nil = OIDC IdP disabled)
+	oidcKeyManager       *OIDCKeyManager
+	oidcIssuerURL        string
+	oidcTokenRateLimiter *GCPTokenRateLimiter // per-agent rate limiter for OIDC identity token requests
+	oidcTokenLifetime    time.Duration        // validity duration for OIDC identity tokens
+
 	// GCP token generator for agent identity (nil = GCP identity disabled)
 	gcpTokenGenerator GCPTokenGenerator
 
@@ -760,6 +781,10 @@ type Server struct {
 
 	// Shared HTTP client for federation proxy calls (no redirect following).
 	federationClient *http.Client
+
+	// federationAuth holds the current FederationAuthenticator.
+	// Swapped atomically by ApplySnapshot; read by the auth middleware.
+	federationAuth atomic.Pointer[FederationAuthenticator]
 
 	imageBuildActive atomic.Bool
 	imagePullActive  atomic.Bool
@@ -990,6 +1015,47 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 			"audience", cfg.TransportAudience)
 	}
 
+	// Initialize OIDC Identity Provider key manager if enabled
+	if cfg.OIDCConfig.Enabled {
+		oidcIssuerURL := cfg.OIDCConfig.IssuerURL
+		if oidcIssuerURL == "" {
+			oidcIssuerURL = cfg.HubEndpoint
+		}
+		if oidcIssuerURL == "" {
+			return nil, fmt.Errorf("OIDC is enabled but no issuer URL configured (set oidc.issuer_url or hub.endpoint)")
+		}
+		oidcIssuerURL = strings.TrimRight(oidcIssuerURL, "/")
+
+		oidcMgr, err := NewOIDCKeyManager(ctx, OIDCKeyManagerConfig{
+			Store:                   s,
+			Backend:                 srv.secretBackend,
+			HubID:                   srv.hubID,
+			IssuerURL:               oidcIssuerURL,
+			RequireStableSigningKey: cfg.RequireStableSigningKey,
+			Log:                     logging.Subsystem("hub.oidc"),
+		})
+		if err != nil {
+			if isGCPBackend || cfg.RequireStableSigningKey {
+				return nil, fmt.Errorf("OIDC key manager: %w", err)
+			}
+			slog.Warn("Failed to initialize OIDC key manager", "error", err)
+		} else {
+			srv.oidcKeyManager = oidcMgr
+			srv.oidcIssuerURL = oidcIssuerURL
+
+			// OIDC identity token lifetime: use config if set, else default 15m
+			srv.oidcTokenLifetime = 15 * time.Minute
+			if cfg.OIDCConfig.TokenLifetime > 0 {
+				srv.oidcTokenLifetime = cfg.OIDCConfig.TokenLifetime
+			}
+
+			// Per-agent rate limiter for OIDC identity token requests (0.5 req/sec avg, burst 30)
+			srv.oidcTokenRateLimiter = NewGCPTokenRateLimiter(0.5, 30)
+
+			slog.Info("OIDC Identity Provider enabled", "issuer_url", oidcIssuerURL)
+		}
+	}
+
 	// Initialize control channel manager
 	srv.controlChannel = NewControlChannelManager(ControlChannelConfig{
 		PingInterval:   30 * time.Second,
@@ -1085,6 +1151,38 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 			"runs", runs, "migrations", migrations)
 	}
 
+	// Initialize federation authenticator if enabled.
+	if cfg.Federation.Enabled {
+		// Derive mode for HTTPS enforcement.
+		federationMode := cfg.Mode
+		if federationMode == "" {
+			if cfg.Workstation {
+				federationMode = "workstation"
+			} else {
+				federationMode = "hosted"
+			}
+		}
+		// Use the OIDC issuer URL as the default expected audience.
+		federationAudience := srv.oidcIssuerURL
+		if federationAudience == "" {
+			federationAudience = cfg.OIDCConfig.IssuerURL
+		}
+
+		fa, err := NewFederationAuthenticator(
+			cfg.Federation,
+			federationAudience,
+			srv.federationClient,
+			federationMode,
+			logging.Subsystem("hub.federation"),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("federation authenticator init: %w", err)
+		}
+		srv.federationAuth.Store(fa)
+		slog.Info("Federation authenticator enabled",
+			"trusted_issuers", len(cfg.Federation.TrustedIssuers))
+	}
+
 	// Build unified auth configuration
 	srv.authConfig = AuthConfig{
 		Mode:               "production",
@@ -1096,6 +1194,7 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		UATSvc:             srv.uatService,
 		TrustedProxies:     cfg.TrustedProxies,
 		ProxyAuthenticator: cfg.ProxyAuth,
+		FederationAuth:     &srv.federationAuth,
 		AuthMode:           cfg.AuthMode,
 		Debug:              cfg.Debug,
 		Logger:             srv.authLog,
@@ -2066,8 +2165,11 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 
 // GenerateAgentToken generates a JWT for an agent.
 // This is a convenience method that delegates to the token service.
-// Additional scopes are merged with the default scopes (status update, token refresh, and notify).
-func (s *Server) GenerateAgentToken(agentID, projectID string, ancestry []string, additionalScopes ...AgentTokenScope) (string, error) {
+// Base scopes are determined by the passed role.
+// Dev-auth mode overrides to full if the role would be more restrictive,
+// preserving dev-mode behavior where all agents get full access.
+// Additional scopes are merged with the role-based defaults, deduplicated.
+func (s *Server) GenerateAgentToken(agentID, projectID string, ancestry []string, role AgentRole, additionalScopes []AgentTokenScope) (string, error) {
 	s.mu.RLock()
 	tokenService := s.agentTokenService
 	s.mu.RUnlock()
@@ -2076,13 +2178,14 @@ func (s *Server) GenerateAgentToken(agentID, projectID string, ancestry []string
 		return "", fmt.Errorf("agent token service not initialized")
 	}
 
-	scopes := []AgentTokenScope{ScopeAgentStatusUpdate, ScopeAgentTokenRefresh, ScopeAgentNotify, ScopeAgentPortForward}
-
-	// In dev-auth mode, auto-grant agent creation and lifecycle scopes
-	// so agents can create sub-agents without explicit template configuration.
-	if s.config.DevAuthToken != "" {
-		scopes = append(scopes, ScopeAgentCreate, ScopeAgentLifecycle)
+	// Use the specified role for base scopes.
+	// Dev-auth mode overrides to full if the role would be more restrictive,
+	// preserving dev-mode behavior where all agents get full access.
+	effectiveRole := role
+	if s.config.DevAuthToken != "" && CompareRoles(role, AgentRoleFull) < 0 {
+		effectiveRole = AgentRoleFull
 	}
+	scopes := ScopesForRole(effectiveRole)
 
 	// Merge additional scopes, deduplicating
 	seen := make(map[AgentTokenScope]bool, len(scopes))
@@ -2694,6 +2797,14 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 	s.scheduler.RegisterRecurringSingleton("broker-message-sweep", 5, store.LockBrokerMessageSweep, s.brokerMessageSweepHandler())
 	s.scheduler.RegisterRecurringSingleton("exposed-ports-sweep", 5, store.LockExposedPortsSweep, s.exposedPortsSweepHandler())
 
+	// A2A bridge sweep — conditional on the bridge being registered as a standalone plugin.
+	if a2aExternalURL := s.getA2ABridgeExternalURL(); a2aExternalURL != "" {
+		s.scheduler.RegisterRecurringSingleton(
+			"a2a-bridge-sweep", 5, store.LockA2ABridgeSweep,
+			s.a2aBridgeSweepHandler(a2aExternalURL),
+		)
+	}
+
 	// Register GitHub resolution cache TTL eviction (every 10 minutes)
 	if s.ghResolutionStore != nil {
 		s.scheduler.RegisterRecurringSingleton("github-resolution-cache-eviction", 10, store.LockGitHubResolutionCacheEviction, s.githubResolutionCacheEvictionHandler())
@@ -2724,9 +2835,17 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 		}
 	}
 
-	// Start rate limiter cleanup goroutine (exits when ctx is cancelled).
+	// Start rate limiter cleanup goroutines (exit when ctx is cancelled).
 	if s.gcpTokenRateLimiter != nil {
 		s.gcpTokenRateLimiter.StartCleanup(ctx)
+	}
+	if s.oidcTokenRateLimiter != nil {
+		s.oidcTokenRateLimiter.StartCleanup(ctx)
+	}
+
+	// Start OIDC key cleanup loop to remove expired rotated keys from JWKS.
+	if s.oidcKeyManager != nil {
+		s.oidcKeyManager.StartCleanupLoop(ctx)
 	}
 
 	// Start notification dispatcher (uses the current event publisher).
@@ -3011,6 +3130,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/maintenance/operations/", s.handleAdminMaintenanceOps)
 	s.mux.HandleFunc("/api/v1/admin/maintenance/migrations/", s.handleAdminMaintenanceMigrations)
 	s.mux.HandleFunc("/api/v1/admin/maintenance/check-updates", s.handleCheckForUpdates)
+	s.mux.HandleFunc("/api/v1/admin/maintenance/restart", s.handleAdminRestart)
 	s.mux.HandleFunc("/api/v1/admin/scheduler", s.handleAdminScheduler)
 	s.mux.HandleFunc("/api/v1/admin/allow-list", s.handleAdminAllowList)
 	s.mux.HandleFunc("/api/v1/admin/allow-list/", s.handleAdminAllowListByEmail)
@@ -3095,6 +3215,13 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("/api/v1/system/apple-dns", s.requireWorkstation(http.HandlerFunc(s.handleAppleDNS)))
 	s.mux.Handle("/api/v1/system/registry", s.requireWorkstation(http.HandlerFunc(s.handleSystemRegistry)))
 	s.mux.Handle("/api/v1/system/workstation-settings", s.requireWorkstation(http.HandlerFunc(s.handleWorkstationSettings)))
+
+	// OIDC Identity Provider endpoints (unauthenticated — public metadata)
+	if s.oidcKeyManager != nil {
+		s.mux.HandleFunc("GET /.well-known/openid-configuration", s.handleOIDCDiscovery)
+		s.mux.HandleFunc("GET /.well-known/jwks.json", s.handleJWKS)
+		s.mux.HandleFunc("POST /api/v1/agent/identity-token", s.handleAgentIdentityToken)
+	}
 
 	// Workstation-only filesystem endpoints
 	s.mux.Handle("/api/v1/system/fs/list", s.requireWorkstation(http.HandlerFunc(s.handleFSList)))
@@ -3525,4 +3652,62 @@ func (s *Server) seedGitHubResolutionCacheSettings(ctx context.Context) error {
 
 	slog.Info("Seeded github_resolution_cache settings into hub_settings")
 	return nil
+}
+
+// getA2ABridgeExternalURL returns the external URL of the A2A bridge if it is
+// registered as a standalone plugin, or "" if not configured. Used to
+// conditionally register the Hub-driven sweep scheduler job.
+func (s *Server) getA2ABridgeExternalURL() string {
+	if s.pluginManager == nil {
+		return ""
+	}
+	cfg := s.pluginManager.GetPluginConfig("broker", "a2a-bridge")
+	return cfg["external_url"]
+}
+
+// a2aBridgeSweepHandler returns a recurring handler that POSTs to the bridge's
+// /internal/sweep endpoint with a Hub-minted service JWT. The bridge validates
+// the token and runs the sweep (reap stale tasks + purge old events).
+func (s *Server) a2aBridgeSweepHandler(externalURL string) func(ctx context.Context) {
+	return func(ctx context.Context) {
+		if s.userTokenService == nil {
+			slog.Warn("a2a-bridge-sweep: user token service not available, skipping")
+			return
+		}
+
+		// Mint a short-lived JWT with a service claim. The bridge's
+		// hubJWTAuthMiddleware pins on role=="service" — without this
+		// claim, any valid user token could trigger sweeps.
+		token, _, err := s.userTokenService.GenerateAccessToken(
+			"hub-scheduler",        // userID — synthetic service identity
+			"hub-scheduler@system", // email
+			"Hub Scheduler",        // displayName
+			"service",              // role — the pinned service claim
+			ClientTypeAPI,          // clientType
+		)
+		if err != nil {
+			slog.Error("a2a-bridge-sweep: failed to mint sweep token", "error", err)
+			return
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", externalURL+"/internal/sweep", nil)
+		if err != nil {
+			slog.Error("a2a-bridge-sweep: failed to create request", "error", err)
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		sweepClient := &http.Client{Timeout: 30 * time.Second}
+		resp, err := sweepClient.Do(req)
+		if err != nil {
+			slog.Error("a2a-bridge-sweep: request failed", "error", err)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			slog.Warn("a2a-bridge-sweep: non-200 response",
+				"status", resp.StatusCode, "url", externalURL)
+		}
+	}
 }

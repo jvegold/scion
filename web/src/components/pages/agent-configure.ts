@@ -65,6 +65,7 @@ interface AppliedConfig {
   inlineConfig?: ScionConfigPayload & {
     harness_config?: string;
   };
+  agentRole?: string;
 }
 
 interface AgentWithConfig extends Omit<Agent, 'appliedConfig'> {
@@ -938,6 +939,21 @@ export class ScionPageAgentConfigure extends LitElement {
               <label>Harness Config</label>
               <sl-input .value=${this.harnessConfig} readonly></sl-input>
               <div class="hint">Set at creation time and cannot be changed.</div>
+            </div>
+          `
+        : nothing}
+
+      ${this.agent?.appliedConfig?.agentRole
+        ? html`
+            <div class="form-field">
+              <label>Agent Role</label>
+              <sl-select value=${this.agent.appliedConfig.agentRole} disabled>
+                <sl-option value="none">None — No hub access</sl-option>
+                <sl-option value="readonly">Read-only — Read-only access</sl-option>
+                <sl-option value="baseline">Baseline — Standard access</sl-option>
+                <sl-option value="full">Full — Full access</sl-option>
+              </sl-select>
+              <div class="hint">Authorization role set at creation time. Determines hub API access level.</div>
             </div>
           `
         : nothing}

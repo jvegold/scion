@@ -221,6 +221,10 @@ type ProjectSettings struct {
 	// Default GCP identity for new agents
 	DefaultGCPIdentityMode             string `json:"defaultGCPIdentityMode,omitempty"`             // "block", "passthrough", or "assign"
 	DefaultGCPIdentityServiceAccountID string `json:"defaultGCPIdentityServiceAccountID,omitempty"` // Required when mode is "assign"
+
+	// Agent authorization
+	MaxAgentRole     string `json:"maxAgentRole,omitempty"`
+	DefaultAgentRole string `json:"defaultAgentRole,omitempty"`
 }
 
 // ResolvedHubDefault reports whether a hub-level default exists for a project

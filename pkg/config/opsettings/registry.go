@@ -95,6 +95,7 @@ func init() {
 				"default_max_turns", "default_max_model_calls",
 				"default_max_duration", "default_resources",
 				"default_model", "default_thinking_level",
+				"default_max_agent_role", "default_agent_role",
 			},
 			New: func() any { return &AgentDefaultsSettings{} },
 		},
@@ -125,6 +126,17 @@ func init() {
 			Name:       "project_defaults",
 			KoanfPaths: nil,
 			New:        func() any { return &ProjectDefaultsSettings{} },
+		},
+		{
+			Name: "federation",
+			KoanfPaths: []string{
+				"server.federation.enabled",
+				"server.federation.trusted_issuers",
+				"server.federation.algorithms",
+				"server.federation.refresh_interval",
+				"server.federation.debounce_interval",
+			},
+			New: func() any { return &FederationSettings{} },
 		},
 	}
 
@@ -291,6 +303,8 @@ func compileSchemas() {
 				"default_resources":       getSchemaProperty(root, "default_resources"),
 				"default_model":           map[string]interface{}{"type": "string"},
 				"default_thinking_level":  map[string]interface{}{"type": "integer"},
+				"default_max_agent_role":  getSchemaProperty(root, "default_max_agent_role"),
+				"default_agent_role":      getSchemaProperty(root, "default_agent_role"),
 			},
 			"additionalProperties": false,
 		},
@@ -323,6 +337,40 @@ func compileSchemas() {
 			"type": "object",
 			"properties": map[string]interface{}{
 				"default_scratchpad": map[string]interface{}{"type": "boolean"},
+			},
+			"additionalProperties": false,
+		},
+		// federation schema is hand-written — federation config has no $defs
+		// in settings-v1.schema.json because it is a new Layer-1 section.
+		"federation": {
+			"type": "object",
+			"properties": map[string]interface{}{
+				"enabled": map[string]interface{}{"type": "boolean"},
+				"trusted_issuers": map[string]interface{}{
+					"type": "array",
+					"items": map[string]interface{}{
+						"type":     "object",
+						"required": []string{"issuer_url"},
+						"properties": map[string]interface{}{
+							"issuer_url":         map[string]interface{}{"type": "string", "minLength": 1},
+							"jwks_url":           map[string]interface{}{"type": "string"},
+							"expected_audience":  map[string]interface{}{"type": "string"},
+							"allowed_projects":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+							"allowed_root_users": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+							"default_scopes":     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+							"issuer_type":        map[string]interface{}{"type": "string", "enum": []string{"hub", "service_account", "user"}},
+							"default_role":       map[string]interface{}{"type": "string"},
+							"allowed_emails":     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+						},
+						"additionalProperties": false,
+					},
+				},
+				"algorithms": map[string]interface{}{
+					"type":  "array",
+					"items": map[string]interface{}{"type": "string", "enum": []string{"RS256", "ES256"}},
+				},
+				"refresh_interval":  map[string]interface{}{"type": "string"},
+				"debounce_interval": map[string]interface{}{"type": "string"},
 			},
 			"additionalProperties": false,
 		},

@@ -78,6 +78,7 @@ var (
 	labelFlags            []string
 	modelFlag             string
 	thinkingLevelFlag     int = -1
+	agentRoleFlag         string
 )
 
 func parseLabels(raw []string) (map[string]string, error) {
@@ -323,9 +324,14 @@ func PrintUsingHub(endpoint string) {
 }
 
 // wrapHubError wraps a Hub error with guidance to disable Hub integration.
+// When running inside a hub-managed agent, the local-only mode hint is
+// suppressed because disabling the Hub would break orchestration connectivity.
 func wrapHubError(err error) error {
 	if apiclient.IsUnauthorizedError(err) {
 		return fmt.Errorf("authentication failed, login to hub with 'scion hub auth login'")
+	}
+	if config.IsHubManagedAgent() {
+		return err
 	}
 	return fmt.Errorf("%w\n\nTo use local-only mode, run: scion hub disable", err)
 }
@@ -356,7 +362,11 @@ func GetProjectID(hubCtx *HubContext) (string, error) {
 	// Fall back to git remote lookup
 	gitRemote := util.GetGitRemote()
 	if gitRemote == "" {
-		return "", fmt.Errorf("no git origin remote found for this project.\n\nThe Hub uses the origin remote URL to identify projects.\nRun 'scion hub link' to link this project with the Hub, or use --no-hub for local-only mode")
+		msg := "no git origin remote found for this project.\n\nThe Hub uses the origin remote URL to identify projects.\nRun 'scion hub link' to link this project with the Hub"
+		if !config.IsHubManagedAgent() {
+			msg += ", or use --no-hub for local-only mode"
+		}
+		return "", errors.New(msg)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -746,6 +756,16 @@ func startAgentViaHub(hubCtx *HubContext, agentName, task string, resume bool, i
 		return err
 	}
 
+	// Validate --role flag if provided
+	if agentRoleFlag != "" {
+		switch agentRoleFlag {
+		case "none", "readonly", "baseline", "full":
+			// valid
+		default:
+			return fmt.Errorf("invalid --role value %q: must be one of none, readonly, baseline, full", agentRoleFlag)
+		}
+	}
+
 	// Build create request (Hub creates and starts in one operation)
 	req := &hubclient.CreateAgentRequest{
 		Name:            agentName,
@@ -764,6 +784,7 @@ func startAgentViaHub(hubCtx *HubContext, agentName, task string, resume bool, i
 		Attach:          attach,
 		GatherEnv:       true, // Enable env-gather flow
 		Notify:          !startNoNotify,
+		AgentRole:       agentRoleFlag,
 	}
 
 	// Thread inline config from --config flag into the Hub request.

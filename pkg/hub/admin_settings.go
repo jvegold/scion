@@ -64,11 +64,18 @@ type ServerConfigResponse struct {
 	DefaultModel         string `json:"default_model,omitempty"`
 	DefaultThinkingLevel *int   `json:"default_thinking_level,omitempty"`
 
+	// Default agent authorization
+	DefaultMaxAgentRole string `json:"default_max_agent_role,omitempty"`
+	DefaultAgentRole    string `json:"default_agent_role,omitempty"`
+
 	// AutoInjectGcloudADC controls whether gcloud ADC is injected into agent containers.
 	AutoInjectGcloudADC bool `json:"auto_inject_gcloud_adc,omitempty"`
 
 	// AutoExposePorts controls whether ports are automatically exposed in agent containers.
 	AutoExposePorts *config.AutoExposePortsSettings `json:"auto_expose_ports,omitempty"`
+
+	// Federation holds the federation authentication config for the admin API.
+	Federation *config.V1FederationConfig `json:"federation,omitempty"`
 
 	// EnvOverrides lists koanf keys overridden by SCION_SERVER_* env vars
 	// on this node. Present in both file-mode and DB-mode responses so the
@@ -100,11 +107,18 @@ type ServerConfigUpdateRequest struct {
 	DefaultModel         *string `json:"default_model,omitempty"`
 	DefaultThinkingLevel *int    `json:"default_thinking_level,omitempty"`
 
+	// Default agent authorization
+	DefaultMaxAgentRole *string `json:"default_max_agent_role,omitempty"`
+	DefaultAgentRole    *string `json:"default_agent_role,omitempty"`
+
 	// AutoInjectGcloudADC controls whether gcloud ADC is injected into agent containers.
 	AutoInjectGcloudADC *bool `json:"auto_inject_gcloud_adc,omitempty"`
 
 	// AutoExposePorts controls whether ports are automatically exposed in agent containers.
 	AutoExposePorts *config.AutoExposePortsSettings `json:"auto_expose_ports,omitempty"`
+
+	// Federation holds the federation authentication config update.
+	Federation *config.V1FederationConfig `json:"federation,omitempty"`
 }
 
 // handleAdminServerConfig handles GET/PUT /api/v1/admin/server-config.
@@ -258,8 +272,15 @@ func (s *Server) handleGetServerConfig(w http.ResponseWriter) {
 		DefaultResources:     vs.DefaultResources,
 		DefaultModel:         vs.DefaultModel,
 		DefaultThinkingLevel: vs.DefaultThinkingLevel,
+		DefaultMaxAgentRole:  vs.DefaultMaxAgentRole,
+		DefaultAgentRole:     vs.DefaultAgentRole,
 		AutoInjectGcloudADC:  vs.AutoInjectGcloudADC,
 		AutoExposePorts:      vs.AutoExposePorts,
+	}
+
+	// Populate top-level federation field from the server config.
+	if vs.Server != nil && vs.Server.Federation != nil {
+		resp.Federation = vs.Server.Federation
 	}
 
 	// Env overrides — detect SCION_SERVER_* env vars so the admin UI can
@@ -472,6 +493,20 @@ func applySettingsUpdates(raw map[string]interface{}, req *ServerConfigUpdateReq
 			delete(raw, "default_thinking_level")
 		}
 	}
+	if req.DefaultMaxAgentRole != nil {
+		if *req.DefaultMaxAgentRole != "" {
+			raw["default_max_agent_role"] = *req.DefaultMaxAgentRole
+		} else {
+			delete(raw, "default_max_agent_role")
+		}
+	}
+	if req.DefaultAgentRole != nil {
+		if *req.DefaultAgentRole != "" {
+			raw["default_agent_role"] = *req.DefaultAgentRole
+		} else {
+			delete(raw, "default_agent_role")
+		}
+	}
 	if req.AutoInjectGcloudADC != nil {
 		if *req.AutoInjectGcloudADC {
 			raw["auto_inject_gcloud_adc"] = true
@@ -485,6 +520,14 @@ func applySettingsUpdates(raw map[string]interface{}, req *ServerConfigUpdateReq
 		} else {
 			delete(raw, "auto_expose_ports")
 		}
+	}
+	if req.Federation != nil {
+		serverMap, ok := raw["server"].(map[string]interface{})
+		if !ok {
+			serverMap = make(map[string]interface{})
+			raw["server"] = serverMap
+		}
+		serverMap["federation"] = marshalToMap(req.Federation)
 	}
 }
 
