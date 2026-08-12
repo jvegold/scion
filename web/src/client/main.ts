@@ -183,11 +183,28 @@ const ROUTES: RouteConfig[] = [
   { pattern: /^\/settings$/, tag: 'scion-page-settings', load: () => import('../components/pages/settings.js') },
   { pattern: /^\/settings\/templates\/[^/]+$/, tag: 'scion-page-template-detail', load: () => import('../components/pages/template-detail.js') },
   { pattern: /^\/settings\/harness-configs\/[^/]+$/, tag: 'scion-page-harness-config-detail', load: () => import('../components/pages/harness-config-detail.js') },
+  // Parentless service accounts only (hub and user scope). Project-scoped ones
+  // are managed from their project's settings tab, which is the surface that
+  // computes their capabilities; see the page component for why there is no
+  // /projects/{id}/service-accounts/{id} twin.
+  //
+  // DELIBERATELY NOT IN ADMIN_ROUTES, same as the template and harness-config
+  // detail pages below the /settings umbrella. scion-page-settings IS admin-
+  // gated, so the tab that links here is admin-only in practice; a non-admin
+  // reaching this URL directly gets a read-only page, because every button on
+  // it is rendered from the server's per-account _capabilities and the Hub
+  // already permits any logged-in user to READ a hub-scoped account
+  // (hub-member-read-all; see handlers_gcp_identity.go getGCPServiceAccount).
+  // Adding the tag here would deny a read the API grants, i.e. change who may
+  // read hub-scoped accounts — which is an open policy question, not a routing
+  // decision to settle here.
+  { pattern: /^\/settings\/service-accounts\/[^/]+$/, tag: 'scion-page-gcp-service-account-detail', load: () => import('../components/pages/gcp-service-account-detail.js') },
   { pattern: /^\/profile\/env$/, tag: 'scion-page-profile-env-vars', load: () => import('../components/pages/profile-env-vars.js') },
   { pattern: /^\/profile\/secrets$/, tag: 'scion-page-profile-secrets', load: () => import('../components/pages/profile-secrets.js') },
   { pattern: /^\/profile\/settings$/, tag: 'scion-page-profile-settings', load: () => import('../components/pages/profile-settings.js') },
   { pattern: /^\/profile\/tokens$/, tag: 'scion-page-profile-tokens', load: () => import('../components/pages/profile-tokens.js') },
   { pattern: /^\/profile\/telegram$/, tag: 'scion-page-profile-telegram', load: () => import('../components/pages/profile-telegram.js') },
+  { pattern: /^\/profile\/teams$/, tag: 'scion-page-profile-teams', load: () => import('../components/pages/profile-teams.js') },
   { pattern: /^\/profile\/discord$/, tag: 'scion-page-profile-discord', load: () => import('../components/pages/profile-discord.js') },
   { pattern: /^\/profile\/skills$/, tag: 'scion-page-profile-skills', load: () => import('../components/pages/profile-skills.js') },
   { pattern: /^\/profile$/, tag: 'scion-page-profile-env-vars', load: () => import('../components/pages/profile-env-vars.js') },
@@ -214,7 +231,7 @@ const STANDALONE_ROUTES = new Set(['scion-login-page', 'scion-page-invite', 'sci
 /**
  * Routes that render inside the profile shell instead of the main app shell
  */
-const PROFILE_ROUTES = new Set(['scion-page-profile-env-vars', 'scion-page-profile-secrets', 'scion-page-profile-settings', 'scion-page-profile-tokens', 'scion-page-profile-telegram', 'scion-page-profile-discord', 'scion-page-profile-skills']);
+const PROFILE_ROUTES = new Set(['scion-page-profile-env-vars', 'scion-page-profile-secrets', 'scion-page-profile-settings', 'scion-page-profile-tokens', 'scion-page-profile-telegram', 'scion-page-profile-teams', 'scion-page-profile-discord', 'scion-page-profile-skills']);
 
 /**
  * Routes that require admin role. Non-admin users are redirected to dashboard.

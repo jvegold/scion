@@ -305,6 +305,8 @@ var (
 		{Name: "default_scopes", Type: field.TypeString, Default: ""},
 		{Name: "verified", Type: field.TypeBool, Default: false},
 		{Name: "verified_at", Type: field.TypeTime, Nullable: true},
+		{Name: "verification_status", Type: field.TypeString, Default: "unverified"},
+		{Name: "verification_error", Type: field.TypeString, Default: ""},
 		{Name: "created_by", Type: field.TypeString, Default: ""},
 		{Name: "managed", Type: field.TypeBool, Default: false},
 		{Name: "managed_by", Type: field.TypeString, Default: ""},
@@ -724,6 +726,9 @@ var (
 		{Name: "dispatch_state", Type: field.TypeString, Default: "pending"},
 		{Name: "dispatch_failure_reason", Type: field.TypeString, Nullable: true},
 		{Name: "dispatched_at", Type: field.TypeTime, Nullable: true},
+		{Name: "channel", Type: field.TypeString, Nullable: true, Size: 64},
+		{Name: "thread_id", Type: field.TypeString, Nullable: true, Size: 256},
+		{Name: "visibility", Type: field.TypeString, Nullable: true, Size: 16},
 		{Name: "created", Type: field.TypeTime},
 	}
 	// MessagesTable holds the schema information for the "messages" table.
@@ -745,7 +750,27 @@ var (
 			{
 				Name:    "message_created",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[16]},
+				Columns: []*schema.Column{MessagesColumns[19]},
+			},
+		},
+	}
+	// NonceCacheColumns holds the columns for the "nonce_cache" table.
+	NonceCacheColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "nonce", Type: field.TypeString, Unique: true},
+		{Name: "expires_at", Type: field.TypeTime},
+		{Name: "created_at", Type: field.TypeTime},
+	}
+	// NonceCacheTable holds the schema information for the "nonce_cache" table.
+	NonceCacheTable = &schema.Table{
+		Name:       "nonce_cache",
+		Columns:    NonceCacheColumns,
+		PrimaryKey: []*schema.Column{NonceCacheColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "noncecache_expires_at",
+				Unique:  false,
+				Columns: []*schema.Column{NonceCacheColumns[2]},
 			},
 		},
 	}
@@ -993,6 +1018,8 @@ var (
 		{Name: "endpoint", Type: field.TypeString, Nullable: true},
 		{Name: "created_by", Type: field.TypeString, Nullable: true},
 		{Name: "auto_provide", Type: field.TypeBool, Default: false},
+		{Name: "gcp_host_service_account_email", Type: field.TypeString, Nullable: true},
+		{Name: "gcp_host_project_id", Type: field.TypeString, Nullable: true},
 		{Name: "connected_hub_id", Type: field.TypeString, Nullable: true},
 		{Name: "connected_session_id", Type: field.TypeString, Nullable: true},
 		{Name: "connected_at", Type: field.TypeTime, Nullable: true},
@@ -1457,6 +1484,7 @@ var (
 		MaintenanceOperationsTable,
 		MaintenanceOperationRunsTable,
 		MessagesTable,
+		NonceCacheTable,
 		NotificationsTable,
 		NotificationSubscriptionsTable,
 		PolicyBindingsTable,
@@ -1542,6 +1570,9 @@ func init() {
 	}
 	MessagesTable.Annotation = &entsql.Annotation{
 		Table: "messages",
+	}
+	NonceCacheTable.Annotation = &entsql.Annotation{
+		Table: "nonce_cache",
 	}
 	NotificationsTable.Annotation = &entsql.Annotation{
 		Table: "notifications",

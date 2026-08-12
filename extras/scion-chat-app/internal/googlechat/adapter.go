@@ -20,7 +20,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
+	"net"
 	"net/http"
+	"net/textproto"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -28,8 +33,9 @@ import (
 )
 
 const (
-	PlatformName = "google_chat"
-	chatAPIBase  = "https://chat.googleapis.com/v1"
+	PlatformName  = "google_chat"
+	chatAPIBase   = "https://chat.googleapis.com/v1"
+	uploadAPIBase = "https://chat.googleapis.com/upload/v1"
 )
 
 // EventHandler processes normalized chat events and returns an optional synchronous response.
@@ -37,6 +43,7 @@ type EventHandler func(ctx context.Context, event *chatapp.ChatEvent) (*chatapp.
 
 // Adapter implements the chatapp.Messenger interface for Google Chat.
 type Adapter struct {
+	config       Config
 	projectID    string
 	externalURL  string
 	commandIDs   map[string]string // command ID → command name
@@ -44,6 +51,9 @@ type Adapter struct {
 	eventHandler EventHandler
 	httpClient   *http.Client // authenticated client for Chat API calls
 	log          *slog.Logger
+
+	pubsubIngress *PubSubIngress
+	pubsubCancel  context.CancelFunc
 
 	mu     sync.RWMutex
 	spaces map[string]bool // tracked spaces
@@ -57,6 +67,8 @@ type Config struct {
 	CommandIDMap        map[string]string // Console command ID → command name
 	ListenAddress       string
 	Credentials         string // Path to service account key
+	IngressMode         string // "http" (default) or "pubsub"
+	PubSubSubscription  string // Pub/Sub subscription resource name
 }
 
 // NewAdapter creates a new Google Chat adapter.
@@ -68,7 +80,11 @@ func NewAdapter(cfg Config, handler EventHandler, httpClient *http.Client, log *
 	if cmdIDs == nil {
 		cmdIDs = make(map[string]string)
 	}
+	if log == nil {
+		log = slog.Default()
+	}
 	return &Adapter{
+		config:       cfg,
 		projectID:    cfg.ProjectID,
 		externalURL:  cfg.ExternalURL,
 		commandIDs:   cmdIDs,
@@ -79,8 +95,25 @@ func NewAdapter(cfg Config, handler EventHandler, httpClient *http.Client, log *
 	}
 }
 
-// Start begins serving the HTTP webhook endpoint for Google Chat events.
+// Start begins serving events. When ingress_mode is "pubsub", events arrive
+// via Cloud Pub/Sub. Otherwise the default HTTP webhook endpoint is used.
 func (a *Adapter) Start(listenAddr string) error {
+	mode := a.config.IngressMode
+	switch mode {
+	case "pubsub":
+		return a.startPubSub(listenAddr)
+	case "http", "":
+		if a.config.PubSubSubscription != "" {
+			a.log.Warn("pubsub_subscription is set but ingress_mode is not \"pubsub\"; subscription will be ignored")
+		}
+		return a.startHTTP(listenAddr)
+	default:
+		return fmt.Errorf("unknown ingress_mode %q: must be \"http\" or \"pubsub\"", mode)
+	}
+}
+
+// startHTTP serves the HTTP webhook endpoint for Google Chat events.
+func (a *Adapter) startHTTP(listenAddr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /chat/events", a.handleEvent)
 	mux.HandleFunc("GET /chat/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -97,12 +130,74 @@ func (a *Adapter) Start(listenAddr string) error {
 	return a.httpServer.ListenAndServe()
 }
 
-// Stop gracefully shuts down the webhook server.
+// startPubSub creates a Pub/Sub client and starts the PubSubIngress.
+// A minimal HTTP health server is started alongside the subscriber so that
+// Kubernetes liveness/readiness probes have an endpoint to hit.
+func (a *Adapter) startPubSub(listenAddr string) error {
+	sub := a.config.PubSubSubscription
+	if sub == "" {
+		return fmt.Errorf("pubsub ingress mode requires pubsub_subscription to be set")
+	}
+	ingress, err := NewPubSubIngress(sub, a, a.config.Credentials, a.log)
+	if err != nil {
+		return fmt.Errorf("creating pubsub ingress: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.pubsubCancel = cancel
+	a.pubsubIngress = ingress
+
+	// Bind to the port synchronously to catch startup errors.
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("starting health server listener: %w", err)
+	}
+
+	// Start a minimal health endpoint for probes.
+	a.startHealthServer(ln)
+
+	a.log.Info("starting pubsub ingress", "subscription", sub)
+	return ingress.Start(ctx)
+}
+
+// Stop gracefully shuts down the adapter, covering both HTTP and Pub/Sub modes.
 func (a *Adapter) Stop(ctx context.Context) error {
+	if a.pubsubCancel != nil {
+		a.pubsubCancel()
+	}
+	if a.pubsubIngress != nil {
+		if err := a.pubsubIngress.Stop(); err != nil {
+			a.log.Error("stopping pubsub ingress", "error", err)
+		}
+	}
 	if a.httpServer != nil {
 		return a.httpServer.Shutdown(ctx)
 	}
 	return nil
+}
+
+// startHealthServer starts a minimal HTTP server exposing /healthz for
+// liveness/readiness probes. It is used in Pub/Sub mode where no other
+// HTTP server is running. The listener is pre-bound so that port conflicts
+// are caught synchronously during startup.
+func (a *Adapter) startHealthServer(ln net.Listener) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	})
+
+	a.httpServer = &http.Server{
+		Handler: mux,
+	}
+
+	go func() {
+		a.log.Info("health server starting (pubsub mode)", "address", ln.Addr().String())
+		if err := a.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			a.log.Error("health server error", "error", err)
+		}
+	}()
 }
 
 // handleEvent processes incoming Google Chat Workspace Add-on events.
@@ -406,6 +501,19 @@ type rawMessage struct {
 	Thread       *rawThread       `json:"thread,omitempty"`
 	Annotations  []rawAnnotation  `json:"annotations,omitempty"`
 	SlashCommand *rawSlashCommand `json:"slashCommand,omitempty"`
+	Attachment   []rawAttachment  `json:"attachment,omitempty"`
+}
+
+type rawAttachment struct {
+	Name              string                `json:"name"`
+	ContentName       string                `json:"contentName"`
+	ContentType       string                `json:"contentType"`
+	DownloadURI       string                `json:"downloadUri"`
+	AttachmentDataRef *rawAttachmentDataRef `json:"attachmentDataRef,omitempty"`
+}
+
+type rawAttachmentDataRef struct {
+	ResourceName string `json:"resourceName"`
 }
 
 type rawSlashCommand struct {
@@ -503,6 +611,7 @@ func (a *Adapter) normalizeEvent(raw *rawEvent) *chatapp.ChatEvent {
 		}
 		if p.Message != nil {
 			event.Args = strings.TrimSpace(p.Message.ArgumentText)
+			event.MessageName = p.Message.Name
 			if p.Message.Thread != nil {
 				event.ThreadID = p.Message.Thread.Name
 			}
@@ -517,9 +626,12 @@ func (a *Adapter) normalizeEvent(raw *rawEvent) *chatapp.ChatEvent {
 		if p.Space != nil {
 			event.SpaceID = p.Space.Name
 		}
+		event.MessageName = p.Message.Name
 		if p.Message.Thread != nil {
 			event.ThreadID = p.Message.Thread.Name
 		}
+		// Extract attachments from message.
+		event.Attachments = extractAttachments(p.Message)
 		if p.Message.SlashCommand != nil {
 			event.Type = chatapp.EventCommand
 			cmdID := p.Message.SlashCommand.CommandId.String()
@@ -544,8 +656,11 @@ func (a *Adapter) normalizeEvent(raw *rawEvent) *chatapp.ChatEvent {
 		if p.Space != nil {
 			event.SpaceID = p.Space.Name
 		}
-		if p.Message != nil && p.Message.Thread != nil {
-			event.ThreadID = p.Message.Thread.Name
+		if p.Message != nil {
+			event.MessageName = p.Message.Name
+			if p.Message.Thread != nil {
+				event.ThreadID = p.Message.Thread.Name
+			}
 		}
 		event.IsDialogEvent = p.IsDialogEvent
 
@@ -597,6 +712,29 @@ func commandNameFromText(msg *rawMessage) string {
 	return "scion"
 }
 
+// extractAttachments converts raw message attachments to normalized EventAttachment structs.
+func extractAttachments(msg *rawMessage) []chatapp.EventAttachment {
+	if msg == nil || len(msg.Attachment) == 0 {
+		return nil
+	}
+	var attachments []chatapp.EventAttachment
+	for _, a := range msg.Attachment {
+		if a.DownloadURI == "" {
+			continue
+		}
+		name := a.ContentName
+		if name == "" {
+			name = filepath.Base(a.Name)
+		}
+		attachments = append(attachments, chatapp.EventAttachment{
+			Name:        name,
+			ContentType: a.ContentType,
+			DownloadURI: a.DownloadURI,
+		})
+	}
+	return attachments
+}
+
 // getParameters extracts action parameters from commonEventObject.
 func (a *Adapter) getParameters(raw *rawEvent) map[string]string {
 	if raw.CommonEventObject != nil && raw.CommonEventObject.Parameters != nil {
@@ -629,6 +767,8 @@ func (a *Adapter) getFormInputs(raw *rawEvent) map[string]string {
 }
 
 // SendMessage sends a text or card message to a Google Chat space.
+// If the request includes attachments, each file is uploaded via UploadMedia
+// and attached to the message.
 func (a *Adapter) SendMessage(ctx context.Context, req chatapp.SendMessageRequest) (string, error) {
 	payload := map[string]any{}
 
@@ -648,14 +788,53 @@ func (a *Adapter) SendMessage(ctx context.Context, req chatapp.SendMessageReques
 		}
 	}
 
+	// Upload attachments and include references in the message.
+	if len(req.Attachments) > 0 {
+		var attachmentRefs []map[string]any
+		var failedAttachments []string
+		for _, att := range req.Attachments {
+			resourceName, uploadErr := a.uploadAttachment(ctx, req.SpaceID, att)
+			if uploadErr != nil {
+				a.log.Error("failed to upload attachment",
+					"filename", att.Filename,
+					"error", uploadErr,
+				)
+				failedAttachments = append(failedAttachments, att.Filename)
+				continue
+			}
+			attachmentRefs = append(attachmentRefs, map[string]any{
+				"attachmentDataRef": map[string]string{
+					"resourceName": resourceName,
+				},
+			})
+		}
+		if len(attachmentRefs) > 0 {
+			payload["attachment"] = attachmentRefs
+		}
+		// Surface upload failures in the message text so recipients know
+		// an attachment was intended but could not be delivered.
+		if len(failedAttachments) > 0 {
+			errNote := "\n\n_[Failed to upload: " + strings.Join(failedAttachments, ", ") + "]_"
+			if existing, ok := payload["text"].(string); ok {
+				payload["text"] = existing + errNote
+			} else {
+				payload["text"] = errNote
+			}
+		}
+	}
+
 	if req.ThreadID != "" {
 		payload["thread"] = map[string]string{
 			"name": req.ThreadID,
 		}
+	} else if req.ThreadKey != "" {
+		payload["thread"] = map[string]string{
+			"threadKey": req.ThreadKey,
+		}
 	}
 
 	url := fmt.Sprintf("%s/%s/messages", chatAPIBase, req.SpaceID)
-	if req.ThreadID != "" {
+	if req.ThreadID != "" || req.ThreadKey != "" {
 		url += "?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
 	}
 
@@ -664,6 +843,7 @@ func (a *Adapter) SendMessage(ctx context.Context, req chatapp.SendMessageReques
 		"thread", req.ThreadID,
 		"has_text", hasText,
 		"has_card", hasCard,
+		"has_attachments", len(req.Attachments) > 0,
 		"text_len", len(req.Text),
 	)
 
@@ -681,6 +861,35 @@ func (a *Adapter) SendMessage(ctx context.Context, req chatapp.SendMessageReques
 	}
 	a.log.Info("async message sent", "message_id", result.Name, "space", req.SpaceID)
 	return result.Name, nil
+}
+
+// uploadAttachment opens a local file (or reads from URL) and uploads it via UploadMedia.
+// Returns the attachment resource name. Enforces the 25 MB size limit.
+func (a *Adapter) uploadAttachment(ctx context.Context, spaceID string, att chatapp.Attachment) (string, error) {
+	if att.Path == "" {
+		return "", fmt.Errorf("attachment has no path")
+	}
+
+	fi, err := os.Stat(att.Path)
+	if err != nil {
+		return "", fmt.Errorf("stat attachment %q: %w", att.Path, err)
+	}
+	if fi.Size() > chatapp.MaxAttachmentSize {
+		return "", fmt.Errorf("attachment %q too large (%d bytes, max %d)", att.Filename, fi.Size(), chatapp.MaxAttachmentSize)
+	}
+
+	f, err := os.Open(att.Path)
+	if err != nil {
+		return "", fmt.Errorf("open attachment %q: %w", att.Path, err)
+	}
+	defer f.Close()
+
+	filename := att.Filename
+	if filename == "" {
+		filename = filepath.Base(att.Path)
+	}
+
+	return a.UploadMedia(ctx, spaceID, filename, f)
 }
 
 // SendCard sends a card-only message to a Google Chat space.
@@ -742,6 +951,140 @@ func (a *Adapter) SetAgentIdentity(ctx context.Context, agent chatapp.AgentIdent
 	return nil
 }
 
+// UploadMedia uploads a file to a Google Chat space and returns the attachment
+// resource name for inclusion in messages.
+//
+// The upload uses the media.upload endpoint with multipart/related containing:
+//   - Part 1: JSON metadata with the filename (Content-Type: application/json)
+//   - Part 2: File content (Content-Type: application/octet-stream)
+//
+// The multipart body is streamed via io.Pipe to avoid buffering the entire file
+// in memory.
+//
+// See https://developers.google.com/workspace/chat/api/reference/rest/v1/media/upload
+func (a *Adapter) UploadMedia(ctx context.Context, spaceID, filename string, content io.Reader) (string, error) {
+	url := fmt.Sprintf("%s/%s/attachments:upload", uploadAPIBase, spaceID)
+	return a.uploadMediaToURL(ctx, url, filename, content)
+}
+
+// uploadMediaToURL performs the actual multipart/related upload to the given URL.
+// Extracted from UploadMedia to allow tests to provide a test-server URL.
+func (a *Adapter) uploadMediaToURL(ctx context.Context, url, filename string, content io.Reader) (string, error) {
+	// Use io.Pipe to stream the multipart body without buffering the entire
+	// file in memory.
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+	contentType := fmt.Sprintf("multipart/related; boundary=%s", writer.Boundary())
+
+	// Write multipart parts in a goroutine so the HTTP request can read from
+	// the pipe reader concurrently.
+	errChan := make(chan error, 1)
+	go func() {
+		var writeErr error
+		defer func() {
+			if writeErr != nil {
+				pw.CloseWithError(writeErr)
+			} else {
+				pw.Close()
+			}
+			errChan <- writeErr
+		}()
+
+		// Part 1: JSON metadata.
+		metaHeader := make(textproto.MIMEHeader)
+		metaHeader.Set("Content-Type", "application/json")
+		metaPart, err := writer.CreatePart(metaHeader)
+		if err != nil {
+			writeErr = fmt.Errorf("creating metadata part: %w", err)
+			return
+		}
+		metadata := map[string]string{"filename": filename}
+		if err := json.NewEncoder(metaPart).Encode(metadata); err != nil {
+			writeErr = fmt.Errorf("encoding metadata: %w", err)
+			return
+		}
+
+		// Part 2: file content with explicit Content-Type header.
+		fileHeader := make(textproto.MIMEHeader)
+		fileHeader.Set("Content-Type", "application/octet-stream")
+		filePart, err := writer.CreatePart(fileHeader)
+		if err != nil {
+			writeErr = fmt.Errorf("creating file part: %w", err)
+			return
+		}
+		if _, err := io.Copy(filePart, content); err != nil {
+			writeErr = fmt.Errorf("copying file content: %w", err)
+			return
+		}
+
+		if err := writer.Close(); err != nil {
+			writeErr = fmt.Errorf("closing multipart writer: %w", err)
+		}
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, pr)
+	if err != nil {
+		return "", fmt.Errorf("creating upload request: %w", err)
+	}
+	req.Header.Set("Content-Type", contentType)
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("uploading media: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check for errors from the writer goroutine.
+	if writeErr := <-errChan; writeErr != nil {
+		return "", writeErr
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading upload response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("upload failed (HTTP %d): %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		AttachmentDataRef struct {
+			ResourceName string `json:"resourceName"`
+		} `json:"attachmentDataRef"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("parsing upload response: %w", err)
+	}
+
+	a.log.Info("uploaded media to Google Chat",
+		"url", url,
+		"filename", filename,
+		"resource_name", result.AttachmentDataRef.ResourceName,
+	)
+	return result.AttachmentDataRef.ResourceName, nil
+}
+
+// DownloadAttachment downloads a file from a Google Chat attachment download URI.
+// The download requires authentication, which is handled by the adapter's httpClient.
+func (a *Adapter) DownloadAttachment(ctx context.Context, downloadURI string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURI, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating download request: %w", err)
+	}
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("downloading attachment: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("download failed (HTTP %d)", resp.StatusCode)
+	}
+
+	return resp.Body, nil
+}
+
 // renderCardV2 converts a platform-agnostic Card to Google Chat Cards V2 format.
 // Action IDs are moved into parameters and the function is set to the external URL.
 func (a *Adapter) renderCardV2(card *chatapp.Card) map[string]any {
@@ -788,7 +1131,7 @@ func (a *Adapter) renderCardV2(card *chatapp.Card) map[string]any {
 		for _, act := range card.Actions {
 			btn := map[string]any{
 				"text":    act.Label,
-				"onClick": a.actionOnClick(act.ActionID),
+				"onClick": a.resolveOnClick(act.ActionID),
 			}
 			if act.Style == "danger" {
 				btn["color"] = map[string]any{
@@ -819,6 +1162,15 @@ func (a *Adapter) renderCardV2(card *chatapp.Card) map[string]any {
 	return c
 }
 
+// resolveOnClick returns an openLink onClick when the actionID starts with
+// "link." (the remainder is the URL), or a callback action otherwise.
+func (a *Adapter) resolveOnClick(actionID string) map[string]any {
+	if strings.HasPrefix(actionID, "link.") {
+		return a.openLinkOnClick(strings.TrimPrefix(actionID, "link."))
+	}
+	return a.actionOnClick(actionID)
+}
+
 // actionOnClick builds an onClick action with the full external URL and action ID in parameters.
 func (a *Adapter) actionOnClick(actionID string) map[string]any {
 	return map[string]any{
@@ -827,6 +1179,15 @@ func (a *Adapter) actionOnClick(actionID string) map[string]any {
 			"parameters": []any{
 				map[string]any{"key": "action", "value": actionID},
 			},
+		},
+	}
+}
+
+// openLinkOnClick builds an onClick that opens a URL in a new tab.
+func (a *Adapter) openLinkOnClick(url string) map[string]any {
+	return map[string]any{
+		"openLink": map[string]any{
+			"url": url,
 		},
 	}
 }
@@ -851,7 +1212,7 @@ func (a *Adapter) renderWidget(w *chatapp.Widget) map[string]any {
 	case chatapp.WidgetButton:
 		btn := map[string]any{
 			"text":    w.Label,
-			"onClick": a.actionOnClick(w.ActionID),
+			"onClick": a.resolveOnClick(w.ActionID),
 		}
 		return map[string]any{
 			"buttonList": map[string]any{

@@ -45,6 +45,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/imagecheck"
+	"github.com/GoogleCloudPlatform/scion/pkg/lifecyclehooks"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dbmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dispatchmetrics"
@@ -198,6 +199,15 @@ type ServerConfig struct {
 	SecretBackend secret.SecretBackend
 	// MaintenanceConfig holds configuration for routine maintenance operations.
 	MaintenanceConfig MaintenanceConfig
+	// GCPIAMCheckMode controls whether IAM actAs permission is checked when
+	// binding a GCP service account to an agent.
+	// "off" (default) or "enforce". See sa_assign_gate.go for the constants.
+	GCPIAMCheckMode string
+	// GCPIAMDenyUnknownPolicy controls behavior when the Policy Troubleshooter
+	// cannot evaluate deny policies (e.g., Hub SA lacks org-level permissions).
+	// "fail-open" (default): if allow is granted and deny is unknown, treat as
+	// allowed. "fail-closed": treat as indeterminate (denied).
+	GCPIAMDenyUnknownPolicy string
 	// GCPProjectID is the GCP project ID used for minting service accounts.
 	// If empty, auto-detected from the metadata server when running on GCE/Cloud Run.
 	GCPProjectID string
@@ -236,6 +246,8 @@ type ServerConfig struct {
 	// DevUserConfig holds optional identity overrides for the development user.
 	DevUserConfig DevUserConfig
 
+	// OIDCLogin holds configuration for an external OIDC provider for web login.
+	OIDCLogin config.OIDCLoginConfig
 	// OIDCConfig holds configuration for the OIDC Identity Provider feature.
 	// When Enabled, the hub initializes an OIDCKeyManager and exposes OIDC endpoints.
 	OIDCConfig config.OIDCProviderConfig
@@ -733,6 +745,26 @@ type Server struct {
 	// GCP IAM admin for minting service accounts (nil = minting disabled)
 	gcpIAMAdmin GCPServiceAccountAdmin
 
+	// Caller-permission checker for the agent service-account assignment
+	// surface, and the mode gating whether it is consulted. Both are ALWAYS
+	// set explicitly in NewServer — nil is a wiring bug and denies, it is not
+	// a way to switch the check off. Turning the check off is done by
+	// installing store.NewDisabledCallerPermissionChecker, which is a value
+	// somebody has to construct and pass. See saAssignCheckerFor.
+	saAssignChecker     store.CallerPermissionChecker
+	saAssignCheckMode   string
+	denyUnknownFailOpen bool
+
+	// The same pair for the lifecycle-hook execution-identity surface. A
+	// SEPARATE field rather than a shared one, deliberately: the two surfaces
+	// degrade differently when the check is off (agent assign falls back to
+	// policy-gated, hook identity falls back to ungated), so an operator must
+	// be able to reason about — and eventually enable — them independently.
+	// Sharing one field would make that impossible and would hide the
+	// difference behind a single innocuous-looking setting.
+	hookIdentityChecker   store.CallerPermissionChecker
+	hookIdentityCheckMode string
+
 	// GCP token rate limiter (nil = no rate limiting)
 	gcpTokenRateLimiter *GCPTokenRateLimiter
 
@@ -817,6 +849,11 @@ type Server struct {
 
 	// ghResolutionStore is the DB-backed GitHub skill resolution cache (nil when entClient is nil).
 	ghResolutionStore *GitHubResolutionStore
+
+	// nonceCacheStore is the DB-backed HMAC nonce replay cache (nil when entClient is nil).
+	// When set, it replaces the in-memory NonceCache in BrokerAuthService for
+	// cross-instance replay protection.
+	nonceCacheStore *NonceCacheStore
 }
 
 // groupsLogger returns the groups subsystem logger, falling back to
@@ -982,14 +1019,27 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// Initialize Teams link service
 	srv.teamsLinkService = NewTeamsLinkService()
 
-	// Initialize OAuth service if configured
-	if cfg.OAuthConfig.IsConfigured() {
-		srv.oauthService = NewOAuthService(cfg.OAuthConfig)
+	// Validate OIDC login configuration at startup (fail fast).
+	if cfg.OIDCLogin.Enabled {
+		if err := validateOIDCLoginConfig(&cfg.OIDCLogin); err != nil {
+			return nil, fmt.Errorf("invalid OIDC login configuration: %w", err)
+		}
+	}
+
+	// Initialize OAuth service if configured (traditional OAuth or OIDC login)
+	oidcLoginCfg := &cfg.OIDCLogin // may be zero-value (Enabled=false)
+	if cfg.OAuthConfig.IsConfigured() || cfg.OIDCLogin.Enabled {
+		srv.oauthService = NewOAuthService(cfg.OAuthConfig, oidcLoginCfg)
 		slog.Info("OAuth service initialized")
 		// Log which providers are configured
 		logOAuthProviders("Web", cfg.OAuthConfig.Web)
 		logOAuthProviders("CLI", cfg.OAuthConfig.CLI)
 		logOAuthProviders("Device", cfg.OAuthConfig.Device)
+		if cfg.OIDCLogin.Enabled {
+			slog.Info("OIDC login provider configured",
+				"displayName", cfg.OIDCLogin.DisplayName,
+				"issuerUrl", cfg.OIDCLogin.IssuerURL)
+		}
 	} else {
 		slog.Info("OAuth service NOT configured - no providers available")
 		slog.Info("To enable OAuth, set environment variables SCION_SERVER_OAUTH_CLI_GOOGLE_CLIENTID, etc.")
@@ -1051,6 +1101,10 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		} else {
 			srv.oidcKeyManager = oidcMgr
 			srv.oidcIssuerURL = oidcIssuerURL
+
+			// Start background loops for key cleanup and cross-instance refresh.
+			oidcMgr.StartCleanupLoop(ctx)
+			oidcMgr.StartRefreshLoop(ctx)
 
 			// OIDC identity token lifetime: use config if set, else default 15m
 			srv.oidcTokenLifetime = 15 * time.Minute
@@ -1131,8 +1185,86 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// Initialize authorization service
 	srv.authzService = NewAuthzService(s, logging.Subsystem("hub.auth"))
 
+	// Wire the caller-permission checker for agent service-account assignment.
+	//
+	// GCP IAM check mode: read from config, default to "off" (Q1 ruling).
+	// When "enforce", the PT checker (wired later in server_foreground.go)
+	// gates SA assignment. The disabled checker installed here is the default
+	// until a real checker replaces it via SetSAAssignChecker.
+	//
+	// Installed explicitly rather than left nil on purpose: a nil checker
+	// denies, so "forgot to wire it" and "chose to switch it off" cannot be
+	// confused for one another. See NewDisabledCallerPermissionChecker.
+	gcpIAMMode := cfg.GCPIAMCheckMode
+	switch gcpIAMMode {
+	case SAAssignCheckEnforce:
+		srv.saAssignCheckMode = SAAssignCheckEnforce
+		srv.hookIdentityCheckMode = SAAssignCheckEnforce
+	case SAAssignCheckOff, "":
+		srv.saAssignCheckMode = SAAssignCheckOff
+		srv.hookIdentityCheckMode = SAAssignCheckOff
+	default:
+		slog.Warn("unrecognised gcpIamCheckMode value, defaulting to off",
+			"value", gcpIAMMode)
+		srv.saAssignCheckMode = SAAssignCheckOff
+		srv.hookIdentityCheckMode = SAAssignCheckOff
+	}
+
+	// Parse deny-unknown fallback policy (default: fail-open).
+	srv.denyUnknownFailOpen = true
+	switch cfg.GCPIAMDenyUnknownPolicy {
+	case "fail-closed":
+		srv.denyUnknownFailOpen = false
+	case "fail-open", "":
+		srv.denyUnknownFailOpen = true
+	default:
+		slog.Warn("unrecognised gcpIamDenyUnknownPolicy value, defaulting to fail-open",
+			"value", cfg.GCPIAMDenyUnknownPolicy)
+	}
+	slog.Info("GCP deny-unknown fallback policy",
+		"policy", cfg.GCPIAMDenyUnknownPolicy,
+		"failOpen", srv.denyUnknownFailOpen)
+
+	srv.saAssignChecker = store.NewDisabledCallerPermissionChecker()
+	if srv.saAssignCheckMode == SAAssignCheckOff {
+		// Names the SURFACE and what it degrades to, not the feature. The same
+		// disabled checker means "policy-gated only" here and "ungated"
+		// elsewhere; a message about "the IAM check" would mislead about the
+		// other one.
+		slog.Warn("GCP caller-permission checking is OFF for agent service-account assignment: "+
+			"assignment is gated by Hub policy only, and no caller is checked for "+
+			store.PermissionActAs+" on the target account",
+			"surface", SurfaceAgentAssign, "mode", srv.saAssignCheckMode)
+	} else {
+		slog.Info("GCP caller-permission checking is ENFORCE for agent service-account assignment",
+			"surface", SurfaceAgentAssign, "mode", srv.saAssignCheckMode)
+	}
+
+	// Same wiring for the lifecycle-hook execution-identity surface, installed
+	// separately because it degrades to something strictly worse. See the
+	// field comment and SurfaceHookExecutionIdentity.
+	srv.hookIdentityChecker = store.NewDisabledCallerPermissionChecker()
+	if srv.hookIdentityCheckMode == SAAssignCheckOff {
+		slog.Warn("GCP caller-permission checking is OFF for lifecycle-hook execution identity: "+
+			"any caller who may write a hook may run it as any in-scope verified service account, "+
+			"and no caller is checked for "+store.PermissionActAs+" on it. Unlike agent "+
+			"service-account assignment, this surface has NO second policy layer to fall back on",
+			"surface", lifecyclehooks.SurfaceHookExecutionIdentity,
+			"mode", srv.hookIdentityCheckMode)
+	} else {
+		slog.Info("GCP caller-permission checking is ENFORCE for lifecycle-hook execution identity",
+			"surface", lifecyclehooks.SurfaceHookExecutionIdentity,
+			"mode", srv.hookIdentityCheckMode)
+	}
+
 	// Seed default policies and groups (idempotent)
 	seedDefaultPoliciesAndGroups(ctx, s)
+
+	// Backfill the per-project service-account assign policy onto projects
+	// that predate it (idempotent). Projects nobody touches never run
+	// createProjectMembersGroupAndPolicy again, so without this their members
+	// would silently lose assign when the gate moves to ActionAssign.
+	backfillProjectAssignPolicies(ctx, s)
 
 	// Seed the dev user when dev-auth is enabled so that Ent FK constraints
 	// on owner_id are satisfied when the dev user creates projects/groups.
@@ -1201,6 +1333,7 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		AgentTokenSvc:      srv.agentTokenService,
 		UserTokenSvc:       srv.userTokenService,
 		UATSvc:             srv.uatService,
+		BrokerAuthSvc:      srv.brokerAuthService,
 		TrustedProxies:     cfg.TrustedProxies,
 		ProxyAuthenticator: cfg.ProxyAuth,
 		FederationAuth:     &srv.federationAuth,
@@ -1741,6 +1874,13 @@ func (s *Server) SetIntegrationHA(dbDriver string, client *ent.Client, dsn strin
 		s.ghResolutionStore = NewGitHubResolutionStore(client)
 	}
 
+	// Initialize DB-backed nonce cache store and wire it into the broker auth
+	// service for cross-instance HMAC replay protection.
+	if client != nil && s.brokerAuthService != nil {
+		s.nonceCacheStore = NewNonceCacheStore(client)
+		s.brokerAuthService.SetNonceCacheStore(s.nonceCacheStore)
+	}
+
 	s.mu.Unlock()
 
 	if client != nil {
@@ -1946,6 +2086,62 @@ func (s *Server) SetGCPServiceAccountAdmin(a GCPServiceAccountAdmin) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcpIAMAdmin = a
+}
+
+// DenyUnknownFailOpen returns the configured deny-unknown fallback policy.
+// Used by server_foreground.go to pass the setting to the PT checker constructor.
+func (s *Server) DenyUnknownFailOpen() bool {
+	return s.denyUnknownFailOpen
+}
+
+// SetSAAssignChecker replaces the caller-permission checker for the agent
+// service-account assignment surface. Both SetSAAssignChecker and
+// SetHookIdentityChecker should typically be called with the same cached
+// checker instance so that the two surfaces share one cache.
+func (s *Server) SetSAAssignChecker(c store.CallerPermissionChecker) {
+	s.mu.Lock()
+	old := s.saAssignChecker
+	s.saAssignChecker = c
+	s.mu.Unlock()
+
+	// Drain stale entries from the outgoing checker. Entries cached under the
+	// old checker's inner would produce decisions against the wrong backend
+	// if the reference leaked (it shouldn't, but belt-and-suspenders).
+	if cc, ok := old.(*CachedCallerPermissionChecker); ok {
+		cc.InvalidateAll()
+	}
+}
+
+// SetHookIdentityChecker replaces the caller-permission checker for the
+// lifecycle-hook execution-identity surface.
+func (s *Server) SetHookIdentityChecker(c store.CallerPermissionChecker) {
+	s.mu.Lock()
+	old := s.hookIdentityChecker
+	s.hookIdentityChecker = c
+	s.mu.Unlock()
+
+	// Drain stale entries — same rationale as SetSAAssignChecker.
+	if cc, ok := old.(*CachedCallerPermissionChecker); ok {
+		cc.InvalidateAll()
+	}
+}
+
+// invalidateActAsCache removes cached actAs decisions for a specific SA.
+// Called after SA deletion and Hub-initiated IAM mutations (mint path).
+// No-op if the configured checkers do not support invalidation (e.g.
+// DisabledCallerPermissionChecker when gcpIamCheckMode=off).
+func (s *Server) invalidateActAsCache(saEmail string) {
+	s.mu.RLock()
+	assignChecker := s.saAssignChecker
+	hookChecker := s.hookIdentityChecker
+	s.mu.RUnlock()
+
+	if c, ok := assignChecker.(*CachedCallerPermissionChecker); ok {
+		c.InvalidateForSA(saEmail)
+	}
+	if c, ok := hookChecker.(*CachedCallerPermissionChecker); ok {
+		c.InvalidateForSA(saEmail)
+	}
 }
 
 // SetGCPProjectID sets the GCP project ID used for minting service accounts.
@@ -2819,6 +3015,11 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 		s.scheduler.RegisterRecurringSingleton("github-resolution-cache-eviction", 10, store.LockGitHubResolutionCacheEviction, s.githubResolutionCacheEvictionHandler())
 	}
 
+	// Register HMAC nonce cache TTL eviction (every 5 minutes)
+	if s.nonceCacheStore != nil {
+		s.scheduler.RegisterRecurringSingleton("nonce-cache-eviction", 5, store.LockNonceCacheEviction, s.nonceCacheEvictionHandler())
+	}
+
 	// Register GitHub App health check if the app is configured
 	s.mu.RLock()
 	ghAppConfigured := s.config.GitHubAppConfig.AppID != 0
@@ -3078,6 +3279,20 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/templates", s.handleTemplatesV2)
 	s.mux.HandleFunc("/api/v1/templates/", s.handleTemplateByIDV2)
 
+	// Scope-addressed service accounts. The project-nested routes under
+	// /api/v1/projects/{id}/gcp-service-accounts remain registered and
+	// unchanged; these routes exist for scopes that have no project to nest
+	// under.
+	//
+	// The by-id subtree serves PARENTLESS accounts only -- hub and user scope.
+	// A project-scoped account is 404 there, so this is not a second address
+	// for accounts that already have one; it is the only address for accounts
+	// that have none. P4 registered the collection alone because it only
+	// needed to list; P5 needs to view, re-verify and delete a hub-scoped
+	// account from a UI and a CLI that are not inside any project.
+	s.mux.HandleFunc("/api/v1/gcp-service-accounts", s.handleGCPServiceAccounts)
+	s.mux.HandleFunc("/api/v1/gcp-service-accounts/", s.handleGCPServiceAccountByID)
+
 	s.mux.HandleFunc("/api/v1/skills", s.handleSkills)
 	s.mux.HandleFunc("/api/v1/skills/", s.handleSkillByID)
 
@@ -3160,6 +3375,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/lifecycle-hooks/", s.handleAdminLifecycleHookByID)
 	s.mux.HandleFunc("/api/v1/admin/validate-resources", s.handleAdminValidateResources)
 	s.mux.HandleFunc("/api/v1/admin/integrations", s.handleAdminIntegrations)
+	s.mux.HandleFunc("/api/v1/admin/integrations/teams/manifest", s.handleTeamsManifestDownload)
 	s.mux.HandleFunc("/api/v1/admin/integrations/", s.handleAdminIntegrationByName)
 	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs/stream", s.handleDiagnosticsLogsStream)
 	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs", s.handleDiagnosticsLogs)
@@ -3631,6 +3847,30 @@ func (s *Server) githubResolutionCacheEvictionHandler() func(ctx context.Context
 
 		if err := s.ghResolutionStore.PurgeExpired(ctx); err != nil {
 			slog.Error("Scheduler: github resolution cache eviction failed", "error", err)
+		}
+	}
+}
+
+// nonceCacheEvictionHandler returns a recurring handler function that purges
+// expired HMAC nonce cache entries from the database. This prevents the nonce
+// table from growing unbounded and reclaims storage for nonces whose TTL has
+// passed.
+func (s *Server) nonceCacheEvictionHandler() func(ctx context.Context) {
+	return func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+
+		if s.nonceCacheStore == nil {
+			return
+		}
+
+		purged, err := s.nonceCacheStore.PurgeExpired(ctx)
+		if err != nil {
+			slog.Error("Scheduler: nonce cache eviction failed", "error", err)
+			return
+		}
+		if purged > 0 {
+			slog.Info("Scheduler: nonce cache eviction completed", "purged", purged)
 		}
 	}
 }

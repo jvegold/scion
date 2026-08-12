@@ -33,6 +33,13 @@ Agents running inside containers must report status back to the Hub without poss
 
 - **Hub-Issued JWT**: During provisioning, the Hub generates a short-lived JWT scoped specifically to that agent instance.
 - **Claims**: The token includes the `agent_id` (sub), `project_id`, and `scopes`.
+
+  :::caution[Scopes Field Plurality]
+  The agent token JWT strictly uses `"scopes"` (plural, array of strings like `["project:read", "agent:status:update"]`), **NOT** `"scope"` (singular string, which is the standard OAuth 2.0 convention). 
+  
+  Providing the singular `"scope"` field in a token will silently fail, resulting in an empty scopes list and a locked-down agent.
+  :::
+
 - **Role-Based Scopes**: Instead of raw template scopes (which are deprecated), an agent's scopes are governed by its assigned **Tiered Agent Role** (`none`, `readonly`, `baseline`, or `full`):
     - `project:read` (Readonly): Allows reading project state (agents, templates, etc.).
     - `agent:status:update`, `agent:token:refresh`, `project:agent:notify`, `agent:port:forward` (Baseline): Standard operational scopes allowing the agent to report progress, refresh its token, and hold port tunnels.
@@ -79,6 +86,18 @@ Scion implements a robust, hierarchical RBAC (Role-Based Access Control) and pol
 - **Override Model**: Lower-level policies (e.g., at the Agent level) override higher-level ones (e.g., at the Project level), allowing for granular delegation of authority.
 - **Actions**: Standardized CRUD actions (`create`, `read`, `update`, `delete`, `list`) plus resource-specific actions (`start`, `stop`, `attach`, `message`).
 - **Lattice-Based Agent Authorization**: Agents are assigned tiered roles (`none`, `readonly`, `baseline`, `full`) that restrict their JWT scopes via a two-gate authority lattice.
+
+### 3.3 GCP Service Account Assignment Gates
+
+To prevent lateral privilege escalation, Scion implements a strict two-layer delegation check when binding a GCP service account to any agent:
+- **Layer 1: Scion Hub Policy**: The Hub's policy engine checks if the caller holds the `ActionAssign` permission on the target GCP service account resource within Scion.
+- **Layer 2: GCP IAM (`actAs`)**: When `gcp_iam_check_mode` is set to `"enforce"`, the Hub performs an out-of-band call via Google's **Policy Troubleshooter v3 API** to verify that the caller's GCP principal possesses `iam.serviceAccounts.actAs` permission on the target service account.
+
+Key security attributes of the GCP IAM check include:
+- **Fail-Closed Design**: If the Policy Troubleshooter returns an indeterminate result (due to conditional bindings, or due to insufficient Hub reviewer permissions when configured to fail-closed), the check fails closed and assignment is blocked. There is no fallback to insecure alternatives like getIamPolicy.
+- **Asymmetric Caching**: Approved assignments are cached for **60 seconds**, and denials are cached for **10 seconds**. Indeterminate or error states are never cached.
+- **Auditing**: Every service account assignment check—both allowed and denied—generates a permanent audit log entry detailing the principal, target service account, and Policy Troubleshooter decision.
+- **Hub-Scoped SAs**: Real hub-scoped service accounts can be assigned across projects. However, to prevent privilege bypasses, hub-scoped assignments are immediately rejected if `gcp_iam_check_mode` is not set to `"enforce"`.
 
 ## 4. Secret Management
 

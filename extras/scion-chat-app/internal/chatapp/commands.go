@@ -17,8 +17,11 @@ package chatapp
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -59,12 +62,17 @@ type CommandRouter struct {
 	store       *state.Store
 	idMapper    *identity.Mapper
 	messenger   Messenger
+	downloader  AttachmentDownloader
 	broker      *BrokerServer
 	log         *slog.Logger
 
 	mu             sync.Mutex
 	pendingAuth    map[string]*pendingDeviceAuth // keyed by platformUserID+platform
 	pendingDeletes map[string]string             // keyed by actionID -> agentID
+
+	// testClient, when non-nil, is returned by clientForUser instead of
+	// going through the identity mapper. Used only in tests.
+	testClient hubclient.Client
 }
 
 // NewCommandRouter creates a new command router.
@@ -78,15 +86,14 @@ func NewCommandRouter(
 	log *slog.Logger,
 ) *CommandRouter {
 	return &CommandRouter{
-		adminClient:    adminClient,
-		hubURL:         hubURL,
-		store:          store,
-		idMapper:       idMapper,
-		messenger:      messenger,
-		broker:         broker,
-		log:            log,
-		pendingAuth:    make(map[string]*pendingDeviceAuth),
-		pendingDeletes: make(map[string]string),
+		adminClient: adminClient,
+		hubURL:      hubURL,
+		store:       store,
+		idMapper:    idMapper,
+		messenger:   messenger,
+		broker:      broker,
+		log:         log,
+		pendingAuth: make(map[string]*pendingDeviceAuth),
 	}
 }
 
@@ -102,6 +109,16 @@ func (r *CommandRouter) hubHostname() string {
 // circular dependency between the command router and chat adapter.
 func (r *CommandRouter) SetMessenger(m Messenger) {
 	r.messenger = m
+	// If the messenger also implements AttachmentDownloader, wire it up.
+	if d, ok := m.(AttachmentDownloader); ok {
+		r.downloader = d
+	}
+}
+
+// SetDownloader sets the attachment downloader (used for downloading files
+// from chat platform events).
+func (r *CommandRouter) SetDownloader(d AttachmentDownloader) {
+	r.downloader = d
 }
 
 // HandleEvent processes a ChatEvent and routes it to the appropriate handler.
@@ -116,9 +133,9 @@ func (r *CommandRouter) HandleEvent(ctx context.Context, event *ChatEvent) (*Eve
 	case EventMessage:
 		return nil, r.handleMessage(ctx, event)
 	case EventAction:
-		return nil, r.handleAction(ctx, event)
+		return r.handleAction(ctx, event)
 	case EventDialogSubmit:
-		return nil, r.handleDialogSubmit(ctx, event)
+		return r.handleDialogSubmit(ctx, event)
 	case EventSpaceJoin:
 		return nil, r.handleSpaceJoin(ctx, event)
 	case EventSpaceRemove:
@@ -206,6 +223,16 @@ func (r *CommandRouter) handleAdminCommand(ctx context.Context, event *ChatEvent
 		resp, err = r.cmdUnsubscribe(ctx, event, args)
 	case "set-default":
 		resp, err = r.cmdSetDefault(ctx, event, args)
+	case "terminal":
+		resp, err = r.cmdTerminal(ctx, event, args)
+	case "thread":
+		resp, err = r.cmdThread(ctx, event, args)
+	case "send":
+		resp, err = r.cmdSend(ctx, event, args)
+	case "secret":
+		resp, err = r.cmdSecret(ctx, event, args)
+	case "settings":
+		resp, err = r.cmdSettings(ctx, event, args)
 	case "help":
 		if len(args) == 0 {
 			resp, err = r.cmdAdminHelp(ctx, event)
@@ -251,10 +278,10 @@ func (r *CommandRouter) handleMessage(ctx context.Context, event *ChatEvent) err
 }
 
 // handleAction processes button clicks and interactive elements.
-func (r *CommandRouter) handleAction(ctx context.Context, event *ChatEvent) error {
+func (r *CommandRouter) handleAction(ctx context.Context, event *ChatEvent) (*EventResponse, error) {
 	parts := strings.Split(event.ActionID, ".")
 	if len(parts) < 2 {
-		return nil
+		return nil, nil
 	}
 
 	actionType := parts[0]
@@ -271,16 +298,77 @@ func (r *CommandRouter) handleAction(ctx context.Context, event *ChatEvent) erro
 		if actionVerb == "ack" && targetID != "" {
 			client, err := r.clientForUser(ctx, event)
 			if err != nil {
-				return r.reply(ctx, event, "Authentication required. Use `/scionAdmin register` first.")
+				return nil, r.reply(ctx, event, "Authentication required. Use `/scionAdmin register` first.")
 			}
-			return client.Notifications().Acknowledge(ctx, targetID)
+			return nil, client.Notifications().Acknowledge(ctx, targetID)
 		}
+	case "subscribe":
+		// Card-based subscribe filter: arrives as EventAction when no
+		// checkboxes are selected (no formInputs).
+		if actionVerb == "filter" && targetID != "" {
+			return r.handleSubscribeFilter(ctx, event)
+		}
+	case "secret":
+		return nil, r.handleSecretAction(ctx, event, actionVerb, targetID)
+	case "send":
+		return nil, r.handleSendAction(ctx, event, actionVerb, targetID)
+	case "settings":
+		return nil, r.handleSettingsAction(ctx, event, actionVerb)
 	}
-	return nil
+	return nil, nil
+}
+
+// handleSecretAction processes secret-related button actions.
+func (r *CommandRouter) handleSecretAction(ctx context.Context, event *ChatEvent, verb, targetID string) error {
+	if verb != "set" || targetID == "" {
+		return nil
+	}
+
+	// targetID is the secret key. The value comes from DialogData using the
+	// action ID as the widget key, matching how the input card is constructed.
+	key := targetID
+	widgetKey := fmt.Sprintf("secret.set.%s", key)
+	value := event.DialogData[widgetKey]
+	if value == "" {
+		return r.reply(ctx, event, "No secret value provided.")
+	}
+
+	link, err := r.store.GetSpaceLink(event.SpaceID, event.Platform)
+	if err != nil {
+		return fmt.Errorf("getting space link: %w", err)
+	}
+	if link == nil {
+		return r.reply(ctx, event, "This space is not linked to a project.")
+	}
+
+	client, err := r.clientForUser(ctx, event)
+	if err != nil {
+		return r.reply(ctx, event, "Authentication required. Use `/scionAdmin register` first.")
+	}
+
+	if _, err := client.Secrets().Set(ctx, key, &hubclient.SetSecretRequest{
+		Value:   value,
+		Scope:   "project",
+		ScopeID: link.ProjectID,
+	}); err != nil {
+		return r.reply(ctx, event, fmt.Sprintf("Failed to set secret `%s`: %v", key, err))
+	}
+
+	return r.reply(ctx, event, fmt.Sprintf("Secret `%s` has been set.", key))
+}
+
+// handleSendAction processes send-related file selection actions.
+func (r *CommandRouter) handleSendAction(ctx context.Context, event *ChatEvent, verb, targetID string) error {
+	if verb != "select" || targetID == "" {
+		return nil
+	}
+	// targetID format: <agent-slug>.<path-hash>
+	// Phase 5 will implement actual file selection and upload.
+	return r.reply(ctx, event, "File selection and upload will be available in a future update.")
 }
 
 // handleDialogSubmit processes form submissions from interactive cards.
-func (r *CommandRouter) handleDialogSubmit(ctx context.Context, event *ChatEvent) error {
+func (r *CommandRouter) handleDialogSubmit(ctx context.Context, event *ChatEvent) (*EventResponse, error) {
 	// Handle agent.respond submissions (ask_user inline response)
 	if strings.HasPrefix(event.ActionID, "agent.respond.") {
 		agentID := strings.TrimPrefix(event.ActionID, "agent.respond.")
@@ -296,33 +384,33 @@ func (r *CommandRouter) handleDialogSubmit(ctx context.Context, event *ChatEvent
 			}
 		}
 		if responseText == "" {
-			return r.reply(ctx, event, "No response text provided.")
+			return nil, r.reply(ctx, event, "No response text provided.")
 		}
 
 		link, err := r.store.GetSpaceLink(event.SpaceID, event.Platform)
 		if err != nil {
-			return fmt.Errorf("getting space link: %w", err)
+			return nil, fmt.Errorf("getting space link: %w", err)
 		}
 		if link == nil {
-			return r.reply(ctx, event, "This space is not linked to a project.")
+			return nil, r.reply(ctx, event, "This space is not linked to a project.")
 		}
 
 		mapping, err := r.idMapper.ResolveOrAutoRegister(ctx, &eventUserLookup{event}, event.UserID, event.Platform)
 		if err != nil {
 			r.log.Error("Failed to resolve user mapping", "error", err, "userID", event.UserID)
-			return r.reply(ctx, event, "Something went wrong, please try again later.")
+			return nil, r.reply(ctx, event, "Something went wrong, please try again later.")
 		}
 		if mapping == nil {
-			return r.reply(ctx, event, "Authentication required. Use `/scionAdmin register` first.")
+			return nil, r.reply(ctx, event, "Authentication required. Use `/scionAdmin register` first.")
 		}
 		client, err := r.idMapper.ClientFor(ctx, mapping)
 		if err != nil {
-			return r.reply(ctx, event, fmt.Sprintf("Failed to create client: %v", err))
+			return nil, r.reply(ctx, event, fmt.Sprintf("Failed to create client: %v", err))
 		}
 
 		senderEmail := mapping.HubUserEmail
 		if senderEmail == "" {
-			return r.reply(ctx, event, "Your user mapping is missing a valid email address.")
+			return nil, r.reply(ctx, event, "Your user mapping is missing a valid email address.")
 		}
 		msg := messages.NewInstruction("user:"+senderEmail, agentID, responseText)
 		msg.Channel = r.broker.ChannelName()
@@ -330,81 +418,129 @@ func (r *CommandRouter) handleDialogSubmit(ctx context.Context, event *ChatEvent
 			msg.ThreadID = event.ThreadID
 		}
 		if _, err := client.ProjectAgents(link.ProjectID).SendStructuredMessage(ctx, agentID, msg, false, false, false); err != nil {
-			return r.reply(ctx, event, fmt.Sprintf("Failed to send response to agent: %v", err))
+			return nil, r.reply(ctx, event, fmt.Sprintf("Failed to send response to agent: %v", err))
 		}
-		return r.reply(ctx, event, fmt.Sprintf("Response sent to agent `%s`.", agentID))
+		return nil, r.reply(ctx, event, fmt.Sprintf("Response sent to agent `%s`.", agentID))
 	}
 
-	// Handle delete confirmation
+	// Handle delete confirmation (also handled via card action; kept for
+	// backward compatibility with any remaining dialog-based flows).
 	if strings.HasPrefix(event.ActionID, "agent.delete.confirm.") {
 		agentID := strings.TrimPrefix(event.ActionID, "agent.delete.confirm.")
-		return r.executeDelete(ctx, event, agentID)
+		return r.executeDelete(ctx, event, agentID, "")
 	}
 
-	// Handle subscription activity filter dialog
+	// Handle subscription activity filter (arrives here when checkboxes are
+	// selected, producing formInputs that the adapter classifies as DialogSubmit).
 	if strings.HasPrefix(event.ActionID, "subscribe.filter.") {
 		return r.handleSubscribeFilter(ctx, event)
 	}
 
-	return nil
+	// Google Chat normalizes button clicks that contain form inputs (e.g.
+	// secret set, send select) as DialogSubmit events because formInputs is
+	// non-empty. Fall back to the regular action handler so those buttons
+	// are processed correctly.
+	if event.ActionID != "" {
+		return r.handleAction(ctx, event)
+	}
+
+	return nil, nil
 }
 
 // handleAgentAction processes agent-specific button actions.
-func (r *CommandRouter) handleAgentAction(ctx context.Context, event *ChatEvent, verb, agentID string) error {
+func (r *CommandRouter) handleAgentAction(ctx context.Context, event *ChatEvent, verb, agentID string) (*EventResponse, error) {
+	switch verb {
+	case "delete":
+		// Sub-actions from the delete confirmation card:
+		//   agent.delete.confirm.<id> → execute deletion, update card in place
+		//   agent.delete.cancel.<id>  → cancel deletion, update card in place
+		if strings.HasPrefix(agentID, "confirm.") {
+			trimmed := strings.TrimPrefix(agentID, "confirm.")
+			parts := strings.SplitN(trimmed, ".", 2)
+			realID := parts[0]
+			var slug string
+			if len(parts) > 1 {
+				slug = parts[1]
+			}
+			return r.executeDelete(ctx, event, realID, slug)
+		}
+		if strings.HasPrefix(agentID, "cancel.") {
+			return updateMessageResponse(event, "Deletion cancelled."), nil
+		}
+		// Plain agent.delete.<id> → show the confirmation card
+		return r.showDeleteConfirmation(ctx, event, agentID)
+	}
+
+	// All other verbs require a space link and authenticated client.
 	link, err := r.store.GetSpaceLink(event.SpaceID, event.Platform)
 	if err != nil {
-		return fmt.Errorf("getting space link: %w", err)
+		return nil, fmt.Errorf("getting space link: %w", err)
 	}
 	if link == nil {
-		return r.reply(ctx, event, "This space is not linked to a project.")
+		return nil, r.reply(ctx, event, "This space is not linked to a project.")
 	}
 
 	client, err := r.clientForUser(ctx, event)
 	if err != nil {
-		return r.reply(ctx, event, "Authentication required. Use `/scionAdmin register` first.")
+		return nil, r.reply(ctx, event, "Authentication required. Use `/scionAdmin register` first.")
 	}
 
 	agents := client.ProjectAgents(link.ProjectID)
 
 	switch verb {
+	case "status":
+		agent, err := agents.Get(ctx, agentID)
+		if err != nil {
+			return nil, r.reply(ctx, event, fmt.Sprintf("Failed to get agent: %v", err))
+		}
+		card := Card{
+			Header: CardHeader{
+				Title:    agent.Name,
+				Subtitle: fmt.Sprintf("Project: %s | %s", link.ProjectSlug, agent.Activity),
+			},
+			Sections: []CardSection{
+				{
+					Widgets: []Widget{
+						{Type: WidgetKeyValue, Label: "Slug", Content: agent.Slug},
+						{Type: WidgetKeyValue, Label: "Phase", Content: agent.Phase},
+						{Type: WidgetKeyValue, Label: "Activity", Content: agent.Activity},
+						{Type: WidgetKeyValue, Label: "Template", Content: agent.Template},
+					},
+				},
+			},
+			Actions: []CardAction{
+				{Label: "Start", ActionID: fmt.Sprintf("agent.start.%s", agent.ID), Style: "primary"},
+				{Label: "Stop", ActionID: fmt.Sprintf("agent.stop.%s", agent.ID), Style: "danger"},
+				{Label: "View Logs", ActionID: fmt.Sprintf("agent.logs.%s", agent.ID)},
+			},
+		}
+		_, err = r.messenger.SendCard(ctx, event.SpaceID, card)
+		return nil, err
 	case "start":
 		if err := agents.Start(ctx, agentID); err != nil {
-			return r.reply(ctx, event, fmt.Sprintf("Failed to start agent: %v", err))
+			return nil, r.reply(ctx, event, fmt.Sprintf("Failed to start agent: %v", err))
 		}
-		return r.reply(ctx, event, fmt.Sprintf("Agent `%s` started.", agentID))
+		return nil, r.reply(ctx, event, fmt.Sprintf("Agent `%s` started.", agentID))
 	case "stop":
 		if err := agents.Stop(ctx, agentID); err != nil {
-			return r.reply(ctx, event, fmt.Sprintf("Failed to stop agent: %v", err))
+			return nil, r.reply(ctx, event, fmt.Sprintf("Failed to stop agent: %v", err))
 		}
-		return r.reply(ctx, event, fmt.Sprintf("Agent `%s` stopped.", agentID))
+		return nil, r.reply(ctx, event, fmt.Sprintf("Agent `%s` stopped.", agentID))
 	case "logs":
 		logs, err := agents.GetLogs(ctx, agentID, &hubclient.GetLogsOptions{Tail: 50})
 		if err != nil {
-			return r.reply(ctx, event, fmt.Sprintf("Failed to get logs: %v", err))
+			return nil, r.reply(ctx, event, fmt.Sprintf("Failed to get logs: %v", err))
 		}
 		if len(logs) > 2000 {
 			logs = logs[len(logs)-2000:]
 		}
-		return r.reply(ctx, event, fmt.Sprintf("*Logs for `%s`:*\n```\n%s\n```", agentID, logs))
+		return nil, r.reply(ctx, event, fmt.Sprintf("*Logs for `%s`:*\n```\n%s\n```", agentID, logs))
 	case "respond":
 		// This is handled via dialog submit when user fills the inline input field.
 		// If triggered as a plain action (no dialog data), prompt for input.
-		return r.reply(ctx, event, fmt.Sprintf("Use the inline response field in the notification card to respond to agent `%s`.", agentID))
-	case "delete":
-		resp, err := r.showDeleteConfirmation(ctx, event, agentID)
-		if err != nil {
-			return err
-		}
-		if resp != nil && resp.Message != nil {
-			if resp.Message.Card != nil {
-				_, err = r.messenger.SendCard(ctx, event.SpaceID, *resp.Message.Card)
-			} else {
-				_, err = r.messenger.SendMessage(ctx, *resp.Message)
-			}
-		}
-		return err
+		return nil, r.reply(ctx, event, fmt.Sprintf("Use the inline response field in the notification card to respond to agent `%s`.", agentID))
 	}
-	return nil
+	return nil, nil
 }
 
 // handleSpaceJoin is called when the bot is added to a space.
@@ -645,20 +781,21 @@ func (r *CommandRouter) cmdLink(ctx context.Context, event *ChatEvent, args []st
 
 	// Save the link
 	link := &state.SpaceLink{
-		SpaceID:     event.SpaceID,
-		Platform:    event.Platform,
-		ProjectID:   proj.ID,
-		ProjectSlug: proj.Slug,
-		LinkedBy:    mapping.HubUserID,
+		SpaceID:          event.SpaceID,
+		Platform:         event.Platform,
+		ProjectID:        proj.ID,
+		ProjectSlug:      proj.Slug,
+		LinkedBy:         mapping.HubUserID,
+		ShowStateChanges: true,
 	}
 	if err := r.store.SetSpaceLink(link); err != nil {
 		return textResponse(event, fmt.Sprintf("Failed to save link: %v", err)), nil
 	}
 
-	// Subscribe only to user-targeted messages so that agent-to-agent
-	// traffic and broadcasts do not leak into chat.
+	// Subscribe to all project messages; observe mode filtering is
+	// applied at delivery time in HandleBrokerMessage.
 	if r.broker != nil {
-		pattern := fmt.Sprintf("scion.grove.%s.user.>", proj.ID)
+		pattern := fmt.Sprintf("scion.grove.%s.>", proj.ID)
 		if err := r.broker.RequestSubscription(pattern); err != nil {
 			r.log.Warn("failed to request project subscription", "project_id", proj.ID, "error", err)
 		}
@@ -678,7 +815,7 @@ func (r *CommandRouter) cmdUnlink(ctx context.Context, event *ChatEvent, args []
 
 	// Cancel broker subscription (must match the pattern used during link).
 	if r.broker != nil {
-		pattern := fmt.Sprintf("scion.grove.%s.user.>", link.ProjectID)
+		pattern := fmt.Sprintf("scion.grove.%s.>", link.ProjectID)
 		if err := r.broker.CancelSubscription(pattern); err != nil {
 			r.log.Warn("failed to cancel project subscription", "project_id", link.ProjectID, "error", err)
 		}
@@ -850,7 +987,8 @@ func (r *CommandRouter) showDeleteConfirmation(ctx context.Context, event *ChatE
 		return textResponse(event, fmt.Sprintf("Agent `%s` not found: %v", agentSlug, err)), nil
 	}
 
-	confirmID := fmt.Sprintf("agent.delete.confirm.%s", agent.ID)
+	confirmID := fmt.Sprintf("agent.delete.confirm.%s.%s", agent.ID, agent.Slug)
+	cancelID := fmt.Sprintf("agent.delete.cancel.%s.%s", agent.ID, agent.Slug)
 
 	card := Card{
 		Header: CardHeader{
@@ -860,7 +998,7 @@ func (r *CommandRouter) showDeleteConfirmation(ctx context.Context, event *ChatE
 		Sections: []CardSection{
 			{
 				Widgets: []Widget{
-					{Type: WidgetText, Content: fmt.Sprintf("Are you sure you want to delete agent `%s`?\n\nThis action cannot be undone.", agent.Slug)},
+					{Type: WidgetText, Content: fmt.Sprintf("Are you sure you want to delete agent *%s*?\n\nThis action cannot be undone.", agent.Slug)},
 					{Type: WidgetKeyValue, Label: "Name", Content: agent.Name},
 					{Type: WidgetKeyValue, Label: "Phase", Content: agent.Phase},
 					{Type: WidgetKeyValue, Label: "Activity", Content: agent.Activity},
@@ -868,8 +1006,8 @@ func (r *CommandRouter) showDeleteConfirmation(ctx context.Context, event *ChatE
 			},
 		},
 		Actions: []CardAction{
-			{Label: "Delete", ActionID: confirmID, Style: "danger"},
-			{Label: "Cancel", ActionID: "noop"},
+			{Label: "Confirm Delete", ActionID: confirmID, Style: "danger"},
+			{Label: "Cancel", ActionID: cancelID},
 		},
 	}
 
@@ -877,24 +1015,29 @@ func (r *CommandRouter) showDeleteConfirmation(ctx context.Context, event *ChatE
 }
 
 // executeDelete performs the actual agent deletion after confirmation.
-func (r *CommandRouter) executeDelete(ctx context.Context, event *ChatEvent, agentID string) error {
+// Returns an UpdateMessage response to replace the confirmation card in place.
+func (r *CommandRouter) executeDelete(ctx context.Context, event *ChatEvent, agentID, agentSlug string) (*EventResponse, error) {
 	link, err := r.store.GetSpaceLink(event.SpaceID, event.Platform)
 	if err != nil {
-		return fmt.Errorf("getting space link: %w", err)
+		return nil, fmt.Errorf("getting space link: %w", err)
 	}
 	if link == nil {
-		return r.reply(ctx, event, "This space is not linked to a project.")
+		return updateMessageResponse(event, "This space is not linked to a project."), nil
 	}
 
 	client, err := r.clientForUser(ctx, event)
 	if err != nil {
-		return r.reply(ctx, event, "Authentication required. Use `/scionAdmin register` first.")
+		return updateMessageResponse(event, "Authentication required. Use `/scionAdmin register` first."), nil
 	}
 
 	if err := client.ProjectAgents(link.ProjectID).Delete(ctx, agentID, nil); err != nil {
-		return r.reply(ctx, event, fmt.Sprintf("Failed to delete agent: %v", err))
+		return updateMessageResponse(event, fmt.Sprintf("Failed to delete agent: %v", err)), nil
 	}
-	return r.reply(ctx, event, fmt.Sprintf("Agent `%s` deleted.", agentID))
+	deletedName := agentSlug
+	if deletedName == "" {
+		deletedName = agentID
+	}
+	return updateMessageResponse(event, fmt.Sprintf("Agent `%s` deleted.", deletedName)), nil
 }
 
 func (r *CommandRouter) cmdLogs(ctx context.Context, event *ChatEvent, args []string) (*EventResponse, error) {
@@ -996,17 +1139,21 @@ func (r *CommandRouter) cmdSubscribe(ctx context.Context, event *ChatEvent, args
 	return cardResponse(event, &card), nil
 }
 
-// handleSubscribeFilter processes the subscription activity filter dialog submission.
-func (r *CommandRouter) handleSubscribeFilter(ctx context.Context, event *ChatEvent) error {
+// handleSubscribeFilter processes the subscription activity filter submission.
+// This handler is reached via both EventAction (no checkboxes selected) and
+// EventDialogSubmit (checkboxes selected, producing formInputs).
+// Returns an UpdateMessage response to replace the filter card in place.
+func (r *CommandRouter) handleSubscribeFilter(ctx context.Context, event *ChatEvent) (*EventResponse, error) {
 	// ActionID format: subscribe.filter.<projectID>.<agentSlug>
 	parts := strings.SplitN(event.ActionID, ".", 4)
 	if len(parts) < 4 {
-		return r.reply(ctx, event, "Invalid subscription filter action.")
+		return updateMessageResponse(event, "Invalid subscription filter action."), nil
 	}
 	projectID := parts[2]
 	agentSlug := parts[3]
 
-	// Collect selected activities from dialog data
+	// Collect selected activities from form data (populated from card
+	// checkbox widgets via commonEventObject.formInputs).
 	var activities string
 	if selected, ok := event.DialogData[event.ActionID]; ok && selected != "" {
 		activities = selected
@@ -1020,7 +1167,7 @@ func (r *CommandRouter) handleSubscribeFilter(ctx context.Context, event *ChatEv
 		Activities:     activities,
 	}
 	if err := r.store.SetAgentSubscription(sub); err != nil {
-		return r.reply(ctx, event, fmt.Sprintf("Failed to subscribe: %v", err))
+		return updateMessageResponse(event, fmt.Sprintf("Failed to subscribe: %v", err)), nil
 	}
 
 	msg := fmt.Sprintf("Subscribed to notifications for agent `%s`.", agentSlug)
@@ -1029,7 +1176,7 @@ func (r *CommandRouter) handleSubscribeFilter(ctx context.Context, event *ChatEv
 	} else {
 		msg += " Receiving all activity types."
 	}
-	return r.reply(ctx, event, msg)
+	return updateMessageResponse(event, msg), nil
 }
 
 func (r *CommandRouter) cmdUnsubscribe(ctx context.Context, event *ChatEvent, args []string) (*EventResponse, error) {
@@ -1124,6 +1271,33 @@ func (r *CommandRouter) cmdMessage(ctx context.Context, event *ChatEvent, args [
 		msg.ThreadID = threadID
 	} else if event.ThreadID != "" {
 		msg.ThreadID = event.ThreadID
+	}
+
+	// Download and attach any files uploaded with the message.
+	if len(event.Attachments) > 0 && r.downloader != nil {
+		for _, att := range event.Attachments {
+			agentPath, dlErr := r.downloadInboundAttachment(
+				ctx, att, event.SpaceID, link.ProjectSlug, link.ProjectID,
+			)
+			if dlErr != nil {
+				r.log.Error("failed to download attachment",
+					"filename", att.Name, "error", dlErr)
+				if strings.Contains(dlErr.Error(), "too large") {
+					errCard := SizeLimitErrorCard(att.Name, 0)
+					if _, sendErr := r.messenger.SendCard(ctx, event.SpaceID, errCard); sendErr != nil {
+						r.log.Error("failed to send size limit card", "error", sendErr)
+					}
+				}
+				continue
+			}
+			msg.Attachments = append(msg.Attachments, agentPath)
+			if messageText != "" {
+				messageText += "\n"
+			}
+			messageText += fmt.Sprintf("[Attachment: %s (%s)]", att.Name, att.ContentType)
+		}
+		// Update the message body with attachment placeholders.
+		msg.Msg = messageText
 	}
 
 	if _, err := client.ProjectAgents(link.ProjectID).SendStructuredMessage(ctx, agentSlug, msg, false, false, false); err != nil {
@@ -1320,6 +1494,15 @@ func (r *CommandRouter) cmdAdminHelp(ctx context.Context, event *ChatEvent) (*Ev
 • ` + "`/scionAdmin logs <agent>`" + ` — View recent agent logs
 • ` + "`/scionAdmin set-default <agent>`" + ` — Set default agent for ` + "`/scion`" + ` messages (clear with ` + "`clear`" + `)
 • ` + "`/scionAdmin set-default <agent> --thread`" + ` — Set default agent for the current thread (clear with ` + "`clear --thread`" + `)
+• ` + "`/scionAdmin terminal <agent>`" + ` — Get the web terminal URL for an agent
+• ` + "`/scionAdmin thread <name> [instruction]`" + ` — Create a new agent and thread
+• ` + "`/scionAdmin send <agent> <path>`" + ` — Show file info from an agent's workspace
+
+*Secrets:*
+• ` + "`/scionAdmin secret list`" + ` — List project secrets (metadata only)
+• ` + "`/scionAdmin secret set <key>`" + ` — Set a secret value (entered via secure card input)
+• ` + "`/scionAdmin secret get <key>`" + ` — Show secret metadata
+• ` + "`/scionAdmin secret delete <key>`" + ` — Delete a secret
 
 *Space & Identity:*
 • ` + "`/scionAdmin info`" + ` — Show registration, project link, and agent info
@@ -1327,6 +1510,7 @@ func (r *CommandRouter) cmdAdminHelp(ctx context.Context, event *ChatEvent) (*Ev
 • ` + "`/scionAdmin unlink`" + ` — Unlink this space
 • ` + "`/scionAdmin register`" + ` — Register your chat account
 • ` + "`/scionAdmin unregister`" + ` — Unregister your account
+• ` + "`/scionAdmin settings`" + ` — Toggle observe mode and notification filters
 
 *Notifications:*
 • ` + "`/scionAdmin subscribe <agent>`" + ` — Subscribe to agent notifications
@@ -1351,6 +1535,550 @@ func (r *CommandRouter) resolveDefaultAgent(spaceID, threadID, platform, spaceDe
 		}
 	}
 	return spaceDefault, nil
+}
+
+// --- Terminal, Thread, Send, Secret commands ---
+
+func (r *CommandRouter) cmdTerminal(ctx context.Context, event *ChatEvent, args []string) (*EventResponse, error) {
+	if len(args) == 0 {
+		return textResponse(event, "Usage: `/scionAdmin terminal <agent-slug>`"), nil
+	}
+
+	link, resp := r.requireSpaceLink(ctx, event)
+	if resp != nil {
+		return resp, nil
+	}
+
+	client, err := r.clientForUser(ctx, event)
+	if err != nil {
+		return textResponse(event, "Authentication required. Use `/scionAdmin register` first."), nil
+	}
+
+	agentSlug := args[0]
+	// Use Get (which supports slug lookup) instead of List+scan.
+	agent, err := client.ProjectAgents(link.ProjectID).Get(ctx, agentSlug)
+	if err != nil {
+		return textResponse(event, fmt.Sprintf("Agent `%s` not found: %v", agentSlug, err)), nil
+	}
+	if agent == nil {
+		return textResponse(event, fmt.Sprintf("Agent `%s` not found.", agentSlug)), nil
+	}
+
+	if strings.ToLower(agent.Phase) != "running" {
+		phase := agent.Phase
+		if phase == "" {
+			phase = "unknown"
+		}
+		return textResponse(event, fmt.Sprintf("Agent `%s` is not running (phase: %s).", agent.Slug, phase)), nil
+	}
+	terminalURL := fmt.Sprintf("%s/agents/%s/terminal", r.hubURL, agent.ID)
+	card := Card{
+		Header: CardHeader{
+			Title:    "Web Terminal",
+			Subtitle: fmt.Sprintf("Agent: %s", agent.Slug),
+		},
+		Sections: []CardSection{
+			{
+				Widgets: []Widget{
+					{Type: WidgetText, Content: fmt.Sprintf("Open the web terminal for agent `%s`:", agent.Slug)},
+				},
+			},
+		},
+		Actions: []CardAction{
+			{Label: "Open Terminal", ActionID: fmt.Sprintf("link.%s", terminalURL), Style: "primary"},
+		},
+	}
+	return cardResponse(event, &card), nil
+}
+
+func (r *CommandRouter) cmdThread(ctx context.Context, event *ChatEvent, args []string) (*EventResponse, error) {
+	if len(args) == 0 {
+		return textResponse(event, "Usage: `/scionAdmin thread <agent-name> [instruction]`"), nil
+	}
+
+	link, resp := r.requireSpaceLink(ctx, event)
+	if resp != nil {
+		return resp, nil
+	}
+
+	client, err := r.clientForUser(ctx, event)
+	if err != nil {
+		return textResponse(event, "Authentication required. Use `/scionAdmin register` first."), nil
+	}
+
+	agentName := args[0]
+	instruction := ""
+	if len(args) > 1 {
+		instruction = strings.Join(args[1:], " ")
+	}
+
+	// Create the agent.
+	createResp, err := client.ProjectAgents(link.ProjectID).Create(ctx, &hubclient.CreateAgentRequest{
+		Name: agentName,
+	})
+	if err != nil {
+		return textResponse(event, fmt.Sprintf("Failed to create agent: %v", err)), nil
+	}
+	if createResp == nil || createResp.Agent == nil {
+		return textResponse(event, "Failed to create agent: received empty response from server"), nil
+	}
+
+	// Start the agent.
+	if err := client.ProjectAgents(link.ProjectID).Start(ctx, createResp.Agent.Slug); err != nil {
+		return textResponse(event, fmt.Sprintf("Agent `%s` created but failed to start: %v", createResp.Agent.Slug, err)), nil
+	}
+
+	// Send a kickoff message in the space to start a new thread.
+	// Use a threadKey derived from the agent slug so Google Chat creates a
+	// new thread and subsequent messages can target it.
+	threadMsg := fmt.Sprintf("Agent `%s` created and started.", createResp.Agent.Slug)
+	if instruction != "" {
+		threadMsg += fmt.Sprintf("\n\n*Instruction:* %s", instruction)
+	}
+	threadKey := fmt.Sprintf("scion-agent-%s", createResp.Agent.Slug)
+	kickoffMsgName, msgErr := r.messenger.SendMessage(ctx, SendMessageRequest{
+		SpaceID:   event.SpaceID,
+		ThreadKey: threadKey,
+		Text:      threadMsg,
+	})
+	if msgErr != nil {
+		r.log.Warn("failed to post thread kickoff message", "error", msgErr)
+	}
+
+	// If instruction provided, send it to the agent.
+	if instruction != "" {
+		senderEmail := r.senderEmailForUser(ctx, event)
+		msg := messages.NewInstruction("user:"+senderEmail, createResp.Agent.Slug, instruction)
+		if r.broker != nil {
+			msg.Channel = r.broker.ChannelName()
+		}
+		// Use the newly created thread (derived from the kickoff message name)
+		// so the agent replies in the new thread, not the admin command's thread.
+		if msgErr == nil && kickoffMsgName != "" {
+			msg.ThreadID = strings.Replace(kickoffMsgName, "/messages/", "/threads/", 1)
+		} else if event.ThreadID != "" {
+			msg.ThreadID = event.ThreadID
+		}
+		if _, err := client.ProjectAgents(link.ProjectID).SendStructuredMessage(ctx, createResp.Agent.Slug, msg, false, false, false); err != nil {
+			return textResponse(event, fmt.Sprintf("Agent `%s` created and started, but failed to send instruction: %v", createResp.Agent.Slug, err)), nil
+		}
+	}
+
+	card := Card{
+		Header: CardHeader{
+			Title:    "Thread Created",
+			Subtitle: fmt.Sprintf("Agent: %s", createResp.Agent.Slug),
+		},
+		Sections: []CardSection{
+			{
+				Widgets: []Widget{
+					{Type: WidgetKeyValue, Label: "Agent", Content: createResp.Agent.Slug},
+					{Type: WidgetKeyValue, Label: "Status", Content: "Running"},
+				},
+			},
+		},
+		Actions: []CardAction{
+			{Label: "View Status", ActionID: fmt.Sprintf("agent.status.%s", createResp.Agent.ID)},
+			{Label: "View Logs", ActionID: fmt.Sprintf("agent.logs.%s", createResp.Agent.ID)},
+		},
+	}
+	if instruction != "" {
+		card.Sections[0].Widgets = append(card.Sections[0].Widgets,
+			Widget{Type: WidgetKeyValue, Label: "Instruction", Content: instruction})
+	}
+
+	return cardResponse(event, &card), nil
+}
+
+func (r *CommandRouter) cmdSend(ctx context.Context, event *ChatEvent, args []string) (*EventResponse, error) {
+	if len(args) < 2 {
+		return textResponse(event, "Usage: `/scionAdmin send <agent-slug> <path-or-query>`"), nil
+	}
+
+	link, resp := r.requireSpaceLink(ctx, event)
+	if resp != nil {
+		return resp, nil
+	}
+
+	client, err := r.clientForUser(ctx, event)
+	if err != nil {
+		return textResponse(event, "Authentication required. Use `/scionAdmin register` first."), nil
+	}
+
+	agentSlug := args[0]
+	filePath := strings.Join(args[1:], " ")
+
+	// Verify the agent exists.
+	agent, err := client.ProjectAgents(link.ProjectID).Get(ctx, agentSlug)
+	if err != nil {
+		return textResponse(event, fmt.Sprintf("Agent `%s` not found: %v", agentSlug, err)), nil
+	}
+
+	// Phase 3: return a card with the file info.
+	// Phase 5 will add actual file upload via media.upload API.
+	card := Card{
+		Header: CardHeader{
+			Title:    "Send File",
+			Subtitle: fmt.Sprintf("Agent: %s", agent.Slug),
+		},
+		Sections: []CardSection{
+			{
+				Widgets: []Widget{
+					{Type: WidgetKeyValue, Label: "Agent", Content: agent.Slug},
+					{Type: WidgetKeyValue, Label: "File Path", Content: filePath},
+					{Type: WidgetText, Content: "_File upload via Google Chat is not yet available. Use the web terminal to access files directly._"},
+				},
+			},
+		},
+		Actions: []CardAction{
+			{Label: "Open Terminal", ActionID: fmt.Sprintf("link.%s/agents/%s/terminal", r.hubURL, agent.ID), Style: "primary"},
+		},
+	}
+
+	return cardResponse(event, &card), nil
+}
+
+func (r *CommandRouter) cmdSecret(ctx context.Context, event *ChatEvent, args []string) (*EventResponse, error) {
+	if len(args) == 0 {
+		return textResponse(event, "Usage: `/scionAdmin secret <list|set|get|delete> [key] [value]`"), nil
+	}
+
+	link, resp := r.requireSpaceLink(ctx, event)
+	if resp != nil {
+		return resp, nil
+	}
+
+	client, err := r.clientForUser(ctx, event)
+	if err != nil {
+		return textResponse(event, "Authentication required. Use `/scionAdmin register` first."), nil
+	}
+
+	subcmd := strings.ToLower(args[0])
+	secretArgs := args[1:]
+
+	switch subcmd {
+	case "list":
+		return r.cmdSecretList(ctx, event, link, client)
+	case "set":
+		return r.cmdSecretSet(ctx, event, link, client, secretArgs)
+	case "get":
+		return r.cmdSecretGet(ctx, event, link, client, secretArgs)
+	case "delete":
+		return r.cmdSecretDelete(ctx, event, link, client, secretArgs)
+	default:
+		return textResponse(event, fmt.Sprintf("Unknown secret subcommand: `%s`. Use `list`, `set`, `get`, or `delete`.", subcmd)), nil
+	}
+}
+
+func (r *CommandRouter) cmdSecretList(ctx context.Context, event *ChatEvent, link *state.SpaceLink, client hubclient.Client) (*EventResponse, error) {
+	secrets, err := client.Secrets().List(ctx, &hubclient.ListSecretOptions{
+		Scope:   "project",
+		ScopeID: link.ProjectID,
+	})
+	if err != nil {
+		return textResponse(event, fmt.Sprintf("Failed to list secrets: %v", err)), nil
+	}
+
+	if secrets == nil || len(secrets.Secrets) == 0 {
+		return textResponse(event, fmt.Sprintf("No secrets found in project `%s`.", link.ProjectSlug)), nil
+	}
+
+	// Cap output to avoid oversized chat messages.
+	const maxSecrets = 50
+	display := secrets.Secrets
+	truncated := false
+	if len(display) > maxSecrets {
+		display = display[:maxSecrets]
+		truncated = true
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("*Secrets in %s* (%d):\n", link.ProjectSlug, len(secrets.Secrets)))
+	for _, sec := range display {
+		line := fmt.Sprintf("• `%s`", sec.Key)
+		if sec.SecretType != "" {
+			line += fmt.Sprintf(" (type: %s)", sec.SecretType)
+		}
+		if sec.Description != "" {
+			line += fmt.Sprintf(" — %s", sec.Description)
+		}
+		sb.WriteString(line + "\n")
+	}
+	if truncated {
+		sb.WriteString(fmt.Sprintf("\n_Showing %d of %d secrets._", maxSecrets, len(secrets.Secrets)))
+	}
+	return textResponse(event, sb.String()), nil
+}
+
+func (r *CommandRouter) cmdSecretSet(ctx context.Context, event *ChatEvent, link *state.SpaceLink, client hubclient.Client, args []string) (*EventResponse, error) {
+	if len(args) < 1 {
+		return textResponse(event, "Usage: `/scionAdmin secret set <key>`"), nil
+	}
+
+	key := args[0]
+	if err := validateSecretKey(key); err != nil {
+		return textResponse(event, fmt.Sprintf("Invalid key: %v", err)), nil
+	}
+
+	// Always use a card-based text input for the secret value to avoid
+	// exposing values in chat history. Any extra args are ignored.
+	card := Card{
+		Header: CardHeader{
+			Title:    "Set Secret",
+			Subtitle: fmt.Sprintf("Key: %s", key),
+		},
+		Sections: []CardSection{
+			{
+				Widgets: []Widget{
+					{Type: WidgetInput, Label: "Secret Value", ActionID: fmt.Sprintf("secret.set.%s", key)},
+				},
+			},
+		},
+		Actions: []CardAction{
+			{Label: "Save", ActionID: fmt.Sprintf("secret.set.%s", key), Style: "primary"},
+		},
+	}
+	return cardResponse(event, &card), nil
+}
+
+func (r *CommandRouter) cmdSecretGet(ctx context.Context, event *ChatEvent, link *state.SpaceLink, client hubclient.Client, args []string) (*EventResponse, error) {
+	if len(args) == 0 {
+		return textResponse(event, "Usage: `/scionAdmin secret get <key>`"), nil
+	}
+
+	key := args[0]
+	if err := validateSecretKey(key); err != nil {
+		return textResponse(event, fmt.Sprintf("Invalid key: %v", err)), nil
+	}
+
+	secret, err := client.Secrets().Get(ctx, key, &hubclient.SecretScopeOptions{
+		Scope:   "project",
+		ScopeID: link.ProjectID,
+	})
+	if err != nil {
+		return textResponse(event, fmt.Sprintf("Failed to get secret `%s`: %v", key, err)), nil
+	}
+
+	card := Card{
+		Header: CardHeader{
+			Title:    "Secret Details",
+			Subtitle: secret.Key,
+		},
+		Sections: []CardSection{
+			{
+				Widgets: []Widget{
+					{Type: WidgetKeyValue, Label: "Key", Content: secret.Key},
+					{Type: WidgetKeyValue, Label: "Scope", Content: secret.Scope},
+					{Type: WidgetKeyValue, Label: "Version", Content: fmt.Sprintf("%d", secret.Version)},
+				},
+			},
+		},
+	}
+	if secret.SecretType != "" {
+		card.Sections[0].Widgets = append(card.Sections[0].Widgets,
+			Widget{Type: WidgetKeyValue, Label: "Type", Content: secret.SecretType})
+	}
+	if secret.Description != "" {
+		card.Sections[0].Widgets = append(card.Sections[0].Widgets,
+			Widget{Type: WidgetKeyValue, Label: "Description", Content: secret.Description})
+	}
+	if !secret.Updated.IsZero() {
+		card.Sections[0].Widgets = append(card.Sections[0].Widgets,
+			Widget{Type: WidgetKeyValue, Label: "Last Updated", Content: secret.Updated.UTC().Format("2006-01-02 15:04:05 UTC")})
+	}
+	card.Sections[0].Widgets = append(card.Sections[0].Widgets,
+		Widget{Type: WidgetText, Content: "_(Secret value is never shown)_"})
+
+	return cardResponse(event, &card), nil
+}
+
+func (r *CommandRouter) cmdSecretDelete(ctx context.Context, event *ChatEvent, link *state.SpaceLink, client hubclient.Client, args []string) (*EventResponse, error) {
+	if len(args) == 0 {
+		return textResponse(event, "Usage: `/scionAdmin secret delete <key>`"), nil
+	}
+
+	key := args[0]
+	if err := validateSecretKey(key); err != nil {
+		return textResponse(event, fmt.Sprintf("Invalid key: %v", err)), nil
+	}
+
+	if err := client.Secrets().Delete(ctx, key, &hubclient.SecretScopeOptions{
+		Scope:   "project",
+		ScopeID: link.ProjectID,
+	}); err != nil {
+		return textResponse(event, fmt.Sprintf("Failed to delete secret `%s`: %v", key, err)), nil
+	}
+
+	return textResponse(event, fmt.Sprintf("Secret `%s` has been deleted.", key)), nil
+}
+
+// validateSecretKey checks that a key is non-empty and contains no spaces,
+// newlines, or equals signs.
+func validateSecretKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("secret key cannot be empty")
+	}
+	if strings.ContainsAny(key, " \t\n\r=:") {
+		return fmt.Errorf("secret key must not contain spaces, tabs, newlines, '=' or ':'")
+	}
+	return nil
+}
+
+// --- Settings command ---
+
+func (r *CommandRouter) cmdSettings(ctx context.Context, event *ChatEvent, args []string) (*EventResponse, error) {
+	link, resp := r.requireSpaceLink(ctx, event)
+	if resp != nil {
+		return resp, nil
+	}
+
+	return r.buildSettingsCard(event, link), nil
+}
+
+// buildSettingsCard creates a card showing the current observe mode and state notification settings.
+func (r *CommandRouter) buildSettingsCard(event *ChatEvent, link *state.SpaceLink) *EventResponse {
+	observeLabel := "Observe Mode: OFF"
+	if link.ShowAgentToAgent {
+		observeLabel = "Observe Mode: ON"
+	}
+	stateLabel := "State Notifications: OFF"
+	if link.ShowStateChanges {
+		stateLabel = "State Notifications: ON"
+	}
+
+	card := Card{
+		Header: CardHeader{
+			Title:    "Space Settings",
+			Subtitle: fmt.Sprintf("Project: %s", link.ProjectSlug),
+		},
+		Sections: []CardSection{
+			{
+				Header: "Message Filtering",
+				Widgets: []Widget{
+					{Type: WidgetText, Content: "Control which messages are relayed to this space."},
+				},
+			},
+		},
+		Actions: []CardAction{
+			{Label: observeLabel, ActionID: "settings.observe"},
+			{Label: stateLabel, ActionID: "settings.statechange"},
+		},
+	}
+
+	return cardResponse(event, &card)
+}
+
+// handleSettingsAction toggles observe mode or state change notification settings.
+func (r *CommandRouter) handleSettingsAction(ctx context.Context, event *ChatEvent, verb string) error {
+	link, err := r.store.GetSpaceLink(event.SpaceID, event.Platform)
+	if err != nil {
+		return fmt.Errorf("getting space link: %w", err)
+	}
+	if link == nil {
+		return r.reply(ctx, event, "This space is not linked to a project.")
+	}
+
+	switch verb {
+	case "observe":
+		link.ShowAgentToAgent = !link.ShowAgentToAgent
+		if err := r.store.SetShowAgentToAgent(event.SpaceID, event.Platform, link.ShowAgentToAgent); err != nil {
+			return r.reply(ctx, event, fmt.Sprintf("Failed to update setting: %v", err))
+		}
+	case "statechange":
+		link.ShowStateChanges = !link.ShowStateChanges
+		if err := r.store.SetShowStateChanges(event.SpaceID, event.Platform, link.ShowStateChanges); err != nil {
+			return r.reply(ctx, event, fmt.Sprintf("Failed to update setting: %v", err))
+		}
+	default:
+		return r.reply(ctx, event, fmt.Sprintf("Unknown setting: `%s`", verb))
+	}
+
+	// Re-render the settings card with updated state via UpdateMessage
+	resp := r.buildSettingsCard(event, link)
+	if resp.Message != nil && resp.Message.Card != nil {
+		if event.ActionData != "" {
+			// Use UpdateMessage to refresh the card in-place
+			if err := r.messenger.UpdateMessage(ctx, event.ActionData, *resp.Message); err != nil {
+				r.log.Warn("failed to update settings card, sending new message", "error", err)
+				_, err = r.messenger.SendCard(ctx, event.SpaceID, *resp.Message.Card)
+				return err
+			}
+			return nil
+		}
+		_, err = r.messenger.SendCard(ctx, event.SpaceID, *resp.Message.Card)
+		return err
+	}
+	return nil
+}
+
+// --- Attachment handling ---
+
+// downloadInboundAttachment downloads a user-uploaded file from Google Chat and
+// saves it to the shared volume. Returns the agent-visible path.
+func (r *CommandRouter) downloadInboundAttachment(ctx context.Context, att EventAttachment, spaceID, projectSlug, projectID string) (string, error) {
+	if r.downloader == nil {
+		return "", fmt.Errorf("no attachment downloader configured")
+	}
+
+	// Sanitize the conversation ID (space name) for use as a directory.
+	safeConvID := sanitizePathComponent(spaceID)
+	if safeConvID == "" {
+		safeConvID = "unknown"
+	}
+
+	// Resolve the host-side directory.
+	hostDir, err := resolveGChatAttachmentDir(projectSlug, projectID, safeConvID)
+	if err != nil {
+		return "", fmt.Errorf("resolving attachment directory: %w", err)
+	}
+	if mkErr := os.MkdirAll(hostDir, 0o755); mkErr != nil {
+		return "", fmt.Errorf("creating attachment directory: %w", mkErr)
+	}
+
+	// Download the file via the authenticated downloader.
+	body, err := r.downloader.DownloadAttachment(ctx, att.DownloadURI)
+	if err != nil {
+		return "", fmt.Errorf("downloading %q: %w", att.Name, err)
+	}
+	defer body.Close()
+
+	// Build a timestamped filename.
+	safeName := sanitizePathComponent(att.Name)
+	if safeName == "" {
+		safeName = "attachment"
+	}
+	destName := fmt.Sprintf("%d_%s", time.Now().UnixNano(), safeName)
+	destPath := filepath.Join(hostDir, destName)
+
+	f, fErr := os.Create(destPath)
+	if fErr != nil {
+		return "", fmt.Errorf("creating file: %w", fErr)
+	}
+	defer f.Close()
+
+	written, copyErr := io.Copy(f, io.LimitReader(body, MaxAttachmentSize+1))
+	if copyErr != nil {
+		f.Close()
+		os.Remove(destPath)
+		return "", fmt.Errorf("writing attachment: %w", copyErr)
+	}
+	if written > MaxAttachmentSize {
+		f.Close()
+		os.Remove(destPath)
+		return "", fmt.Errorf("attachment %q too large (%d bytes, max %d)", att.Name, written, MaxAttachmentSize)
+	}
+
+	agentPath := filepath.ToSlash(filepath.Join(
+		"/scion-volumes/scratchpad/.attachments", gchatAttachmentDir, safeConvID, destName,
+	))
+
+	r.log.Info("downloaded Google Chat attachment",
+		"filename", att.Name,
+		"content_type", att.ContentType,
+		"agent_path", agentPath,
+	)
+
+	return agentPath, nil
 }
 
 // --- Helper methods ---
@@ -1388,6 +2116,18 @@ func cardResponse(event *ChatEvent, card *Card) *EventResponse {
 	}
 }
 
+// updateMessageResponse creates a synchronous EventResponse that updates the
+// triggering message in place (e.g. replacing a confirmation card with a result).
+func updateMessageResponse(event *ChatEvent, text string) *EventResponse {
+	return &EventResponse{
+		UpdateMessage: &SendMessageRequest{
+			SpaceID:  event.SpaceID,
+			ThreadID: event.ThreadID,
+			Text:     text,
+		},
+	}
+}
+
 // requireSpaceLink checks that the space is linked to a project, returning an error response if not.
 func (r *CommandRouter) requireSpaceLink(ctx context.Context, event *ChatEvent) (*state.SpaceLink, *EventResponse) {
 	link, err := r.store.GetSpaceLink(event.SpaceID, event.Platform)
@@ -1400,8 +2140,27 @@ func (r *CommandRouter) requireSpaceLink(ctx context.Context, event *ChatEvent) 
 	return link, nil
 }
 
+// senderEmailForUser returns the Hub-registered email for the event's user.
+// Falls back to the chat platform email if no identity mapper is configured
+// (e.g. in tests). This keeps sender identity consistent across all commands.
+func (r *CommandRouter) senderEmailForUser(ctx context.Context, event *ChatEvent) string {
+	if r.idMapper != nil {
+		mapping, err := r.idMapper.Resolve(event.UserID, event.Platform)
+		if err == nil && mapping != nil && mapping.HubUserEmail != "" {
+			return mapping.HubUserEmail
+		}
+	}
+	if event.UserEmail != "" {
+		return event.UserEmail
+	}
+	return "unknown"
+}
+
 // clientForUser creates a Hub client authenticated as the event's user.
 func (r *CommandRouter) clientForUser(ctx context.Context, event *ChatEvent) (hubclient.Client, error) {
+	if r.testClient != nil {
+		return r.testClient, nil
+	}
 	mapping, err := r.idMapper.ResolveOrAutoRegister(ctx, &eventUserLookup{event}, event.UserID, event.Platform)
 	if err != nil {
 		return nil, err

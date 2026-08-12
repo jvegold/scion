@@ -76,7 +76,8 @@ type OnBehalfOfResolver interface {
 type BrokerAuthService struct {
 	config             BrokerAuthConfig
 	store              store.Store
-	nonces             *NonceCache
+	nonces             *NonceCache      // in-memory fallback (used when DB is unavailable)
+	nonceStore         *NonceCacheStore // DB-backed nonce cache (used in multi-instance mode)
 	onBehalfOfResolver OnBehalfOfResolver
 }
 
@@ -167,6 +168,18 @@ func (bas *BrokerAuthService) Close() {
 	}
 }
 
+// SetNonceCacheStore sets a database-backed nonce cache store. When set, the
+// DB store is preferred over the in-memory cache for nonce replay detection.
+// This enables replay protection across multiple hub instances.
+func (bas *BrokerAuthService) SetNonceCacheStore(store *NonceCacheStore) {
+	bas.nonceStore = store
+}
+
+// NonceStore returns the database-backed nonce cache store, or nil if not set.
+func (bas *BrokerAuthService) NonceStore() *NonceCacheStore {
+	return bas.nonceStore
+}
+
 // =============================================================================
 // Broker Registration
 // =============================================================================
@@ -178,6 +191,11 @@ type CreateBrokerRegistrationRequest struct {
 	AutoProvide  bool              `json:"autoProvide,omitempty"`
 	Capabilities []string          `json:"capabilities,omitempty"`
 	Labels       map[string]string `json:"labels,omitempty"`
+
+	// GCP host identity — the GCP service account that runs on this broker's
+	// host. Set by the operator so the Hub can gate passthrough on actAs.
+	GCPHostServiceAccountEmail string `json:"gcpHostServiceAccountEmail,omitempty"`
+	GCPHostProjectID           string `json:"gcpHostProjectId,omitempty"`
 }
 
 // CreateBrokerRegistrationResponse is the response for POST /api/v1/brokers.
@@ -215,6 +233,10 @@ func (s *BrokerAuthService) CreateBrokerRegistration(ctx context.Context, req Cr
 		return nil, errors.New("name is required")
 	}
 
+	// GCP SA emails are case-insensitive; normalize to lowercase before
+	// storage so that later comparisons (e.g. actAs checks) are reliable.
+	req.GCPHostServiceAccountEmail = strings.ToLower(req.GCPHostServiceAccountEmail)
+
 	// Default broker-type label to "external" if not provided
 	if req.Labels == nil {
 		req.Labels = make(map[string]string)
@@ -248,6 +270,8 @@ func (s *BrokerAuthService) CreateBrokerRegistration(ctx context.Context, req Cr
 		brokerID = existingBroker.ID
 		reregistered = true
 		existingBroker.AutoProvide = req.AutoProvide
+		existingBroker.GCPHostServiceAccountEmail = req.GCPHostServiceAccountEmail
+		existingBroker.GCPHostProjectID = req.GCPHostProjectID
 		// Merge request labels into existing labels to preserve any
 		// user-set labels while updating registration-provided ones.
 		if len(req.Labels) > 0 {
@@ -271,15 +295,17 @@ func (s *BrokerAuthService) CreateBrokerRegistration(ctx context.Context, req Cr
 		}
 
 		broker := &store.RuntimeBroker{
-			ID:          brokerID,
-			Name:        req.Name,
-			Slug:        slugify(req.Name),
-			Status:      store.BrokerStatusOffline,
-			AutoProvide: req.AutoProvide,
-			Labels:      req.Labels,
-			Created:     time.Now(),
-			Updated:     time.Now(),
-			CreatedBy:   createdBy,
+			ID:                         brokerID,
+			Name:                       req.Name,
+			Slug:                       slugify(req.Name),
+			Status:                     store.BrokerStatusOffline,
+			AutoProvide:                req.AutoProvide,
+			Labels:                     req.Labels,
+			GCPHostServiceAccountEmail: req.GCPHostServiceAccountEmail,
+			GCPHostProjectID:           req.GCPHostProjectID,
+			Created:                    time.Now(),
+			Updated:                    time.Now(),
+			CreatedBy:                  createdBy,
 		}
 
 		if err := s.store.CreateRuntimeBroker(ctx, broker); err != nil {
@@ -505,10 +531,23 @@ func (s *BrokerAuthService) ValidateBrokerSignature(ctx context.Context, r *http
 		return nil, fmt.Errorf("timestamp outside acceptable range (skew: %v)", clockSkew)
 	}
 
-	// Validate nonce if enabled
-	if s.nonces != nil && nonce != "" {
-		if !s.nonces.Add(nonce) {
-			return nil, errors.New("nonce already used (possible replay attack)")
+	// Validate nonce if enabled — use DB-backed store for multi-instance
+	// replay protection when configured; otherwise use in-memory cache.
+	// DB errors are fail-closed (request is rejected, not silently passed).
+	// Defence-in-depth: guard against empty nonce reaching the DB store.
+	if s.config.EnableNonceCache && nonce != "" {
+		if s.nonceStore != nil {
+			isNew, err := s.nonceStore.CheckAndStore(ctx, nonce, s.config.NonceCacheTTL)
+			if err != nil {
+				return nil, fmt.Errorf("nonce cache check failed: %w", err)
+			}
+			if !isNew {
+				return nil, errors.New("nonce already used (possible replay attack)")
+			}
+		} else if s.nonces != nil {
+			if !s.nonces.Add(nonce) {
+				return nil, errors.New("nonce already used (possible replay attack)")
+			}
 		}
 	}
 
@@ -766,10 +805,23 @@ func (s *BrokerAuthService) validateWithSecret(ctx context.Context, r *http.Requ
 		return nil, errors.New("invalid signature")
 	}
 
-	// Only add nonce to cache after successful validation
-	if s.nonces != nil && nonce != "" {
-		if !s.nonces.Add(nonce) {
-			return nil, errors.New("nonce already used (possible replay attack)")
+	// Only add nonce to cache after successful validation — use DB-backed
+	// store for multi-instance replay protection when configured; otherwise
+	// use in-memory cache. DB errors are fail-closed.
+	// Defence-in-depth: guard against empty nonce reaching the DB store.
+	if s.config.EnableNonceCache && nonce != "" {
+		if s.nonceStore != nil {
+			isNew, err := s.nonceStore.CheckAndStore(ctx, nonce, s.config.NonceCacheTTL)
+			if err != nil {
+				return nil, fmt.Errorf("nonce cache check failed: %w", err)
+			}
+			if !isNew {
+				return nil, errors.New("nonce already used (possible replay attack)")
+			}
+		} else if s.nonces != nil {
+			if !s.nonces.Add(nonce) {
+				return nil, errors.New("nonce already used (possible replay attack)")
+			}
 		}
 	}
 

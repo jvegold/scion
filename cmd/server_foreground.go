@@ -17,6 +17,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,7 +34,9 @@ import (
 	"sync"
 	"time"
 
+	policytroubleshooteriam "cloud.google.com/go/policytroubleshooter/iam/apiv3"
 	"github.com/google/uuid"
+	"google.golang.org/api/option"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -241,7 +244,7 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// 10b. Initialize plugin manager
-	pluginMgr := initPluginManager(ctx, secretBackend)
+	pluginMgr := initPluginManager(ctx, secretBackend, s)
 	defer pluginMgr.Shutdown()
 
 	// 11. Start Hub
@@ -583,6 +586,29 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 					log.Printf("Message broker spoke added: name=%s channel_id=%s observer=%v", bt, channelID, observer)
 				}
 
+				// Register the native web channel spoke. It follows the same
+				// contract as every plugin adapter: Subscribe discards the handler
+				// (F7/F8, #944), Publish does real work (webchat_* state).
+				// Observer: true so a state-write failure degrades the thread rail
+				// rather than failing the user's message.
+				if dbProvider, ok := s.(interface{ DB() *sql.DB }); ok {
+					if rawDB := dbProvider.DB(); rawDB != nil {
+						webStore := hub.NewWebChatStore(rawDB, cfg.Database.Driver)
+						if err := webStore.Init(); err != nil {
+							log.Printf("Warning: failed to initialize webchat store: %v", err)
+						} else {
+							webSpoke := hub.NewWebChannelBus(logging.Subsystem("hub.eventbus.web"), webStore)
+							namedBuses = append(namedBuses, eventbus.NamedEventBus{
+								Name:      "web",
+								ChannelID: "web",
+								Bus:       webSpoke,
+								Observer:  true,
+							})
+							log.Printf("Message broker spoke added: name=web channel_id=web observer=true")
+						}
+					}
+				}
+
 				fanout := eventbus.NewFanOutEventBus(namedBuses, logging.Subsystem("hub.eventbus.fanout"))
 				hubSrv.StartMessageBroker(fanout)
 				log.Printf("Message broker started: fan-out with %d spoke(s)", len(namedBuses))
@@ -909,6 +935,14 @@ func validateHostedHAPreflight(cfg *config.GlobalConfig) error {
 		return nil
 	}
 
+	// Require an explicitly configured hub_id so all instances share the same
+	// GCS prefix, secret scopes, and DB lookups. Without this, each Cloud Run
+	// instance derives a different hubId from its hostname, causing divergent
+	// state (audit finding C1).
+	if cfg.Hub.IsHubIDUnconfigured() {
+		return fmt.Errorf("hosted HA deployment requires an explicit server.hub.hub_id; without it each instance derives a different ID from its hostname, causing divergent GCS prefixes and secret scopes")
+	}
+
 	if !strings.EqualFold(cfg.Database.Driver, "postgres") {
 		return fmt.Errorf("hosted HA deployment requires server.database.driver=postgres; got %q (single-instance VM deployments do not require Postgres)", cfg.Database.Driver)
 	}
@@ -1149,6 +1183,45 @@ func migrateStore(ctx context.Context, cfg *config.GlobalConfig, s *entadapter.C
 	}
 	locked = false
 	return nil
+}
+
+// runWithAdvisoryLock runs fn under a TryAdvisoryLock if the store implements
+// AdvisoryLocker. On non-Postgres backends (SQLite) or when the store is nil,
+// fn runs unconditionally — single-writer backends don't need coordination.
+// This is the generic helper for boot-time migrations that must not race
+// across replicas (audit finding C6).
+//
+// When the lock is held by another replica, fn is silently skipped. This is
+// safe because all guarded boot migrations are idempotent: each one checks
+// whether its work has already been done (e.g. MigrateStorageOnFirstBoot
+// checks for existing namespaced objects, BootstrapBundledResources uses
+// SkipIfAnyExist, migrateInlineSecrets checks for existing secret values)
+// and no-ops if so. The winning replica does the work; the others skip it
+// here and will see the completed state on their next access.
+func runWithAdvisoryLock(ctx context.Context, s store.Store, key store.AdvisoryLockKey, label string, fn func()) {
+	if s == nil {
+		fn()
+		return
+	}
+	locker, ok := s.(store.AdvisoryLocker)
+	if !ok {
+		fn()
+		return
+	}
+	acquired, release, err := locker.TryAdvisoryLock(ctx, key)
+	if err != nil {
+		slog.Error("Failed to acquire advisory lock", "label", label, "error", err)
+		return
+	}
+	if !acquired {
+		// release is safe to call even when not acquired (per AdvisoryLocker
+		// contract), but we call it here explicitly before returning.
+		_ = release()
+		slog.Info("Advisory lock held by another replica, skipping", "label", label)
+		return
+	}
+	defer func() { _ = release() }()
+	fn()
 }
 
 // maybeMigrateLegacySQLite detects a legacy raw-SQL hub.db at path and, unless
@@ -1451,9 +1524,11 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 				},
 			},
 		},
-		MaintenanceConfig: resolveMaintenanceConfig(cfg),
-		SecretBackend:     secretBackend,
-		GCPProjectID:      cfg.Hub.GCPProjectID,
+		MaintenanceConfig:       resolveMaintenanceConfig(cfg),
+		SecretBackend:           secretBackend,
+		GCPIAMCheckMode:         cfg.Hub.GCPIAMCheckMode,
+		GCPIAMDenyUnknownPolicy: cfg.Hub.GCPIAMDenyUnknownPolicy,
+		GCPProjectID:            cfg.Hub.GCPProjectID,
 		// Derive the agent/user JWT signing keys from the same shared session
 		// secret the web cookie store uses, so every replica behind the load
 		// balancer agrees on the signing key regardless of its host-derived
@@ -1466,6 +1541,7 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 		// new host that changed the HubID). Operators enabling this must supply a
 		// session secret or pre-provision the signing keys.
 		RequireStableSigningKey: os.Getenv("SCION_REQUIRE_STABLE_SIGNING_KEY") == "true",
+		OIDCLogin:               cfg.OIDCLogin,
 		OIDCConfig:              cfg.OIDC,
 		Federation:              cfg.Federation,
 	}
@@ -1577,7 +1653,7 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 	if hubID != "" && storageBucket != "" {
 		slog.Info("storage: using hub-scoped GCS paths", "hub_id", hubID, "prefix", "hubs/"+hubID+"/")
 	}
-	if storageBucket != "" && cfg.Hub.IsHubIDAutoGenerated() {
+	if storageBucket != "" && cfg.Hub.IsHubIDUnconfigured() {
 		slog.Warn("storage: hub_id was auto-generated from hostname; "+
 			"set an explicit hub_id in settings for multi-hub deployments",
 			"hub_id", hubID,
@@ -1623,18 +1699,52 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 		}
 	}
 
+	// Initialize Policy Troubleshooter checker for actAs checks.
+	// Non-fatal if the PT API is not available — the existing disabled checker
+	// remains in place and denies when mode is "enforce" (fail-closed by
+	// construction). Requires a GCP project ID for quota/billing context and
+	// the GCP token generator for diagnostic messages.
+	ptProjectID, ptProjErr := hub.ResolveGCPProjectID(cfg.Hub.GCPProjectID)
+	if ptProjErr != nil {
+		log.Printf("Policy Troubleshooter: no GCP project ID available (actAs check will be unavailable): %v", ptProjErr)
+	} else {
+		ptClient, ptErr := policytroubleshooteriam.NewPolicyTroubleshooterClient(ctx,
+			option.WithQuotaProject(ptProjectID),
+		)
+		if ptErr != nil {
+			log.Printf("Policy Troubleshooter not available (actAs check will be unavailable; ensure Policy Troubleshooter API is enabled and Hub SA has serviceUsage.serviceUsageConsumer role): %v", ptErr)
+		} else {
+			hubSAEmail := ""
+			if gcpErr == nil {
+				hubSAEmail = gcpGen.ServiceAccountEmail()
+			}
+			checker := hub.NewPolicyTroubleshooterChecker(ptClient, hubSAEmail, hubSrv.DenyUnknownFailOpen())
+			cached := hub.NewCachedCallerPermissionChecker(checker,
+				60*time.Second, // allowTTL
+				10*time.Second, // denyTTL
+			)
+			hubSrv.SetSAAssignChecker(cached)
+			hubSrv.SetHookIdentityChecker(cached)
+			// Both surfaces share one checker instance and one cache.
+			log.Printf("Policy Troubleshooter checker configured for actAs checks (quota project: %s)", ptProjectID)
+		}
+	}
+
 	if hostedMode {
 		// Hosted mode: bootstrap bundled resources directly into the Hub from
 		// the binary's embedded catalog. This removes the dependency on local
 		// ~/.scion directories and ensures every replica converges on the same
-		// DB + storage state.
-		if err := hubSrv.BootstrapBundledResources(ctx, hub.BootstrapOptions{
-			RepairStorage:   true,
-			OverwritePolicy: hub.OverwriteBuiltinManaged,
-			SkipIfAnyExist:  true,
-		}); err != nil {
-			log.Printf("Warning: bundled resource bootstrap failed: %v", err)
-		}
+		// DB + storage state. Advisory lock prevents concurrent replicas from
+		// racing this bootstrap (audit finding C6).
+		runWithAdvisoryLock(ctx, s, store.LockBundledResources, "bundled resource bootstrap", func() {
+			if err := hubSrv.BootstrapBundledResources(ctx, hub.BootstrapOptions{
+				RepairStorage:   true,
+				OverwritePolicy: hub.OverwriteBuiltinManaged,
+				SkipIfAnyExist:  true,
+			}); err != nil {
+				log.Printf("Warning: bundled resource bootstrap failed: %v", err)
+			}
+		})
 	} else {
 		// Workstation mode: import from local ~/.scion directories. These were
 		// refreshed from embeds earlier in the startup sequence.
@@ -1651,7 +1761,10 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 	// On first boot with hub-namespaced paths, copy legacy GCS objects to
 	// the hub-scoped prefix so that subsequent sync/dispatch uses the
 	// namespaced paths. Runs synchronously before SyncAll* calls.
-	hubSrv.MigrateStorageOnFirstBoot(ctx)
+	// Advisory lock prevents concurrent replicas from racing (audit finding C6).
+	runWithAdvisoryLock(ctx, s, store.LockStorageMigration, "storage migration", func() {
+		hubSrv.MigrateStorageOnFirstBoot(ctx)
+	})
 
 	// Reconcile resource DB manifest hashes against actual GCS content.
 	// In multi-hub mode a peer hub may have uploaded newer files; this ensures
@@ -2390,7 +2503,9 @@ func isObserverBroker(pluginMgr *scionplugin.Manager, name string) bool {
 // initPluginManager creates and loads a plugin manager from versioned settings.
 // The secretBackend parameter (may be nil) enables one-shot migration of inline
 // secrets to the backend before ResolvePluginConfig strips them.
-func initPluginManager(ctx context.Context, secretBackend secret.SecretBackend) *scionplugin.Manager {
+// The dataStore parameter (may be nil) is used to acquire an advisory lock
+// around the inline secrets migration to prevent races across replicas.
+func initPluginManager(ctx context.Context, secretBackend secret.SecretBackend, dataStore store.Store) *scionplugin.Manager {
 	logger := logging.Subsystem("plugin")
 	mgr := scionplugin.NewManager(logger)
 	mgr.NewGRPCBrokerAdapter = grpcbroker.NewAdapterFromEntry
@@ -2410,15 +2525,19 @@ func initPluginManager(ctx context.Context, secretBackend secret.SecretBackend) 
 	pluginsCfg := scionplugin.PluginsConfig{
 		Broker: make(map[string]scionplugin.PluginEntry),
 	}
-	for name, entry := range vs.Server.Plugins.Broker {
-		// B1: Auto-migrate inline secrets to the secret backend before
-		// ResolvePluginConfig strips them. This ensures existing users
-		// with bot_token in settings.yaml don't lose their credentials
-		// on upgrade.
-		if secretBackend != nil && entry.Config != nil {
-			migrateInlineSecrets(ctx, secretBackend, name, entry.Config)
-		}
+	// Migrate inline secrets under advisory lock to prevent concurrent replicas
+	// from racing the one-shot migration (audit finding C6).
+	if secretBackend != nil {
+		runWithAdvisoryLock(ctx, dataStore, store.LockInlineSecretsMigration, "inline secrets migration", func() {
+			for name, entry := range vs.Server.Plugins.Broker {
+				if entry.Config != nil {
+					migrateInlineSecrets(ctx, secretBackend, name, entry.Config)
+				}
+			}
+		})
+	}
 
+	for name, entry := range vs.Server.Plugins.Broker {
 		mergedConfig, mergeErr := config.ResolvePluginConfig(entry.ConfigFile, entry.Config)
 		if mergeErr != nil {
 			log.Printf("Warning: failed to load config file for plugin %q: %v", name, mergeErr)

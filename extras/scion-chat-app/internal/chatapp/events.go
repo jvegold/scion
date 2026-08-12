@@ -20,6 +20,7 @@ type ChatEvent struct {
 	Platform        string
 	SpaceID         string
 	ThreadID        string
+	MessageName     string // message resource name (e.g. "spaces/x/messages/y") for UpdateMessage
 	UserID          string
 	UserEmail       string // user's email from the chat platform (Google-asserted identity)
 	UserDisplayName string
@@ -29,8 +30,16 @@ type ChatEvent struct {
 	ActionID        string
 	ActionData      string
 	DialogData      map[string]string
-	InteractionAdd  bool // true when added to space via @mention (multi-turn)
-	IsDialogEvent   bool // true when the event is a dialog request/submit
+	Attachments     []EventAttachment // files uploaded by the user
+	InteractionAdd  bool              // true when added to space via @mention (multi-turn)
+	IsDialogEvent   bool              // true when the event is a dialog request/submit
+}
+
+// EventAttachment represents a file attached to an inbound chat event.
+type EventAttachment struct {
+	Name        string // display name of the file
+	ContentType string // MIME type
+	DownloadURI string // URL to download the file content (requires authenticated client)
 }
 
 // EventResponse holds an optional synchronous response to return in the HTTP body.

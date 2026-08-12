@@ -106,6 +106,9 @@ const PLATFORM_SECRETS: Record<string, PlatformSecretDef[]> = {
   gchat: [
     { key: 'signing_key', label: 'Hub Signing Key', description: 'Shared signing key for hub authentication (HS256 JWT)', required: true },
   ],
+  teams: [
+    { key: 'app_secret', label: 'App Secret', description: 'Azure App Registration client secret' },
+  ],
 };
 
 function resolvePlatform(name: string): string {
@@ -115,6 +118,7 @@ function resolvePlatform(name: string): string {
     case 'slack': return 'slack';
     case 'chat-app': return 'gchat';
     case 'a2a-bridge': return 'a2a';
+    case 'teams': return 'teams';
     default: return name;
   }
 }
@@ -191,6 +195,12 @@ const PLATFORM_FIELDS: Record<string, PlatformFieldDef[]> = {
     { key: 'listen_address', label: 'Webhook Listen Address', description: 'HTTP listen address for webhook mode', defaultValue: ':8443' },
     { key: 'external_url', label: 'External URL', description: 'Public URL where Google Chat sends events', defaultValue: '' },
     { key: 'service_account_email', label: 'Service Account Email', description: 'Email of the GCP service account (for JWT verification)', defaultValue: '' },
+  ],
+  teams: [
+    { key: 'app_id', label: 'Application (Client) ID', description: 'Azure App Registration Client ID', defaultValue: '', placeholder: 'e.g. 12345678-abcd-1234-efgh-123456789012' },
+    { key: 'tenant_id', label: 'Tenant ID', description: 'Azure AD Tenant ID (GUID)', defaultValue: '', placeholder: 'e.g. 12345678-abcd-1234-efgh-123456789012' },
+    { key: 'listen_address', label: 'Listen Address', description: 'HTTP listen address for the Teams webhook endpoint', defaultValue: ':3978', placeholder: ':3978' },
+    { key: 'db_path', label: 'Database Path', description: 'Path to SQLite database', defaultValue: '~/.scion/scion-teams.db', placeholder: '~/.scion/scion-teams.db' },
   ],
 };
 
@@ -1009,6 +1019,7 @@ export class ScionPageAdminIntegrations extends LitElement {
       ${this.renderConfigSection(d)}
       ${this.renderA2AProjectsSection(d)}
       ${this.renderDiscordInviteLink(d)}
+      ${this.renderTeamsSetupSection(d)}
       ${this.renderActionsSection()}
     `;
   }
@@ -1483,6 +1494,71 @@ export class ScionPageAdminIntegrations extends LitElement {
     `;
   }
 
+  private renderTeamsSetupSection(d: IntegrationDetail) {
+    const platform = resolvePlatform(d.name);
+    if (platform !== 'teams') return nothing;
+
+    const appId = (d.settings['app_id'] ?? '').trim();
+    const tenantId = (d.settings['tenant_id'] ?? '').trim();
+    if (!appId || !tenantId) return nothing;
+
+    const downloadUrl = '/api/v1/admin/integrations/teams/manifest';
+    const messagingEndpoint = `${window.location.origin}/api/messages`;
+
+    return html`
+      <div class="section">
+        <h3 class="section-title">Teams App Package</h3>
+        <div class="invite-link-container">
+          <div class="invite-link-info">
+            <sl-icon name="download"></sl-icon>
+            <div>
+              <p class="invite-link-description">Download the Teams app package (.zip)</p>
+              <p class="invite-link-permissions">
+                Upload it to your Microsoft Teams Admin Center or sideload it in Teams to enable the bot integration.
+              </p>
+            </div>
+          </div>
+          <sl-button
+            variant="primary"
+            size="small"
+            href=${downloadUrl}
+            download="teams-app.zip"
+          >
+            <sl-icon slot="prefix" name="download"></sl-icon>
+            Download App Package
+          </sl-button>
+        </div>
+        <div class="invite-link-container" style="margin-top: 1rem;">
+          <div class="invite-link-info">
+            <sl-icon name="link-45deg"></sl-icon>
+            <div>
+              <p class="invite-link-description">Messaging Endpoint</p>
+              <p class="invite-link-permissions">
+                Set this URL in your Azure Bot resource → Configuration page.
+              </p>
+            </div>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem;">
+          <sl-input
+            readonly
+            value=${messagingEndpoint}
+            style="flex: 1;"
+          ></sl-input>
+          <sl-button
+            size="small"
+            @click=${() => {
+              void navigator.clipboard.writeText(messagingEndpoint);
+            }}
+          >
+            <sl-icon slot="prefix" name="clipboard"></sl-icon>
+            Copy
+          </sl-button>
+        </div>
+      </div>
+    `;
+  }
+
   private renderSelfManagedSetupSection(d: IntegrationDetail) {
     const platform = resolvePlatform(d.name);
 
@@ -1742,6 +1818,8 @@ export class ScionPageAdminIntegrations extends LitElement {
         return 'Google Chat';
       case 'a2a':
         return 'A2A Bridge';
+      case 'teams':
+        return 'Microsoft Teams';
       default:
         return platform;
     }

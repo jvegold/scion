@@ -29,6 +29,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/maintenanceoperation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/maintenanceoperationrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/message"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/noncecache"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notification"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notificationsubscription"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/policybinding"
@@ -344,20 +345,28 @@ func init() {
 	gcpserviceaccountDescVerified := gcpserviceaccountFields[7].Descriptor()
 	// gcpserviceaccount.DefaultVerified holds the default value on creation for the verified field.
 	gcpserviceaccount.DefaultVerified = gcpserviceaccountDescVerified.Default.(bool)
+	// gcpserviceaccountDescVerificationStatus is the schema descriptor for verification_status field.
+	gcpserviceaccountDescVerificationStatus := gcpserviceaccountFields[9].Descriptor()
+	// gcpserviceaccount.DefaultVerificationStatus holds the default value on creation for the verification_status field.
+	gcpserviceaccount.DefaultVerificationStatus = gcpserviceaccountDescVerificationStatus.Default.(string)
+	// gcpserviceaccountDescVerificationError is the schema descriptor for verification_error field.
+	gcpserviceaccountDescVerificationError := gcpserviceaccountFields[10].Descriptor()
+	// gcpserviceaccount.DefaultVerificationError holds the default value on creation for the verification_error field.
+	gcpserviceaccount.DefaultVerificationError = gcpserviceaccountDescVerificationError.Default.(string)
 	// gcpserviceaccountDescCreatedBy is the schema descriptor for created_by field.
-	gcpserviceaccountDescCreatedBy := gcpserviceaccountFields[9].Descriptor()
+	gcpserviceaccountDescCreatedBy := gcpserviceaccountFields[11].Descriptor()
 	// gcpserviceaccount.DefaultCreatedBy holds the default value on creation for the created_by field.
 	gcpserviceaccount.DefaultCreatedBy = gcpserviceaccountDescCreatedBy.Default.(string)
 	// gcpserviceaccountDescManaged is the schema descriptor for managed field.
-	gcpserviceaccountDescManaged := gcpserviceaccountFields[10].Descriptor()
+	gcpserviceaccountDescManaged := gcpserviceaccountFields[12].Descriptor()
 	// gcpserviceaccount.DefaultManaged holds the default value on creation for the managed field.
 	gcpserviceaccount.DefaultManaged = gcpserviceaccountDescManaged.Default.(bool)
 	// gcpserviceaccountDescManagedBy is the schema descriptor for managed_by field.
-	gcpserviceaccountDescManagedBy := gcpserviceaccountFields[11].Descriptor()
+	gcpserviceaccountDescManagedBy := gcpserviceaccountFields[13].Descriptor()
 	// gcpserviceaccount.DefaultManagedBy holds the default value on creation for the managed_by field.
 	gcpserviceaccount.DefaultManagedBy = gcpserviceaccountDescManagedBy.Default.(string)
 	// gcpserviceaccountDescCreated is the schema descriptor for created field.
-	gcpserviceaccountDescCreated := gcpserviceaccountFields[12].Descriptor()
+	gcpserviceaccountDescCreated := gcpserviceaccountFields[14].Descriptor()
 	// gcpserviceaccount.DefaultCreated holds the default value on creation for the created field.
 	gcpserviceaccount.DefaultCreated = gcpserviceaccountDescCreated.Default.(func() time.Time)
 	// gcpserviceaccountDescID is the schema descriptor for id field.
@@ -736,14 +745,40 @@ func init() {
 	messageDescDispatchState := messageFields[13].Descriptor()
 	// message.DefaultDispatchState holds the default value on creation for the dispatch_state field.
 	message.DefaultDispatchState = messageDescDispatchState.Default.(string)
+	// messageDescChannel is the schema descriptor for channel field.
+	messageDescChannel := messageFields[16].Descriptor()
+	// message.ChannelValidator is a validator for the "channel" field. It is called by the builders before save.
+	message.ChannelValidator = messageDescChannel.Validators[0].(func(string) error)
+	// messageDescThreadID is the schema descriptor for thread_id field.
+	messageDescThreadID := messageFields[17].Descriptor()
+	// message.ThreadIDValidator is a validator for the "thread_id" field. It is called by the builders before save.
+	message.ThreadIDValidator = messageDescThreadID.Validators[0].(func(string) error)
+	// messageDescVisibility is the schema descriptor for visibility field.
+	messageDescVisibility := messageFields[18].Descriptor()
+	// message.VisibilityValidator is a validator for the "visibility" field. It is called by the builders before save.
+	message.VisibilityValidator = messageDescVisibility.Validators[0].(func(string) error)
 	// messageDescCreated is the schema descriptor for created field.
-	messageDescCreated := messageFields[16].Descriptor()
+	messageDescCreated := messageFields[19].Descriptor()
 	// message.DefaultCreated holds the default value on creation for the created field.
 	message.DefaultCreated = messageDescCreated.Default.(func() time.Time)
 	// messageDescID is the schema descriptor for id field.
 	messageDescID := messageFields[0].Descriptor()
 	// message.DefaultID holds the default value on creation for the id field.
 	message.DefaultID = messageDescID.Default.(func() uuid.UUID)
+	noncecacheFields := schema.NonceCache{}.Fields()
+	_ = noncecacheFields
+	// noncecacheDescNonce is the schema descriptor for nonce field.
+	noncecacheDescNonce := noncecacheFields[1].Descriptor()
+	// noncecache.NonceValidator is a validator for the "nonce" field. It is called by the builders before save.
+	noncecache.NonceValidator = noncecacheDescNonce.Validators[0].(func(string) error)
+	// noncecacheDescCreatedAt is the schema descriptor for created_at field.
+	noncecacheDescCreatedAt := noncecacheFields[3].Descriptor()
+	// noncecache.DefaultCreatedAt holds the default value on creation for the created_at field.
+	noncecache.DefaultCreatedAt = noncecacheDescCreatedAt.Default.(func() time.Time)
+	// noncecacheDescID is the schema descriptor for id field.
+	noncecacheDescID := noncecacheFields[0].Descriptor()
+	// noncecache.DefaultID holds the default value on creation for the id field.
+	noncecache.DefaultID = noncecacheDescID.Default.(func() uuid.UUID)
 	notificationFields := schema.Notification{}.Fields()
 	_ = notificationFields
 	// notificationDescSubscriberType is the schema descriptor for subscriber_type field.
@@ -945,11 +980,11 @@ func init() {
 	// runtimebroker.DefaultAutoProvide holds the default value on creation for the auto_provide field.
 	runtimebroker.DefaultAutoProvide = runtimebrokerDescAutoProvide.Default.(bool)
 	// runtimebrokerDescCreated is the schema descriptor for created field.
-	runtimebrokerDescCreated := runtimebrokerFields[21].Descriptor()
+	runtimebrokerDescCreated := runtimebrokerFields[23].Descriptor()
 	// runtimebroker.DefaultCreated holds the default value on creation for the created field.
 	runtimebroker.DefaultCreated = runtimebrokerDescCreated.Default.(func() time.Time)
 	// runtimebrokerDescUpdated is the schema descriptor for updated field.
-	runtimebrokerDescUpdated := runtimebrokerFields[22].Descriptor()
+	runtimebrokerDescUpdated := runtimebrokerFields[24].Descriptor()
 	// runtimebroker.DefaultUpdated holds the default value on creation for the updated field.
 	runtimebroker.DefaultUpdated = runtimebrokerDescUpdated.Default.(func() time.Time)
 	// runtimebroker.UpdateDefaultUpdated holds the default value on update for the updated field.

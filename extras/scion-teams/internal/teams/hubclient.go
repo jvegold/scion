@@ -222,9 +222,9 @@ func (c *HubClient) ListAgents(ctx context.Context, projectID string) ([]AgentIn
 }
 
 // ListProjects returns all projects visible to the broker.
-// GET /api/v1/projects
+// GET /api/v1/broker/projects
 func (c *HubClient) ListProjects(ctx context.Context) ([]ProjectOption, error) {
-	u := c.hubURL + "/api/v1/projects"
+	u := c.hubURL + "/api/v1/broker/projects"
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
@@ -248,6 +248,42 @@ func (c *HubClient) ListProjects(ctx context.Context) ([]ProjectOption, error) {
 	var result hubProjectsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode list projects response: %w", err)
+	}
+
+	projects := make([]ProjectOption, len(result.Projects))
+	for i, p := range result.Projects {
+		projects[i] = ProjectOption{ID: p.ID, Name: p.Name, Slug: p.Slug}
+	}
+	return projects, nil
+}
+
+// ListProjectsForUser returns projects owned by or associated with a specific user.
+// GET /api/v1/projects?ownerId=<ownerID>
+func (c *HubClient) ListProjectsForUser(ctx context.Context, ownerID string) ([]ProjectOption, error) {
+	u := c.hubURL + "/api/v1/projects?ownerId=" + url.QueryEscape(ownerID)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create list user projects request: %w", err)
+	}
+	if err := c.signRequest(req); err != nil {
+		return nil, fmt.Errorf("sign request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list user projects request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, fmt.Errorf("list user projects returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result hubProjectsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode list user projects response: %w", err)
 	}
 
 	projects := make([]ProjectOption, len(result.Projects))
@@ -337,28 +373,28 @@ func (c *HubClient) RegisterTeamsLink(ctx context.Context, teamsUserID string) (
 
 // CheckTeamsLinkStatus polls the hub for the status of a pending identity link.
 // GET /api/v1/teams/link/status?teams_user_id=...
-func (c *HubClient) CheckTeamsLinkStatus(ctx context.Context, teamsUserID string) (string, string, error) {
+func (c *HubClient) CheckTeamsLinkStatus(ctx context.Context, teamsUserID string) (status string, userID string, email string, err error) {
 	u := fmt.Sprintf("%s/api/v1/teams/link/status?teams_user_id=%s",
 		c.hubURL, url.QueryEscape(teamsUserID))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
-		return "", "", fmt.Errorf("create link status request: %w", err)
+		return "", "", "", fmt.Errorf("create link status request: %w", err)
 	}
 
 	if err := c.signRequest(req); err != nil {
-		return "", "", fmt.Errorf("sign request: %w", err)
+		return "", "", "", fmt.Errorf("sign request: %w", err)
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("link status request failed: %w", err)
+		return "", "", "", fmt.Errorf("link status request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return "", "", fmt.Errorf("link status returned status %d: %s", resp.StatusCode, string(respBody))
+		return "", "", "", fmt.Errorf("link status returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var result struct {
@@ -369,15 +405,17 @@ func (c *HubClient) CheckTeamsLinkStatus(ctx context.Context, teamsUserID string
 		} `json:"user,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", "", fmt.Errorf("decode link status response: %w", err)
+		return "", "", "", fmt.Errorf("decode link status response: %w", err)
 	}
 
-	userID := ""
+	uid := ""
+	em := ""
 	if result.User != nil {
-		userID = result.User.ID
+		uid = result.User.ID
+		em = result.User.Email
 	}
 
-	return result.Status, userID, nil
+	return result.Status, uid, em, nil
 }
 
 // generateLinkCode produces a 6-character uppercase alphanumeric code using

@@ -386,7 +386,29 @@ gcloud iam service-accounts add-iam-policy-binding \
 
 Without this binding, template generation will fail with: `Permission 'iam.serviceAccounts.signBlob' denied on resource`.
 
-### 2e. Transport SA — IAP Access
+### 2e. Hub Runner SA — IAM Security Reviewer (Optional, for Policy Troubleshooter)
+
+When you enable GCP IAM check mode (`gcp_iam_check_mode: enforce`), Scion verifies that human and agent callers possess `iam.serviceAccounts.actAs` permission on assigned service accounts via the **GCP Policy Troubleshooter v3 API**.
+
+For Policy Troubleshooter to evaluate permissions across your project (or your entire organization if you assign SAs from multiple projects), the Hub Runner SA must be granted the **IAM Security Reviewer** role (`roles/iam.securityReviewer`):
+
+```bash
+# Grant Security Reviewer at the project level
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$SA_HUB" \
+  --role="roles/iam.securityReviewer" \
+  --quiet
+
+# (Optional) For multi-project or organization-wide SAs, grant at the org level instead:
+# export ORG_ID="your-gcp-organization-id"
+# gcloud organizations add-iam-policy-binding $ORG_ID \
+#   --member="serviceAccount:$SA_HUB" \
+#   --role="roles/iam.securityReviewer"
+```
+
+Without this permission, Policy Troubleshooter checks will return an indeterminate or unknown status (such as ACCESS_STATE_UNKNOWN_INFO_DENIED), which results in a **fail-closed** denial of service account assignment in Scion.
+
+### 2f. Transport SA — IAP Access
 
 The transport SA's identity is used in the IAP token. IAP must allow this identity to access
 the Hub:
@@ -418,7 +440,7 @@ gcloud run services add-iam-policy-binding scion-hub \
 Make sure your deployer identity has `roles/run.admin` before running this, as it modifies service-level IAM.
 :::
 
-### 2f. Discord Runner SA — IAP Access
+### 2g. Discord Runner SA — IAP Access
 
 The Discord service calls Hub APIs through IAP (for registration, message routing, etc.):
 
@@ -438,7 +460,7 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
   --quiet
 ```
 
-### 2g. GKE Workload Identity — Agent Pod Secret Access
+### 2h. GKE Workload Identity — Agent Pod Secret Access
 
 Agent pods need Workload Identity (WI) bindings to access Secret Manager for CSI-mounted
 secrets:
@@ -506,6 +528,7 @@ gcloud projects get-iam-policy $PROJECT_ID \
 | `scion-hub-runner` | `roles/container.developer` | Project | GKE agent dispatch |
 | `scion-hub-runner` | `roles/iam.serviceAccountTokenCreator` | **On itself** | Generate GCS signed URLs |
 | `scion-hub-runner` | `roles/iam.serviceAccountTokenCreator` | **On `scion-transport` SA** | Mint IAP tokens for agents |
+| `scion-hub-runner` | `roles/iam.securityReviewer` | Project/Org | Policy Troubleshooter (Optional, for SA assignment gates) |
 | `scion-transport` | `roles/iap.httpsResourceAccessor` | Project | Allow IAP access to Hub |
 | `scion-transport` | `roles/run.invoker` | Hub service | Allow Cloud Run invocation |
 | `scion-discord-runner` | `roles/cloudsql.client` | Project | Cloud SQL connections |
@@ -543,6 +566,12 @@ $$\text{core-base} \longrightarrow \text{scion-base} \longrightarrow \text{harne
 1. **`core-base`:** Contains core tools (Go compiler, Git from source, unix packages, GCS FUSE).
 2. **`scion-base`:** Copies repository code (`cmd/`, `pkg/`, etc.) and builds the `scion` and `sciontool` binaries on top of `core-base`.
 3. **Harnesses:** Pulls `scion-base` and adds target agent packages (like `@google/gemini-cli`).
+
+:::note[Compilation Constraint: `-tags no_embed_web`]
+By default, the Hub’s Go build process compiles and embeds the frontend web assets (`web/dist/`) into the final binary. However, compiling the frontend takes time and is not required for non-hub components.
+
+Any container or binary build for a **non-hub service** (such as the A2A bridge, Discord broker, custom harnesses, or utility binaries) that imports from the `pkg/` module **must compile with `-tags no_embed_web`**. If this tag is omitted, compilation will fail with errors in `web/embed.go` because the required frontend build artifacts do not exist.
+:::
 
 #### Single-Architecture AMD64 Speed Up
 :::tip[Avoid Emulation Build Timeouts]
@@ -668,6 +697,19 @@ server:
       oidc_audience: IAP_CLIENT_ID_PLACEHOLDER
       platform_auth_sa: scion-transport@PROJECT_ID.iam.gserviceaccount.com
 
+  # === OIDC IDENTITY PROVIDER ===
+  # Enables the Hub to act as an OIDC provider, publishing JWKS endpoints
+  # and minting identity tokens for agents to authenticate to external resources.
+  oidc:
+    enabled: true                      # Enabled to support agent identity tokens
+    token_lifetime: 15m                # Lifetime of minted OIDC identity tokens
+
+  # === OIDC FEDERATION ===
+  # Enables inbound federation from trusted external OIDC providers.
+  federation:
+    enabled: false                     # Disabled by default, configure if needed
+    trusted_issuers: []
+
   secrets:
     backend: gcpsm
     gcp_project_id: PROJECT_ID
@@ -685,6 +727,26 @@ server:
     enabled: true
     host: 127.0.0.1
 ```
+
+:::caution[Critical: Distinguishing IAP Audiences]
+Configuring IAP requires two different audience formats used in separate contexts:
+
+1. **`server.auth.proxy.iap.audience`** (Cloud Run native IAP audience path):
+   - **Format:** `/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME`
+   - **Purpose:** Used by the Hub to validate incoming IAP-signed JWTs (from browsers and human API calls).
+   - **Where to find:** GCP Console → Security → Identity-Aware Proxy → Select your backend service → click the three dots → select **Signed Header JWT Audience**.
+
+2. **`server.auth.transport.oidc_audience`** (IAP OAuth Client ID):
+   - **Format:** `PROJECT_NUMBER-xxxx.apps.googleusercontent.com`
+   - **Purpose:** Used as the audience minted into OIDC tokens for dispatched agents and brokers to authenticate and traverse Google IAP. IAP requires the OAuth client ID format for validating programmatically minted OIDC tokens, *not* the Cloud Run resource path.
+   - **Where to find:** GCP Console → Security → Identity-Aware Proxy → Select your backend service → click the three dots → select **Edit OAuth Client**.
+
+Using the wrong format for either field will cause startup verification or agent authentication to fail.
+:::
+
+:::tip[Proxy-Authorization Support]
+Cloud Run native IAP fully supports the `Proxy-Authorization: Bearer <Google OIDC ID token>` header. Dispatched agents and brokers can use either `Authorization` or `Proxy-Authorization` for the outer transport layer to pass through IAP. This prevents collisions if your client needs to use the standard `Authorization` header for internal Hub authentication.
+:::
 
 Replace placeholders with your live values:
 ```bash
@@ -790,6 +852,26 @@ export HUB_URL=$(gcloud run services describe scion-hub \
   --format="value(status.url)")
 echo "Hub URL: $HUB_URL"
 ```
+
+:::caution[Critical: New Cloud Run URL Format & Hub Endpoint Resolution]
+Cloud Run service URLs are provisioned in two formats:
+- **Legacy:** `https://scion-hub-PROJECT_NUMBER.REGION.run.app`
+- **New (default for newer projects):** `https://scion-hub-HASH-REGION.a.run.app`
+
+When the Hub is protected by IAP, it attempts to automatically resolve its own public URL from the IAP audience path. However, this automatic resolution **only works for the legacy format**. 
+
+If your printed `Hub URL` uses the new format containing a random hash (such as `.a.run.app`), the Hub's auto-derivation will fail, causing agent dispatching and OIDC federation to break. You **must set the `SCION_SERVER_BASE_URL` environment variable explicitly** to resolve this.
+
+**Action Required:**
+If your URL uses the new format, update your Cloud Run service to set this variable now:
+```bash
+gcloud run services update scion-hub \
+  --region=$REGION \
+  --project=$PROJECT_ID \
+  --update-env-vars="SCION_SERVER_BASE_URL=$HUB_URL"
+```
+For more information on how the Hub resolves endpoints, see the [Hub Endpoint Resolution Reference](/scion/reference/server-config/#hub-endpoint-resolution).
+:::
 
 Verify that unauthenticated endpoints are successfully blocked by IAP:
 ```bash
@@ -1093,6 +1175,19 @@ server:
       mode: iap
       oidc_audience: PROJECT_NUMBER-xxxx.apps.googleusercontent.com  # OAuth client ID
       platform_auth_sa: scion-transport@PROJECT_ID.iam.gserviceaccount.com
+
+  # === OIDC IDENTITY PROVIDER ===
+  # Enables the Hub to act as an OIDC provider, publishing JWKS endpoints
+  # and minting identity tokens for agents to authenticate to external resources.
+  oidc:
+    enabled: true                      # Enabled to support agent identity tokens
+    token_lifetime: 15m                # Lifetime of minted OIDC identity tokens
+
+  # === OIDC FEDERATION ===
+  # Enables inbound federation from trusted external OIDC providers.
+  federation:
+    enabled: false                     # Disabled by default, configure if needed
+    trusted_issuers: []
 
   secrets:
     backend: gcpsm
