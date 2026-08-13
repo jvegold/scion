@@ -229,7 +229,7 @@ func buildTeamsManifest(appID string) teamsManifest {
 	return teamsManifest{
 		Schema:          "https://developer.microsoft.com/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
 		ManifestVersion: "1.16",
-		Version:         "1.0.0",
+		Version:         "1.1.0",
 		ID:              appID,
 		Developer: teamsDevInfo{
 			Name:          "Scion",
@@ -264,6 +264,7 @@ func buildTeamsManifest(appID string) teamsManifest {
 							{Title: "unlink", Description: "Unlink this channel from its project"},
 							{Title: "agents", Description: "List agents in the linked project"},
 							{Title: "status", Description: "Show project or agent status"},
+							{Title: "default", Description: "Set or show the default agent for this channel"},
 							{Title: "register", Description: "Link your Teams account to your Scion identity"},
 							{Title: "unregister", Description: "Unlink your Teams account from Scion"},
 							{Title: "help", Description: "Show available commands"},

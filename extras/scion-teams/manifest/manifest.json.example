@@ -1,7 +1,7 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
   "manifestVersion": "1.16",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "id": "<YOUR_APP_ID>",
   "developer": {
     "name": "Your Organization",
@@ -55,6 +55,10 @@
             {
               "title": "status",
               "description": "Show project or agent status"
+            },
+            {
+              "title": "default",
+              "description": "Set or show the default agent for this channel"
             },
             {
               "title": "register",
