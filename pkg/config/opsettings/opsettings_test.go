@@ -865,6 +865,8 @@ func TestClassifyKeys_AllLayer0Prefixes(t *testing.T) {
 		"server.hub.cors",
 		"server.message_broker",
 		"server.plugins",
+		"server.native_chat",
+		"server.native_chat.enabled",
 	}
 
 	_, l0, unclassified := ClassifyKeys(layer0Keys)
@@ -1227,6 +1229,68 @@ func TestRuntimesKoanfRoundTrip(t *testing.T) {
 	}
 	if reloaded.String("runtimes.cloudrun.type") != "cloudrun-instances" {
 		t.Errorf("expected runtimes.cloudrun.type=cloudrun-instances, got %v", reloaded.Get("runtimes.cloudrun.type"))
+	}
+}
+
+// TestRuntimesCloudRunInstancesKoanfRoundTrip verifies that the nested
+// CloudRunInstances struct (cloudrun_instances.project_id, cloudrun_instances.region)
+// survives the koanf extract → JSON → reload → unmarshal round-trip.
+// This was the failing path described in issue #984.
+func TestRuntimesCloudRunInstancesKoanfRoundTrip(t *testing.T) {
+	k := koanf.New(".")
+	err := k.Load(confmap.Provider(map[string]interface{}{
+		"runtimes.docker.type":                      "docker",
+		"runtimes.cr.type":                          "cloudrun-instances",
+		"runtimes.cr.cloudrun_instances.project_id": "my-gcp-project",
+		"runtimes.cr.cloudrun_instances.region":     "us-central1",
+	}, "."), nil)
+	if err != nil {
+		t.Fatalf("load koanf: %v", err)
+	}
+
+	// Extract runtimes section as JSON.
+	raw, err := ExtractSectionFromKoanf(k, "runtimes")
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	// Verify nested struct is present in the extracted JSON.
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal JSON: %v", err)
+	}
+	crEntry, ok := doc["cr"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected cr entry in runtimes doc, got %v", doc)
+	}
+	crInstances, ok := crEntry["cloudrun_instances"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected cloudrun_instances sub-object in cr entry, got %v", crEntry)
+	}
+	if crInstances["project_id"] != "my-gcp-project" {
+		t.Errorf("expected cloudrun_instances.project_id=my-gcp-project, got %v", crInstances["project_id"])
+	}
+	if crInstances["region"] != "us-central1" {
+		t.Errorf("expected cloudrun_instances.region=us-central1, got %v", crInstances["region"])
+	}
+
+	// Reload into fresh koanf and verify the round-trip preserves keys.
+	sections := map[string]json.RawMessage{"runtimes": raw}
+	reloaded, err := LoadSectionsIntoKoanf(sections)
+	if err != nil {
+		t.Fatalf("load sections: %v", err)
+	}
+
+	if reloaded.String("runtimes.cr.type") != "cloudrun-instances" {
+		t.Errorf("expected runtimes.cr.type=cloudrun-instances, got %v", reloaded.Get("runtimes.cr.type"))
+	}
+	if reloaded.String("runtimes.cr.cloudrun_instances.project_id") != "my-gcp-project" {
+		t.Errorf("expected runtimes.cr.cloudrun_instances.project_id=my-gcp-project, got %v",
+			reloaded.Get("runtimes.cr.cloudrun_instances.project_id"))
+	}
+	if reloaded.String("runtimes.cr.cloudrun_instances.region") != "us-central1" {
+		t.Errorf("expected runtimes.cr.cloudrun_instances.region=us-central1, got %v",
+			reloaded.Get("runtimes.cr.cloudrun_instances.region"))
 	}
 }
 

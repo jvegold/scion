@@ -40,10 +40,7 @@ let rendererPromise: Promise<MarkdownRenderer> | null = null;
 export async function getMarkdownRenderer(): Promise<MarkdownRenderer> {
   if (!rendererPromise) {
     rendererPromise = (async () => {
-      const [{ marked }, DOMPurify] = await Promise.all([
-        import('marked'),
-        import('dompurify'),
-      ]);
+      const [{ marked }, DOMPurify] = await Promise.all([import('marked'), import('dompurify')]);
 
       const purify = DOMPurify.default ?? DOMPurify;
 
@@ -57,7 +54,7 @@ export async function getMarkdownRenderer(): Promise<MarkdownRenderer> {
 
       return {
         render(markdown: string): string {
-          const rawHtml = marked.parse(markdown, { async: false }) as string;
+          const rawHtml = marked.parse(markdown, { async: false, breaks: true }) as string;
           return purify.sanitize(rawHtml);
         },
       };

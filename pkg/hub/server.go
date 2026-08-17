@@ -268,6 +268,13 @@ type ServerConfig struct {
 	// configured durable mount instead of the node-local home directory.
 	// Nil or Backend=="" / "local" preserves the legacy ephemeral behavior.
 	WorkspaceStorageConfig *config.V1WorkspaceStorageConfig
+
+	// NativeChatEnabled controls whether the built-in chat feature is active:
+	// the /api/v1/chat/* routes are registered and the web UI is told to show
+	// the chat interface. Nil means enabled — chat shipped default-on, so an
+	// operator must opt out explicitly via server.native_chat.enabled.
+	// Read through Server.nativeChatEnabled(), never directly.
+	NativeChatEnabled *bool
 }
 
 // MaintenanceConfig holds configuration for routine maintenance operation executors.
@@ -738,6 +745,17 @@ type Server struct {
 
 	// Web chat store for webchat_* tables (thread prefs, chat threads, etc.) — nil = disabled.
 	webChatStore WebChatStore
+
+	// Chat notifier for human mention + DM received notifications (W6). Nil-safe.
+	chatNotifier *ChatNotifier
+
+	// Attachment file store for chat attachments (W7). Nil = attachments disabled.
+	// HA limitation: LocalDiskAttachmentStore is single-node only; see attachments.go.
+	attachmentStore AttachmentStore
+
+	// Presence manager for in-memory user presence tracking (nil = disabled).
+	// Single-node only; see design §4.5 HA limitation.
+	presenceManager *PresenceManager
 
 	// Channel registry for external notification delivery (nil = disabled)
 	channelRegistry *ChannelRegistry
@@ -1870,10 +1888,53 @@ func (s *Server) GetMessageBrokerProxy() *MessageBrokerProxy {
 }
 
 // SetWebChatStore sets the webchat store for thread prefs and chat threads API.
-func (s *Server) SetWebChatStore(store WebChatStore) {
+// It also initializes the ChatNotifier for human-mention and DM notifications (W6).
+func (s *Server) SetWebChatStore(wcs WebChatStore) {
 	s.mu.Lock()
-	s.webChatStore = store
+	s.webChatStore = wcs
+	// Initialize ChatNotifier with the store; presence checker is nil (W5 stub).
+	s.chatNotifier = NewChatNotifier(s.store, s.events, wcs, nil, s.messageLog)
+	// Wire into existing broker proxy if already started (startup order varies).
+	if s.messageBrokerProxy != nil {
+		s.messageBrokerProxy.chatNotifier = s.chatNotifier
+		s.messageBrokerProxy.webChatStore = wcs
+	}
 	s.mu.Unlock()
+}
+
+// SetAttachmentStore sets the attachment file store for upload/download (W7).
+func (s *Server) SetAttachmentStore(as AttachmentStore) {
+	s.mu.Lock()
+	s.attachmentStore = as
+	s.mu.Unlock()
+}
+
+// getChatNotifier returns the chat notifier, or nil if not initialized.
+func (s *Server) getChatNotifier() *ChatNotifier {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.chatNotifier
+}
+
+// InitPresenceManager creates and starts the presence manager for real-time
+// user presence tracking. It seeds the in-memory map from User.last_seen.
+// Call this after the event publisher is wired.
+func (s *Server) InitPresenceManager() {
+	pm := NewPresenceManager(s.events, s.store)
+	pm.SeedFromStore(s.ctx, s.store)
+	s.mu.Lock()
+	s.presenceManager = pm
+	s.mu.Unlock()
+}
+
+// StopPresenceManager shuts down the presence manager's background goroutine.
+func (s *Server) StopPresenceManager() {
+	s.mu.RLock()
+	pm := s.presenceManager
+	s.mu.RUnlock()
+	if pm != nil {
+		pm.Stop()
+	}
 }
 
 // SetPluginManager sets the plugin manager for broker integration admin API.
@@ -2038,6 +2099,13 @@ func (s *Server) GetStore() store.Store {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.store
+}
+
+// GetAuthzService returns the authorization service.
+func (s *Server) GetAuthzService() *AuthzService {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.authzService
 }
 
 // GetBrokerAuthService returns the broker authentication service.
@@ -2293,6 +2361,8 @@ func (s *Server) StartMessageBroker(b eventbus.EventBus) {
 
 	proxy := NewMessageBrokerProxy(b, s.store, s.events, s.GetDispatcher, logging.Subsystem("hub.broker"))
 	proxy.messageLog = s.dedicatedMessageLog
+	proxy.chatNotifier = s.chatNotifier // W6: wire DM notification trigger
+	proxy.webChatStore = s.webChatStore // DM watermark stamping after persist
 	s.messageBrokerProxy = proxy
 	proxy.Start()
 
@@ -3196,6 +3266,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.lifecycleHookEvaluator.Stop()
 	}
 
+	// Stop presence manager before closing event publisher
+	if s.presenceManager != nil {
+		s.presenceManager.Stop()
+	}
+
 	// Close event publisher
 	if s.events != nil {
 		s.events.Close()
@@ -3252,6 +3327,10 @@ func (s *Server) CleanupResources(ctx context.Context) error {
 		}
 		if s.teamsLinkService != nil {
 			s.teamsLinkService.Close()
+		}
+		// Stop presence manager before closing event publisher
+		if s.presenceManager != nil {
+			s.presenceManager.Stop()
 		}
 		if s.events != nil {
 			s.events.Close()
@@ -3437,12 +3516,30 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/messages/", s.handleMessageRoutes)
 	s.mux.HandleFunc("/api/v1/message-channels", s.handleMessageChannels)
 
-	// Chat thread prefs (Phase 3 — visibility mode persistence)
-	s.mux.HandleFunc("/api/v1/chat/prefs", s.handleChatPrefs)
+	// Native chat endpoints. Registration is gated on server.native_chat.enabled,
+	// so disabling the feature makes every /api/v1/chat/* path 404 rather than
+	// leaving a live API behind a hidden UI. This is a startup-time gate:
+	// flipping the toggle requires a hub restart (same as the message broker).
+	if s.nativeChatEnabled() {
+		// Chat thread prefs (Phase 3 — visibility mode persistence)
+		s.mux.HandleFunc("/api/v1/chat/prefs", s.handleChatPrefs)
 
-	// Chat thread endpoints (Phase 5 — thread rail)
-	s.mux.HandleFunc("/api/v1/chat/threads", s.handleChatThreads)
-	s.mux.HandleFunc("/api/v1/chat/threads/", s.handleChatThreadRoutes)
+		// Chat thread endpoints (Phase 5 — thread rail, legacy)
+		s.mux.HandleFunc("/api/v1/chat/threads", s.handleChatThreads)
+		s.mux.HandleFunc("/api/v1/chat/threads/", s.handleChatThreadRoutes)
+
+		// Wave-2 chat endpoints (conversation REST API)
+		s.mux.HandleFunc("/api/v1/chat/spaces", s.handleChatSpaces)
+		s.mux.HandleFunc("/api/v1/chat/spaces/", s.handleChatSpaceRoutes)
+		s.mux.HandleFunc("/api/v1/chat/conversations/", s.handleChatConversationRoutes)
+		s.mux.HandleFunc("/api/v1/chat/topics/", s.handleChatTopicRoutes)
+		s.mux.HandleFunc("/api/v1/chat/dms", s.handleChatDMs)
+		s.mux.HandleFunc("/api/v1/chat/user-prefs", s.handleChatUserPrefs)
+		s.mux.HandleFunc("/api/v1/chat/presence", s.handleChatPresence)
+		s.mux.HandleFunc("/api/v1/chat/search", s.handleChatSearch)
+		s.mux.HandleFunc("/api/v1/chat/attachments", s.handleChatAttachments)
+		s.mux.HandleFunc("/api/v1/chat/attachments/", s.handleChatAttachmentByID)
+	}
 
 	// WebSocket control channel endpoint for Runtime Brokers
 	s.mux.HandleFunc("/api/v1/runtime-brokers/connect", s.handleRuntimeBrokerConnect)

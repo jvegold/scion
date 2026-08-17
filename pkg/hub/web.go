@@ -172,6 +172,7 @@ type WebServer struct {
 	hubHandler   http.Handler                // mounted Hub API handler, or nil
 	hubShutdown  func(context.Context) error // Hub resource cleanup, or nil
 	maintenance  *MaintenanceState           // runtime maintenance mode state (shared with Hub)
+	authzService *AuthzService               // authorization service for SSE subject checks
 	startTime    time.Time
 	log          *slog.Logger // subsystem logger for hub.web
 
@@ -557,6 +558,11 @@ func (ws *WebServer) SetUserTokenService(svc *UserTokenService) {
 // SetEventPublisher sets the event publisher for real-time SSE streaming.
 func (ws *WebServer) SetEventPublisher(pub EventPublisher) {
 	ws.events = pub
+}
+
+// SetAuthzService sets the authorization service for SSE subject-level checks.
+func (ws *WebServer) SetAuthzService(a *AuthzService) {
+	ws.authzService = a
 }
 
 // SetRequestLogger sets the dedicated request logger.
@@ -1078,6 +1084,19 @@ func (ws *WebServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Subject-level authorization: verify the caller has access to every
+	// requested subject. This runs once at connection time, not per-event.
+	if denied := ws.authorizeSSESubjects(r, subjects); len(denied) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		body, _ := json.Marshal(map[string]interface{}{
+			"error":           "access denied for one or more subjects",
+			"denied_subjects": denied,
+		})
+		_, _ = w.Write(body)
+		return
+	}
+
 	// Disable the server's WriteTimeout for this long-lived SSE connection.
 	// Without this, the global WriteTimeout (e.g. 60s) kills the stream,
 	// causing reconnection churn and wasted connection-pool slots.
@@ -1151,6 +1170,12 @@ func validateSSESubjects(subjects []string) string {
 			return fmt.Sprintf("subject pattern too long: %d characters (max 256)", len(sub))
 		}
 		tokens := strings.Split(sub, ".")
+		// Belt-and-suspenders: reject subjects whose first token is a
+		// wildcard — a bare ">" or "*" would match all events across all
+		// projects and users, bypassing subject-level authorization.
+		if len(tokens) > 0 && (tokens[0] == "*" || tokens[0] == ">") {
+			return fmt.Sprintf("invalid subject %q: first token must not be a wildcard", sub)
+		}
 		for i, token := range tokens {
 			if token == "" {
 				return fmt.Sprintf("invalid subject %q: empty token", sub)
@@ -1172,6 +1197,110 @@ func validateSSESubjects(subjects []string) string {
 		}
 	}
 	return ""
+}
+
+// authorizeSSESubjects checks that the caller has access to every requested
+// subject. Returns the list of denied subjects; an empty slice means all are
+// authorized. For project-scoped subjects (project.<id>.*) the caller must
+// have ActionRead on the project. For user-scoped subjects (user.<id>.*)
+// the caller's identity must match the user ID. Other subjects (notification,
+// broker, etc.) pass through without additional checks.
+func (ws *WebServer) authorizeSSESubjects(r *http.Request, subjects []string) []string {
+	if ws.authzService == nil {
+		// No authz service configured — fail closed. Callers that need
+		// SSE must wire an AuthzService; allowing all subjects when authz
+		// is absent would be a privilege-escalation hole.
+		return subjects
+	}
+
+	// Reject subjects whose first token is a wildcard (* or >). A bare
+	// ">" matches ALL events via NATS-style pattern matching, bypassing
+	// project/user authorization entirely. validateSSESubjects also
+	// rejects these as belt-and-suspenders, but this check is the
+	// authoritative security gate.
+	for _, sub := range subjects {
+		tokens := strings.Split(sub, ".")
+		if len(tokens) > 0 && (tokens[0] == "*" || tokens[0] == ">") {
+			return subjects // deny all, fail closed
+		}
+	}
+
+	// Build the caller identity from the web session.
+	sessionUser := getWebSessionUser(r.Context())
+	if sessionUser == nil {
+		// No session user — should not happen (sessionAuthMiddleware gates
+		// the SSE endpoint), but fail closed.
+		return subjects
+	}
+	identity := NewAuthenticatedUser(
+		sessionUser.UserID,
+		sessionUser.Email,
+		sessionUser.Name,
+		sessionUser.Role,
+		"web",
+	)
+
+	// Collect unique project IDs and user IDs from subjects.
+	projectIDs := map[string]bool{}
+	userIDs := map[string]bool{}
+	for _, sub := range subjects {
+		tokens := strings.Split(sub, ".")
+		if len(tokens) >= 2 {
+			switch tokens[0] {
+			case "project":
+				projectIDs[tokens[1]] = true
+			case "user":
+				userIDs[tokens[1]] = true
+			}
+		}
+	}
+
+	// Batch-check project access.
+	deniedProjects := map[string]bool{}
+	if len(projectIDs) > 0 {
+		var resources []Resource
+		var ids []string
+		for pid := range projectIDs {
+			ids = append(ids, pid)
+			resources = append(resources, Resource{Type: "project", ID: pid})
+		}
+		caps := ws.authzService.ComputeCapabilitiesBatch(r.Context(), identity, resources, "project")
+		for i, c := range caps {
+			if !capabilityAllows(c, ActionRead) {
+				deniedProjects[ids[i]] = true
+			}
+		}
+	}
+
+	// Check user subjects: caller can only subscribe to their own user subjects.
+	deniedUsers := map[string]bool{}
+	for uid := range userIDs {
+		if uid != sessionUser.UserID {
+			deniedUsers[uid] = true
+		}
+	}
+
+	// Build denied list.
+	if len(deniedProjects) == 0 && len(deniedUsers) == 0 {
+		return nil
+	}
+	var denied []string
+	for _, sub := range subjects {
+		tokens := strings.Split(sub, ".")
+		if len(tokens) >= 2 {
+			switch tokens[0] {
+			case "project":
+				if deniedProjects[tokens[1]] {
+					denied = append(denied, sub)
+				}
+			case "user":
+				if deniedUsers[tokens[1]] {
+					denied = append(denied, sub)
+				}
+			}
+		}
+	}
+	return denied
 }
 
 // isAllowedSubjectChar returns true if the character is valid in a subject token.
@@ -1347,7 +1476,44 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 			email, _ := session.Values[sessKeyUserEmail].(string)
 			if email != "" {
 				currentRole, _ := session.Values[sessKeyUserRole].(string)
-				expectedRole := determineUserRole(email, ws.config.AdminEmails)
+				// The stored role is the source of truth: it carries UI-granted
+				// promotions (and demotions) that the config list knows nothing
+				// about. If it can't be read we deliberately fall back to the
+				// session role, preserving the status quo rather than extending
+				// privilege: unlike a refresh token, the session cookie is not
+				// re-minted here, so a transient read failure cannot lengthen
+				// the life of a stale role.
+				storedRole := currentRole
+				// A nil store is fatal further down this middleware (see the
+				// check before proxy provisioning), but this branch returns
+				// before reaching it, so the guard is load-bearing here.
+				if ws.store != nil {
+					u, err := ws.store.GetUserByEmail(r.Context(), email)
+					switch {
+					case err == nil:
+						if u.Status == store.UserStatusSuspended {
+							ws.logger().Warn("Proxy auth: session user is suspended", "email", email, "user_id", u.ID)
+							http.Error(w, "access denied: user account is suspended", http.StatusForbidden)
+							return
+						}
+						storedRole = u.Role
+					case errors.Is(err, store.ErrNotFound):
+						// Definitive answer: the account is gone. Unlike a
+						// transient read failure, this must not fall back to
+						// the session role — that would let a deleted user
+						// keep a UI-granted admin role for the remaining life
+						// of their session cookie.
+						ws.logger().Warn("Proxy auth: session user no longer exists", "email", email)
+						http.Error(w, "access denied: user account no longer exists", http.StatusForbidden)
+						return
+					default:
+						// Transient read failure — keep the status quo (see
+						// the storedRole comment above).
+						ws.logger().Warn("Proxy auth: user lookup failed, falling back to session role",
+							"email", email, "error", err)
+					}
+				}
+				expectedRole := determineUserRole(email, ws.config.AdminEmails, storedRole)
 				if currentRole == expectedRole {
 					// Role unchanged — inject user into context and proceed
 					// without saving session (avoids redundant write).
@@ -1434,7 +1600,7 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 		}
 		if err != nil {
 			// User not found — create new user
-			role := determineUserRole(proxyUser.Email, ws.config.AdminEmails)
+			role := determineUserRole(proxyUser.Email, ws.config.AdminEmails, "")
 			user = &store.User{
 				ID:          generateID(),
 				Email:       proxyUser.Email,
@@ -1464,7 +1630,7 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 				user.DisplayName = proxyUser.DisplayName
 			}
 			// Re-evaluate admin status on every login (matches handleOAuthCallback / provisionUser)
-			if newRole := determineUserRole(proxyUser.Email, ws.config.AdminEmails); user.Role != newRole {
+			if newRole := determineUserRole(proxyUser.Email, ws.config.AdminEmails, user.Role); user.Role != newRole {
 				ws.logger().Info("User role changed on proxy login", "email", proxyUser.Email, "old_role", user.Role, "new_role", newRole)
 				user.Role = newRole
 			}
@@ -1718,7 +1884,7 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		// Create new user (only reachable in open/domain_restricted modes;
 		// in invite_only mode, checkUserAuthorized already confirmed a User record exists)
-		role := determineUserRole(userInfo.Email, ws.config.AdminEmails)
+		role := determineUserRole(userInfo.Email, ws.config.AdminEmails, "")
 		user = &store.User{
 			ID:          generateID(),
 			Email:       userInfo.Email,
@@ -1755,7 +1921,7 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 				user.AvatarURL = userInfo.AvatarURL
 			}
 			user.LastLogin = time.Now()
-			user.Role = determineUserRole(userInfo.Email, ws.config.AdminEmails)
+			user.Role = determineUserRole(userInfo.Email, ws.config.AdminEmails, user.Role)
 			// Log the activation via slog (WebServer does not have a structured
 			// audit logger; the hub.Server audit path covers API/CLI auth).
 			ws.logger().Info("invite audit: user_activated", "email", userInfo.Email, "user_id", user.ID)
@@ -1769,7 +1935,7 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 				user.DisplayName = userInfo.DisplayName
 			}
 			// Re-evaluate admin status on every login
-			newRole := determineUserRole(userInfo.Email, ws.config.AdminEmails)
+			newRole := determineUserRole(userInfo.Email, ws.config.AdminEmails, user.Role)
 			if user.Role != newRole {
 				ws.logger().Info("User role changed on login", "email", userInfo.Email, "old_role", user.Role, "new_role", newRole)
 				user.Role = newRole

@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
@@ -46,6 +47,14 @@ type EventPublisher interface {
 	// broker.dispatch.<dispatchID>.done so the originator's subscription wakes
 	// and reads the result from the dispatch row (design §6.3).
 	PublishDispatchDone(ctx context.Context, dispatchID string)
+	// PublishChatTopicEvent publishes a topic lifecycle event (created, updated,
+	// deleted) on project.<projectID>.chat.topic so SSE subscribers can
+	// update the space rail in real time.
+	PublishChatTopicEvent(ctx context.Context, projectID string, action string, topic WebChatTopic)
+	// PublishChatReadStateEvent publishes a read-watermark advance to the other
+	// participants of a DM on user.<peerID>.chat.read-state so the sender can
+	// render "seen" without polling.
+	PublishChatReadStateEvent(ctx context.Context, conversationKey, userID, messageID string)
 	// Subscribe returns a channel that receives events matching the given
 	// subject patterns, along with an unsubscribe function. Patterns use
 	// NATS-style wildcards: '*' matches a single token, '>' matches the
@@ -75,8 +84,11 @@ func (noopEventPublisher) PublishAgentPorts(_ context.Context, _ *store.Agent)  
 func (noopEventPublisher) PublishAllowListChanged(_ context.Context, _, _ string)            {}
 func (noopEventPublisher) PublishInviteChanged(_ context.Context, _, _, _ string)            {}
 func (noopEventPublisher) PublishDispatchDone(_ context.Context, _ string)                   {}
-func (noopEventPublisher) PublishRaw(_ string, _ interface{})                                {}
-func (noopEventPublisher) Close()                                                            {}
+func (noopEventPublisher) PublishChatTopicEvent(_ context.Context, _ string, _ string, _ WebChatTopic) {
+}
+func (noopEventPublisher) PublishChatReadStateEvent(_ context.Context, _, _, _ string) {}
+func (noopEventPublisher) PublishRaw(_ string, _ interface{})                          {}
+func (noopEventPublisher) Close()                                                      {}
 
 // Subscribe on the no-op publisher returns a nil channel (which blocks forever
 // on receive) and a no-op unsubscribe. Callers that need real subscriptions
@@ -639,6 +651,67 @@ func (p *eventBuilder) PublishUserMessage(_ context.Context, msg *store.Message)
 	}
 	if msg.AgentID != "" {
 		p.sink("agent."+msg.AgentID+".message", evt)
+	}
+	// Fan out to project-scoped chat subject for web-channel messages with
+	// topic thread_ids (UUID, not dm: prefixed). This enables shared-space
+	// SSE: all project members see the message, not just the direct
+	// recipient. Wave-2 §4.4.
+	if msg.Channel == "web" && msg.ProjectID != "" && msg.ThreadID != "" &&
+		!strings.HasPrefix(msg.ThreadID, "dm:") &&
+		!strings.HasPrefix(msg.ThreadID, "agent:") {
+		p.sink("project."+msg.ProjectID+".chat.message", evt)
+	}
+	// Fan out DM messages to user.<id>.chat.dm for both participants so the
+	// v2 frontend (which subscribes to user.<self>.chat.>) receives real-time
+	// DM updates. The wave-1 user.<id>.message subject above is kept for
+	// backward compat. Wave-2 §4.4.
+	if msg.Channel == "web" && msg.ThreadID != "" && strings.HasPrefix(msg.ThreadID, "dm:") {
+		// Publish to both participants extracted from the DM key.
+		dmParts := strings.Split(msg.ThreadID, ":")
+		if len(dmParts) >= 5 {
+			id1, id2 := dmParts[2], dmParts[4]
+			p.sink("user."+id1+".chat.dm", evt)
+			if id2 != id1 {
+				p.sink("user."+id2+".chat.dm", evt)
+			}
+		}
+	}
+}
+
+// PublishChatTopicEvent publishes a topic lifecycle event on
+// project.<projectID>.chat.topic.
+func (p *eventBuilder) PublishChatTopicEvent(_ context.Context, projectID string, action string, topic WebChatTopic) {
+	if projectID == "" {
+		return
+	}
+	evt := TopicEvent{
+		Action: action,
+		Topic:  topic,
+	}
+	p.sink("project."+projectID+".chat.topic", evt)
+}
+
+// PublishChatReadStateEvent fans a read-watermark advance out to the OTHER
+// user participants of a DM on user.<peerID>.chat.read-state.
+//
+// Only DM keys are published. A thread watermark is per-user state that the
+// rest of the space has no use for, so broadcasting it on the project subject
+// would be pure noise — thread readers clear their own unread dot locally.
+func (p *eventBuilder) PublishChatReadStateEvent(_ context.Context, conversationKey, userID, messageID string) {
+	if !strings.HasPrefix(conversationKey, "dm:") {
+		return
+	}
+	evt := ChatReadStateEvent{
+		ConversationKey: conversationKey,
+		UserID:          userID,
+		MessageID:       messageID,
+		ReadAt:          time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+	}
+	for _, participantID := range dmUserParticipants(conversationKey) {
+		if participantID == userID {
+			continue
+		}
+		p.sink("user."+participantID+".chat.read-state", evt)
 	}
 }
 

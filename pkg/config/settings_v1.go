@@ -344,6 +344,10 @@ type V1ServerConfig struct {
 	// enabling topic-based subscriptions and broadcast fan-out at the Hub level.
 	MessageBroker *V1MessageBrokerConfig `json:"message_broker,omitempty" yaml:"message_broker,omitempty" koanf:"message_broker"`
 
+	// NativeChat controls the built-in chat feature (web chat UI and the
+	// /api/v1/chat/* endpoints). Absent means enabled — chat shipped default-on.
+	NativeChat *V1NativeChatConfig `json:"native_chat,omitempty" yaml:"native_chat,omitempty" koanf:"native_chat"`
+
 	// Plugins configures external plugin loading for message brokers.
 	// Plugins run as separate processes using hashicorp/go-plugin.
 	Plugins *V1PluginsConfig `json:"plugins,omitempty" yaml:"plugins,omitempty" koanf:"plugins"`
@@ -443,6 +447,25 @@ type V1MessageBrokerConfig struct {
 	// When non-empty, all listed plugins run concurrently via FanOutBroker.
 	// Falls back to Type (singular) for backward compatibility.
 	Types []string `json:"types,omitempty" yaml:"types,omitempty" koanf:"types"`
+}
+
+// V1NativeChatConfig configures the built-in native chat feature.
+type V1NativeChatConfig struct {
+	// Enabled controls whether the chat UI and the /api/v1/chat/* endpoints
+	// are available. Nil (absent) means enabled: chat shipped default-on, so
+	// an operator must opt out explicitly. A pointer is required to tell
+	// "absent" apart from an explicit false — see EnabledSetting.
+	Enabled *bool `json:"enabled,omitempty" yaml:"enabled,omitempty" koanf:"enabled"`
+}
+
+// EnabledSetting returns the tri-state toggle: nil when the operator expressed
+// no preference (callers must read that as enabled — chat is default-on),
+// otherwise the explicit setting. Safe to call on a nil config.
+func (nc *V1NativeChatConfig) EnabledSetting() *bool {
+	if nc == nil {
+		return nil
+	}
+	return nc.Enabled
 }
 
 // V1PluginsConfig configures external plugin loading for message brokers.
@@ -837,6 +860,16 @@ type V1CloudRunConfig struct {
 	Region string `json:"region,omitempty" yaml:"region,omitempty" koanf:"region"`
 }
 
+// V1CloudRunInstancesConfig holds Cloud Run Instances runtime settings.
+// This is the per-agent-instance variant of Cloud Run, where each agent
+// gets its own Cloud Run service instance.
+type V1CloudRunInstancesConfig struct {
+	// ProjectID is the GCP project ID for Cloud Run Instances API calls.
+	ProjectID string `json:"project_id,omitempty" yaml:"project_id,omitempty" koanf:"project_id"`
+	// Region is the GCP region for Cloud Run instances (e.g. "us-central1").
+	Region string `json:"region,omitempty" yaml:"region,omitempty" koanf:"region"`
+}
+
 // V1RuntimeConfig extends RuntimeConfig with a Type field.
 type V1RuntimeConfig struct {
 	Type              string            `json:"type,omitempty" yaml:"type,omitempty" koanf:"type"`
@@ -849,6 +882,8 @@ type V1RuntimeConfig struct {
 	ListAllNamespaces bool              `json:"list_all_namespaces,omitempty" yaml:"list_all_namespaces,omitempty" koanf:"list_all_namespaces"`
 	// CloudRun holds Cloud Run-specific settings when Type is "cloudrun".
 	CloudRun *V1CloudRunConfig `json:"cloudrun,omitempty" yaml:"cloudrun,omitempty" koanf:"cloudrun"`
+	// CloudRunInstances holds Cloud Run Instances-specific settings when Type is "cloudrun-instances".
+	CloudRunInstances *V1CloudRunInstancesConfig `json:"cloudrun_instances,omitempty" yaml:"cloudrun_instances,omitempty" koanf:"cloudrun_instances"`
 }
 
 // V1RuntimeDefaultsConfig holds runtime-wide behaviour that is not specific to
@@ -1613,6 +1648,11 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		gc.WorkspaceStorage = v1.WorkspaceStorage
 	}
 
+	// Native chat — thread into GlobalConfig so the hub can gate chat routes.
+	if v1.NativeChat != nil {
+		gc.NativeChat = v1.NativeChat
+	}
+
 	// GitHub App
 	if v1.GitHubApp != nil {
 		gc.GitHubApp.AppID = v1.GitHubApp.AppID
@@ -2178,6 +2218,11 @@ func LoadEffectiveSettings(projectPath string) (*VersionedSettings, []string, er
 		if missingSchemaVersion {
 			warnings = append(warnings, `settings.yaml contains v1 runtime fields (type, cloudrun, gke, list_all_namespaces) but is missing 'schema_version: "1"'; add it as the first line to silence this warning`)
 		}
+		// Apply DB-backed settings overlay (co-located hub+broker mode).
+		// DB values win over file values for runtimes, profiles, harness_configs.
+		if o := globalOverlay; o != nil {
+			o.Apply(vs)
+		}
 		return vs, warnings, nil
 	}
 
@@ -2217,6 +2262,10 @@ func LoadEffectiveSettings(projectPath string) (*VersionedSettings, []string, er
 	}
 	vs, legacyWarnings := AdaptLegacySettings(legacy)
 	warnings = append(warnings, legacyWarnings...)
+	// Apply DB-backed settings overlay (co-located hub+broker mode).
+	if o := globalOverlay; o != nil {
+		o.Apply(vs)
+	}
 	return vs, warnings, nil
 }
 

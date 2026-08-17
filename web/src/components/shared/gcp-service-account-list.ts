@@ -40,7 +40,12 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
-import type { GCPServiceAccount, GCPVerificationStatus, Capabilities, GCPMintQuotaInfo } from '../../shared/types.js';
+import type {
+  GCPServiceAccount,
+  GCPVerificationStatus,
+  Capabilities,
+  GCPMintQuotaInfo,
+} from '../../shared/types.js';
 import { can } from '../../shared/types.js';
 import type { GCPSAListScope } from '../../shared/gcp-service-account-urls.js';
 import {
@@ -55,6 +60,12 @@ import { apiFetch, extractApiError } from '../../client/api.js';
 import { resourceStyles } from './resource-styles.js';
 import { showToast } from '../../utils/toast.js';
 import { showConfirm } from './confirm-dialog.js';
+
+/** Detail payload for the `sa-list-changed` CustomEvent. */
+export interface SAListChangedDetail {
+  action: 'registered' | 'verified' | 'minted' | 'deleted';
+  account: GCPServiceAccount;
+}
 
 @customElement('scion-gcp-service-account-list')
 export class ScionGCPServiceAccountList extends LitElement {
@@ -249,6 +260,21 @@ export class ScionGCPServiceAccountList extends LitElement {
     return can(this.listCapabilities, 'mint');
   }
 
+  /**
+   * Dispatches a bubbling `sa-list-changed` event so parent components can
+   * react to registration, verification, minting, or deletion of a service
+   * account without a full page reload.
+   */
+  private dispatchSAChange(detail: SAListChangedDetail): void {
+    this.dispatchEvent(
+      new CustomEvent('sa-list-changed', {
+        bubbles: true,
+        composed: true,
+        detail,
+      })
+    );
+  }
+
   private async loadAccounts(): Promise<void> {
     this.loading = true;
     this.error = null;
@@ -257,7 +283,9 @@ export class ScionGCPServiceAccountList extends LitElement {
       const response = await apiFetch(saListUrl(this.scope, this.scopeId));
 
       if (!response.ok) {
-        throw new Error(await extractApiError(response, `HTTP ${response.status}: ${response.statusText}`));
+        throw new Error(
+          await extractApiError(response, `HTTP ${response.status}: ${response.statusText}`)
+        );
       }
 
       const data = (await response.json()) as
@@ -317,14 +345,11 @@ export class ScionGCPServiceAccountList extends LitElement {
         throw new Error('Minting is only available for a project');
       }
 
-      const response = await apiFetch(
-        url,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        }
-      );
+      const response = await apiFetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
 
       if (!response.ok) {
         throw new Error(
@@ -332,8 +357,15 @@ export class ScionGCPServiceAccountList extends LitElement {
         );
       }
 
+      // Parse the minted SA from the response before any other consumption.
+      const mintedSA = (await response.json().catch(() => null)) as GCPServiceAccount | null;
+
       this.closeMintDialog();
       await this.loadAccounts();
+
+      if (mintedSA?.id) {
+        this.dispatchSAChange({ action: 'minted', account: mintedSA });
+      }
     } catch (err) {
       console.error('Failed to mint service account:', err);
       this.mintDialogError = err instanceof Error ? err.message : 'Failed to mint service account';
@@ -396,17 +428,24 @@ export class ScionGCPServiceAccountList extends LitElement {
       });
 
       if (!response.ok) {
-        throw new Error(await extractApiError(response, `HTTP ${response.status}: ${response.statusText}`));
+        throw new Error(
+          await extractApiError(response, `HTTP ${response.status}: ${response.statusText}`)
+        );
       }
 
-      // Check if auto-verification failed after registration
-      const data = (await response.json().catch(() => ({}))) as {
+      // Parse the created SA (and verification metadata) before any other
+      // consumption — response.json() can only be read once.
+      const data = (await response.json().catch(() => ({}))) as GCPServiceAccount & {
         verificationFailed?: boolean;
         verificationDetails?: { hubServiceAccountEmail?: string; targetEmail?: string };
       };
 
       this.closeDialog();
       await this.loadAccounts();
+
+      if (data.id) {
+        this.dispatchSAChange({ action: 'registered', account: data });
+      }
 
       if (data.verificationFailed) {
         this.verifyFailedHubEmail = data.verificationDetails?.hubServiceAccountEmail || '';
@@ -450,7 +489,14 @@ export class ScionGCPServiceAccountList extends LitElement {
         return;
       }
 
+      // Parse the updated SA from the verify response before reloading.
+      const updatedSA = (await response.json().catch(() => null)) as GCPServiceAccount | null;
+
       await this.loadAccounts();
+
+      if (updatedSA?.id) {
+        this.dispatchSAChange({ action: 'verified', account: updatedSA });
+      }
     } catch (err) {
       console.error('Failed to verify service account:', err);
       this.verifyFailedHubEmail = '';
@@ -479,10 +525,13 @@ export class ScionGCPServiceAccountList extends LitElement {
       const response = await apiFetch(saRef(account), { method: 'DELETE' });
 
       if (!response.ok && response.status !== 204) {
-        throw new Error(await extractApiError(response, `Failed to delete (HTTP ${response.status})`));
+        throw new Error(
+          await extractApiError(response, `Failed to delete (HTTP ${response.status})`)
+        );
       }
 
       await this.loadAccounts();
+      this.dispatchSAChange({ action: 'deleted', account });
     } catch (err) {
       console.error('Failed to delete service account:', err);
       showToast(err instanceof Error ? err.message : 'Failed to delete');
@@ -620,7 +669,6 @@ export class ScionGCPServiceAccountList extends LitElement {
             : ''}
         </div>
         ${this.renderQuotaInfo()}
-
         ${this.loading
           ? html`<div class="section-loading">
               <sl-spinner></sl-spinner> Loading service accounts...
@@ -835,7 +883,9 @@ export class ScionGCPServiceAccountList extends LitElement {
             label="GCP Project ID"
             placeholder="e.g. my-project-123"
             value=${this.dialogProjectId}
-            help-text=${this.extractProjectFromEmail(this.dialogEmail) ? 'Auto-detected from service account email' : ''}
+            help-text=${this.extractProjectFromEmail(this.dialogEmail)
+              ? 'Auto-detected from service account email'
+              : ''}
             @sl-input=${(e: Event) => {
               this.dialogProjectId = (e.target as HTMLInputElement).value;
             }}
@@ -944,8 +994,8 @@ export class ScionGCPServiceAccountList extends LitElement {
           >
             Allow this service account to act as itself
             <div slot="help-text">
-              Enables using this SA as a project default, allowing agents to create
-              sub-agents that run as this same identity. Recommended for most use cases.
+              Enables using this SA as a project default, allowing agents to create sub-agents that
+              run as this same identity. Recommended for most use cases.
             </div>
           </sl-checkbox>
 
@@ -955,7 +1005,9 @@ export class ScionGCPServiceAccountList extends LitElement {
             automatically verified for impersonation by the Hub.
           </div>
 
-          ${this.mintDialogError ? html`<div class="dialog-error">${this.mintDialogError}</div>` : nothing}
+          ${this.mintDialogError
+            ? html`<div class="dialog-error">${this.mintDialogError}</div>`
+            : nothing}
         </form>
 
         <sl-button
@@ -1030,7 +1082,9 @@ export class ScionGCPServiceAccountList extends LitElement {
             assignment until verification succeeds.
           </p>
           <p>After granting the role, click the refresh icon to re-check verification.</p>
-          <p><strong>Note:</strong> GCP IAM permission changes may take several minutes to propagate.</p>
+          <p>
+            <strong>Note:</strong> GCP IAM permission changes may take several minutes to propagate.
+          </p>
         </div>
 
         <sl-button slot="footer" variant="primary" @click=${this.closeVerifyFailedDialog}>

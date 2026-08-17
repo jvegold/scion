@@ -58,6 +58,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtimebroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
+	"github.com/GoogleCloudPlatform/scion/pkg/secretmigration"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
@@ -606,6 +607,21 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 							})
 							hubSrv.SetWebChatStore(webStore)
 							log.Printf("Message broker spoke added: name=web channel_id=web observer=true")
+
+							// W7: Initialize local-disk attachment store.
+							globalDir, err := config.GetGlobalDir()
+							if err != nil {
+								log.Printf("Warning: could not determine global dir, attachments disabled: %v", err)
+							} else {
+								attachDir := filepath.Join(globalDir, "attachments")
+								attachStore, err := hub.NewLocalDiskAttachmentStore(attachDir)
+								if err != nil {
+									log.Printf("Warning: failed to initialize attachment store: %v", err)
+								} else {
+									hubSrv.SetAttachmentStore(attachStore)
+									log.Printf("Attachment store initialized: dir=%s", attachDir)
+								}
+							}
 						}
 					}
 				}
@@ -622,6 +638,7 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 		}
 
 		hubSrv.StartNotificationDispatcher()
+		hubSrv.InitPresenceManager()
 	}
 
 	// 15. Print startup banner
@@ -1196,7 +1213,8 @@ func migrateStore(ctx context.Context, cfg *config.GlobalConfig, s *entadapter.C
 // safe because all guarded boot migrations are idempotent: each one checks
 // whether its work has already been done (e.g. MigrateStorageOnFirstBoot
 // checks for existing namespaced objects, BootstrapBundledResources uses
-// SkipIfAnyExist, migrateInlineSecrets checks for existing secret values)
+// SkipIfAnyExist, secretmigration.MigratePluginSecrets checks for existing
+// secret values)
 // and no-ops if so. The winning replica does the work; the others skip it
 // here and will see the completed state on their next access.
 func runWithAdvisoryLock(ctx context.Context, s store.Store, key store.AdvisoryLockKey, label string, fn func()) {
@@ -1546,6 +1564,8 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 		OIDCConfig:              cfg.OIDC,
 		Federation:              cfg.Federation,
 		WorkspaceStorageConfig:  cfg.WorkspaceStorage,
+		// nil (no server.native_chat section) means enabled — chat is default-on.
+		NativeChatEnabled: cfg.NativeChat.EnabledSetting(),
 	}
 
 	// In hosted mode every replica must share the same session secret for
@@ -2165,6 +2185,7 @@ func initWebServer(ctx context.Context, cfg *config.GlobalConfig, hubSrv *hub.Se
 		webSrv.SetStore(hubSrv.GetStore())
 		webSrv.SetUserTokenService(hubSrv.GetUserTokenService())
 		webSrv.SetMaintenanceState(hubSrv.GetMaintenanceState())
+		webSrv.SetAuthzService(hubSrv.GetAuthzService())
 		webSrv.MountHubAPI(hubSrv.Handler(), hubSrv.CleanupResources)
 
 		localHubSrv := hubSrv
@@ -2377,6 +2398,27 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		rhCfg.ColocatedStorage = hubSrv.GetStorage()
 	}
 
+	// In co-located mode, install a global settings overlay so that the
+	// broker's config.LoadEffectiveSettings() calls pick up DB-backed
+	// runtimes, profiles, and harness_configs. Without this, the broker
+	// always reads from the ephemeral settings.yaml file and never sees
+	// changes made through the admin UI (issue #985).
+	if hubSrv != nil && cfg.Database.Driver == "postgres" {
+		overlay := config.NewSettingsOverlay()
+		config.SetGlobalSettingsOverlay(overlay)
+		// Seed the overlay from the current operational settings snapshot
+		// so that DB values are available from the first agent dispatch,
+		// not only after the next LISTEN/NOTIFY propagation.
+		if ops := hubSrv.GetOperationalSettings(); ops != nil {
+			snap := ops.Snapshot()
+			overlay.Update(snap.Runtimes, snap.Profiles, snap.HarnessConfigs, snap.ImageRegistry)
+			log.Printf("Settings overlay installed for co-located broker (runtimes=%d, profiles=%d, harness_configs=%d)",
+				len(snap.Runtimes), len(snap.Profiles), len(snap.HarnessConfigs))
+		} else {
+			log.Printf("Settings overlay installed for co-located broker (operational settings not yet available)")
+		}
+	}
+
 	rhSrv := runtimebroker.New(rhCfg, mgr, rt)
 	rhSrv.SetRequestLogger(requestLogger)
 	if messageLogger != nil {
@@ -2527,14 +2569,14 @@ func initPluginManager(ctx context.Context, secretBackend secret.SecretBackend, 
 	pluginsCfg := scionplugin.PluginsConfig{
 		Broker: make(map[string]scionplugin.PluginEntry),
 	}
-	// Migrate inline secrets under advisory lock to prevent concurrent replicas
-	// from racing the one-shot migration (audit finding C6).
+	// Migrate plugin secrets under advisory lock to prevent concurrent replicas
+	// from racing the one-shot migration (audit finding C6). The lock key stays
+	// LockInlineSecretsMigration: it is a persisted name, and renaming it would
+	// stop replicas on different versions from excluding each other.
 	if secretBackend != nil {
-		runWithAdvisoryLock(ctx, dataStore, store.LockInlineSecretsMigration, "inline secrets migration", func() {
+		runWithAdvisoryLock(ctx, dataStore, store.LockInlineSecretsMigration, "plugin secrets migration", func() {
 			for name, entry := range vs.Server.Plugins.Broker {
-				if entry.Config != nil {
-					migrateInlineSecrets(ctx, secretBackend, name, entry.Config)
-				}
+				secretmigration.MigratePluginSecrets(ctx, secretBackend, name, entry.Config, entry.ConfigFile)
 			}
 		})
 	}
@@ -2644,11 +2686,10 @@ func deriveCloudRunLogicalBrokerID(settings *config.VersionedSettings, rt runtim
 	sort.Strings(profileNames)
 	for _, profileName := range profileNames {
 		rtConfig, runtimeType, err := settings.ResolveRuntime(profileName)
-		if err != nil || runtimeType != "cloudrun" || rtConfig.CloudRun == nil {
+		if err != nil {
 			continue
 		}
-		projectID := strings.TrimSpace(rtConfig.CloudRun.Project)
-		location := strings.TrimSpace(rtConfig.CloudRun.Region)
+		projectID, location := resolveCloudRunProjectAndRegion(rtConfig, runtimeType)
 		if projectID == "" || location == "" {
 			continue
 		}
@@ -2660,16 +2701,33 @@ func deriveCloudRunLogicalBrokerID(settings *config.VersionedSettings, rt runtim
 	if err != nil {
 		return "", fmt.Errorf("deriveCloudRunLogicalBrokerID: failed to resolve runtime: %w", err)
 	}
-	if runtimeType != "cloudrun" || rtConfig.CloudRun == nil {
-		return "", fmt.Errorf("deriveCloudRunLogicalBrokerID: no cloudrun profile with project+region found in settings (active profile runtime: %q)", runtimeType)
-	}
-	projectID := strings.TrimSpace(rtConfig.CloudRun.Project)
-	location := strings.TrimSpace(rtConfig.CloudRun.Region)
+	projectID, location := resolveCloudRunProjectAndRegion(rtConfig, runtimeType)
 	if projectID == "" || location == "" {
-		return "", fmt.Errorf("deriveCloudRunLogicalBrokerID: project (%q) and region (%q) must both be set in cloudrun runtime config", projectID, location)
+		return "", fmt.Errorf("deriveCloudRunLogicalBrokerID: project (%q) and region (%q) must both be set in cloudrun runtime config (type: %q)", projectID, location, runtimeType)
 	}
 	seed := fmt.Sprintf("cloudrun:%s:%s", projectID, location)
 	return uuid.NewSHA1(cloudRunLogicalBrokerNamespace, []byte(seed)).String(), nil
+}
+
+// resolveCloudRunProjectAndRegion extracts the GCP project ID and region from
+// a V1RuntimeConfig for both "cloudrun" and "cloudrun-instances" runtime types.
+// Returns empty strings when the runtime type is not a Cloud Run variant or
+// when the required nested config is absent.
+func resolveCloudRunProjectAndRegion(rtConfig config.V1RuntimeConfig, runtimeType string) (string, string) {
+	switch runtimeType {
+	case "cloudrun":
+		if rtConfig.CloudRun == nil {
+			return "", ""
+		}
+		return strings.TrimSpace(rtConfig.CloudRun.Project), strings.TrimSpace(rtConfig.CloudRun.Region)
+	case "cloudrun-instances":
+		if rtConfig.CloudRunInstances == nil {
+			return "", ""
+		}
+		return strings.TrimSpace(rtConfig.CloudRunInstances.ProjectID), strings.TrimSpace(rtConfig.CloudRunInstances.Region)
+	default:
+		return "", ""
+	}
 }
 
 // resolveBrokerName determines the broker name from various sources.
@@ -2798,48 +2856,6 @@ func requireImageRegistryForBroker() error {
 		"  Option 1: scion config set --global image_registry <your-registry>\n" +
 		"  Option 2: export SCION_IMAGE_REGISTRY=<your-registry>\n\n" +
 		"See image-build/README.md for instructions on building and pushing images")
-}
-
-// migrateInlineSecrets performs a one-shot migration of secret config keys found
-// in the raw inline settings.yaml config into the secret backend. This prevents
-// existing users who followed the Telegram/Discord READMEs (which have
-// bot_token directly in settings.yaml) from losing their credentials when
-// ResolvePluginConfig strips inline secrets.
-func migrateInlineSecrets(ctx context.Context, sb secret.SecretBackend, pluginName string, inlineConfig map[string]string) {
-	mappings, ok := config.PluginSecretKeyMap[pluginName]
-	if !ok {
-		return
-	}
-
-	hubID := sb.HubID()
-	for _, m := range mappings {
-		val, has := inlineConfig[m.ConfigKey]
-		if !has || val == "" {
-			continue
-		}
-		existing, err := sb.Get(ctx, m.SecretKey, store.ScopeHub, hubID)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			log.Printf("Warning: failed to check secret backend for %s (plugin %q), skipping migration: %v", m.ConfigKey, pluginName, err)
-			continue
-		}
-		if existing != nil && existing.Value != "" {
-			continue
-		}
-		_, _, err = sb.Set(ctx, &secret.SetSecretInput{
-			Name:          m.SecretKey,
-			Value:         val,
-			SecretType:    secret.TypeVariable,
-			InjectionMode: "as_needed",
-			Scope:         store.ScopeHub,
-			ScopeID:       hubID,
-			Description:   fmt.Sprintf("Auto-migrated from inline config for plugin %s", pluginName),
-		})
-		if err != nil {
-			log.Printf("Warning: failed to migrate inline secret %s for plugin %q: %v", m.ConfigKey, pluginName, err)
-			continue
-		}
-		log.Printf("Migrated inline %s to secret backend for plugin %q — remove it from settings.yaml", m.ConfigKey, pluginName)
-	}
 }
 
 // stripSecretKeys returns a copy of the config map with all secret config keys removed.
