@@ -58,6 +58,8 @@ import { can } from '../../shared/types.js';
 import { apiFetch } from '../../client/api.js';
 import { navigateTo, stateManager } from '../../client/main.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
+import { chatNotifications } from '../../client/chat-notifications.js';
+import { chatUnread } from '../../client/chat-unread.js';
 import { isFeatureEnabled, NATIVE_CHAT_V2_FLAG } from '../../utils/feature-flags.js';
 import { hashColor, getInitials } from '../shared/chat/chat-avatar.js';
 import '../shared/chat/chat-thread.js';
@@ -68,6 +70,8 @@ const loadSpaceRail = () => import('../shared/chat/chat-space-rail.js');
 const loadChatMembers = () => import('../shared/chat/chat-members.js');
 // Lazy-load the search component only when v2 is active
 const loadChatSearch = () => import('../shared/chat/chat-search.js');
+// Lazy-load the quick switcher component on first Cmd+K press
+const loadChatSwitcher = () => import('../shared/chat/chat-switcher.js');
 
 /**
  * Slow fallback poll for the members sidebar.
@@ -232,6 +236,8 @@ export class ScionPageChat extends LitElement {
   private _onAgentsUpdated = this._handleAgentsUpdated.bind(this);
   private _onScopeChanged = this._handleScopeChanged.bind(this);
   private _onReadStateUpdated = this._handleReadStateUpdated.bind(this);
+  /** Bound keydown handler for Cmd/Ctrl+K quick switcher. */
+  private _onKeydown = this._handleGlobalKeydown.bind(this);
   /** Map from project slug → project ID for deep-link resolution. */
   private _slugToProjectId = new Map<string, string>();
   /** Map from project ID → project slug for URL generation. */
@@ -242,6 +248,12 @@ export class ScionPageChat extends LitElement {
   private _typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** IDs of members with unread DM messages (for the unread dot on avatars). */
   @state() private v2UnreadFromIds: string[] = [];
+  /** Whether the quick-switcher modal is visible (Cmd/Ctrl+K). */
+  @state() private v2SwitcherOpen = false;
+  /** Whether the quick-switcher component has been lazy-loaded. */
+  private v2SwitcherLoaded = false;
+  /** Cached conversation list for the switcher. */
+  @state() private v2SwitcherConversations: import('../shared/chat/chat-switcher.js').SwitcherConversation[] = [];
   /** Whether the search panel is visible. */
   @state() private v2SearchActive = false;
   /** Whether the search component has been lazy-loaded. */
@@ -638,6 +650,8 @@ export class ScionPageChat extends LitElement {
 
   override connectedCallback(): void {
     super.connectedCallback();
+    // Global Cmd/Ctrl+K listener for the quick switcher.
+    document.addEventListener('keydown', this._onKeydown);
 
     if (this.isV2) {
       void this.initV2();
@@ -656,6 +670,7 @@ export class ScionPageChat extends LitElement {
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
+    document.removeEventListener('keydown', this._onKeydown);
     if (this.isV2) {
       stateManager.removeEventListener('chat-message-received', this._onChatMessage);
       stateManager.removeEventListener('chat-topic-updated', this._onChatTopic);
@@ -683,6 +698,8 @@ export class ScionPageChat extends LitElement {
       clearTimeout(this._refreshTimer);
       this._refreshTimer = null;
     }
+    // Nothing is on screen any more, so nothing is being actively read.
+    chatNotifications.setActiveConversation(null);
   }
 
   override updated(changedProperties: Map<string, unknown>): void {
@@ -692,6 +709,12 @@ export class ScionPageChat extends LitElement {
       } else {
         this.parseRoute();
       }
+    }
+    // A message arriving in the conversation already on screen should not
+    // also pop a desktop notification about it. Reported from updated()
+    // rather than from each of the twenty places v2Conversation is assigned.
+    if (changedProperties.has('v2Conversation')) {
+      chatNotifications.setActiveConversation(this.v2Conversation?.conversationKey ?? null);
     }
   }
 
@@ -901,8 +924,19 @@ export class ScionPageChat extends LitElement {
   private handleRailLoaded(e: Event): void {
     const detail = (e as CustomEvent).detail as {
       spaceIds: string[];
-      spaces?: Array<{ projectId: string; projectSlug: string; projectName: string }>;
+      spaces?: Array<{
+        projectId: string;
+        projectSlug: string;
+        projectName: string;
+        unreadCount?: number;
+      }>;
     };
+
+    // The rail just loaded the space rollup the tab-title badge needs; hand it
+    // over rather than fetching /chat/spaces again alongside it.
+    if (detail.spaces) {
+      chatUnread.setSpaceUnread(detail.spaces);
+    }
 
     // Populate slug ↔ projectId maps for deep-link resolution
     if (detail.spaces) {
@@ -1853,9 +1887,11 @@ export class ScionPageChat extends LitElement {
       };
       // A muted DM raises no dot: muting is the user saying "stop telling me
       // about this", and the avatar dot is the telling (#1029).
-      const unreadIds = (data.dms || [])
+      const unreadIds = (data?.dms || [])
         .filter((dm) => dm.hasUnread && !dm.muted)
         .map((dm) => dm.peerId);
+      // Same list the tab-title badge counts — reuse the response.
+      chatUnread.setDMUnread(data?.dms || []);
       // Only update if changed to avoid unnecessary re-renders
       if (
         unreadIds.length !== this.v2UnreadFromIds.length ||
@@ -2257,6 +2293,141 @@ export class ScionPageChat extends LitElement {
   }
 
   // =========================================================================
+  // Quick Switcher (Cmd/Ctrl-K)  — #1048
+  // =========================================================================
+
+  /** Global keydown handler: open the quick-switcher on Cmd/Ctrl+K. */
+  private _handleGlobalKeydown(e: KeyboardEvent): void {
+    if (e.key === 'k' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      void this.toggleSwitcher();
+    }
+  }
+
+  private async toggleSwitcher(): Promise<void> {
+    if (this.v2SwitcherOpen) {
+      this.v2SwitcherOpen = false;
+      return;
+    }
+    // Lazy-load the component on first use.
+    if (!this.v2SwitcherLoaded) {
+      await loadChatSwitcher();
+      this.v2SwitcherLoaded = true;
+    }
+    // Build the conversation list from API data.
+    void this.loadSwitcherConversations();
+    this.v2SwitcherOpen = true;
+  }
+
+  /** Fetch spaces + threads + DMs for the switcher conversation list. */
+  private async loadSwitcherConversations(): Promise<void> {
+    type SwitcherConv = import('../shared/chat/chat-switcher.js').SwitcherConversation;
+    const convs: SwitcherConv[] = [];
+
+    try {
+      // Fetch spaces (projects with threads).
+      const spacesRes = await apiFetch('/api/v1/chat/spaces');
+      if (spacesRes.ok) {
+        const spacesData = (await spacesRes.json()) as {
+          spaces?: Array<{ projectId: string; projectName: string; projectSlug: string }>;
+        };
+        const spaces = spacesData.spaces || [];
+
+        // Fetch threads for each space in parallel.
+        const threadFetches = spaces.map(async (space) => {
+          try {
+            const res = await apiFetch(
+              `/api/v1/chat/spaces/${encodeURIComponent(space.projectId)}/threads`
+            );
+            if (!res.ok) return;
+            const data = (await res.json()) as {
+              threads?: Array<{
+                id: string;
+                name: string;
+                lastActivityAt?: string;
+              }>;
+            };
+            for (const thread of data.threads || []) {
+              convs.push({
+                conversationKey: thread.id,
+                name: `#${thread.name}`,
+                spaceName: space.projectName,
+                isDM: false,
+                projectId: space.projectId,
+                ...(thread.lastActivityAt ? { lastActivityAt: thread.lastActivityAt } : {}),
+              });
+            }
+          } catch {
+            // Non-critical — skip this space.
+          }
+        });
+        await Promise.all(threadFetches);
+      }
+
+      // Fetch DM conversations.
+      const dmsRes = await apiFetch('/api/v1/chat/dms');
+      if (dmsRes.ok) {
+        const dmsData = (await dmsRes.json()) as {
+          dms?: Array<{
+            conversationKey: string;
+            peerName: string;
+            peerKind: string;
+            lastActivityAt?: string;
+          }>;
+        };
+        for (const dm of dmsData.dms || []) {
+          convs.push({
+            conversationKey: dm.conversationKey,
+            name: dm.peerName || dm.conversationKey,
+            spaceName: dm.peerKind === 'agent' ? 'Agent DM' : 'Direct Message',
+            isDM: true,
+            ...(dm.lastActivityAt ? { lastActivityAt: dm.lastActivityAt } : {}),
+          });
+        }
+      }
+    } catch {
+      // Non-critical — show whatever we collected.
+    }
+
+    this.v2SwitcherConversations = convs;
+  }
+
+  private handleSwitcherSelect(e: CustomEvent): void {
+    const detail = e.detail as { conversationKey: string };
+    this.v2SwitcherOpen = false;
+    if (detail?.conversationKey) {
+      const key = detail.conversationKey;
+      if (key.startsWith('dm:')) {
+        navigateTo(`/chat/dm/${encodeURIComponent(key)}`);
+      } else {
+        // Find the project slug for this thread via its projectId.
+        let foundSlug = '';
+        const conv = this.v2SwitcherConversations.find(
+          (c) => c.conversationKey === key && !c.isDM
+        );
+        if (conv?.projectId) {
+          foundSlug = this._projectIdToSlug.get(conv.projectId) || '';
+        }
+        if (foundSlug) {
+          navigateTo(`/chat/${foundSlug}/${key}`);
+        } else {
+          // Fall back: let the page's route handler resolve by iterating slugs.
+          const firstSlug = this._slugToProjectId.keys().next().value;
+          if (firstSlug) {
+            navigateTo(`/chat/${firstSlug}/${key}`);
+          } else {
+            navigateTo(`/chat`);
+          }
+        }
+      }
+    }
+  }
+
+  private handleSwitcherClose(): void {
+    this.v2SwitcherOpen = false;
+  }
+
+  // =========================================================================
   // Render
   // =========================================================================
 
@@ -2342,6 +2513,15 @@ export class ScionPageChat extends LitElement {
 
   private renderV2() {
     return html`
+      ${this.v2SwitcherOpen
+        ? html`
+            <scion-chat-switcher
+              .conversations=${this.v2SwitcherConversations}
+              @switcher-select=${this.handleSwitcherSelect}
+              @switcher-close=${this.handleSwitcherClose}
+            ></scion-chat-switcher>
+          `
+        : nothing}
       <div
         class="v2-panels"
         data-panel=${this.mobilePanel}
@@ -2632,27 +2812,36 @@ export class ScionPageChat extends LitElement {
     };
     if (!detail) return;
 
+    const msgFragment = detail.messageId ? `#msg-${encodeURIComponent(detail.messageId)}` : '';
+
     this.v2SearchActive = false;
 
     // If the result is in a different conversation, navigate to it.
     if (detail.conversationKey !== this.v2Conversation?.conversationKey) {
       const isDM = detail.conversationKey.startsWith('dm:');
       if (isDM) {
-        navigateTo(`/chat/dm/${encodeURIComponent(detail.conversationKey)}`);
+        navigateTo(`/chat/dm/${encodeURIComponent(detail.conversationKey)}${msgFragment}`);
       } else if (detail.projectId) {
         const slug = this._projectIdToSlug.get(detail.projectId);
         if (slug) {
           navigateTo(
-            `/chat/${encodeURIComponent(slug)}/${encodeURIComponent(detail.conversationKey)}`
+            `/chat/${encodeURIComponent(slug)}/${encodeURIComponent(detail.conversationKey)}${msgFragment}`
           );
         } else {
           navigateTo(
-            `/chat/space/${encodeURIComponent(detail.projectId)}/thread/${encodeURIComponent(detail.conversationKey)}`
+            `/chat/space/${encodeURIComponent(detail.projectId)}/thread/${encodeURIComponent(detail.conversationKey)}${msgFragment}`
           );
         }
       }
+    } else if (detail.messageId) {
+      // Same conversation: scroll directly to the message.
+      void this.updateComplete.then(() => {
+        const thread = this.shadowRoot?.querySelector('scion-chat-thread') as
+          | import('../shared/chat/chat-thread.js').ScionChatThread
+          | null;
+        thread?.scrollToMessageById(detail.messageId);
+      });
     }
-    // TODO: scroll to the specific messageId within the conversation
   }
 
   /** Extract agent members as Agent-like objects for the mention autocomplete. */
