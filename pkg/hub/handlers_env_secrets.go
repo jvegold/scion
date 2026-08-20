@@ -45,6 +45,7 @@ type SetEnvVarRequest struct {
 	Sensitive     bool   `json:"sensitive,omitempty"`
 	InjectionMode string `json:"injectionMode,omitempty"`
 	Secret        bool   `json:"secret,omitempty"`
+	AllowProgeny  bool   `json:"allowProgeny,omitempty"` // Allow creator's progeny agents to access (user scope, always mode only)
 }
 
 type SetEnvVarResponse struct {
@@ -367,6 +368,28 @@ func (s *Server) setEnvVar(w http.ResponseWriter, r *http.Request, key string) {
 		return
 	}
 
+	// allowProgeny is only valid on user-scoped env vars with injection_mode=always
+	if req.AllowProgeny {
+		if scope != store.ScopeUser {
+			ValidationError(w, "allowProgeny is only supported on user-scoped env vars", map[string]interface{}{
+				"field": "allowProgeny",
+				"scope": scope,
+			})
+			return
+		}
+		im := req.InjectionMode
+		if im == "" {
+			im = store.InjectionModeAsNeeded
+		}
+		if im != store.InjectionModeAlways {
+			ValidationError(w, "allowProgeny requires injectionMode to be 'always'", map[string]interface{}{
+				"field":         "allowProgeny",
+				"injectionMode": im,
+			})
+			return
+		}
+	}
+
 	var createdBy string
 	if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
 		createdBy = userIdent.ID()
@@ -432,6 +455,7 @@ func (s *Server) setEnvVar(w http.ResponseWriter, r *http.Request, key string) {
 		Sensitive:     req.Sensitive,
 		InjectionMode: injectionMode,
 		Secret:        false,
+		AllowProgeny:  req.AllowProgeny,
 	}
 	envVar.CreatedBy = createdBy
 
@@ -440,6 +464,9 @@ func (s *Server) setEnvVar(w http.ResponseWriter, r *http.Request, key string) {
 		writeErrorFromErr(w, err, "")
 		return
 	}
+
+	// Manage implicit env var progeny policy lifecycle
+	s.ensureEnvVarProgenyPolicy(ctx, envVar)
 
 	// Clean up any existing secret with same key (demotion from secret to plain)
 	if s.secretBackend != nil {
@@ -469,6 +496,13 @@ func (s *Server) deleteEnvVar(w http.ResponseWriter, r *http.Request, key string
 	scopeID, ok := s.resolveEnvSecretAccess(w, r, scope, query.Get("scopeId"), true)
 	if !ok {
 		return
+	}
+
+	// Check for progeny policy cleanup before deletion
+	if scope == store.ScopeUser {
+		if existing, err := s.store.GetEnvVar(ctx, key, scope, scopeID); err == nil && existing.AllowProgeny {
+			s.deleteEnvVarProgenyPolicy(ctx, existing.ID)
+		}
 	}
 
 	if err := s.store.DeleteEnvVar(ctx, key, scope, scopeID); err != nil {
@@ -624,6 +658,81 @@ func (s *Server) deleteProgenyPolicy(ctx context.Context, secretID string) {
 	for _, p := range existing.Items {
 		if err := s.store.DeletePolicy(ctx, p.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 			s.envSecretLog.Warn("failed to delete progeny policy", "policyID", p.ID, "error", err)
+		}
+	}
+}
+
+// =============================================================================
+// Progeny policy helpers for env vars
+// =============================================================================
+
+// envVarProgenyPolicyName returns the canonical policy name for a progeny env var policy.
+func envVarProgenyPolicyName(envVarID string) string {
+	return "progeny-envvar-access:" + envVarID
+}
+
+// ensureEnvVarProgenyPolicy creates or deletes the implicit progeny policy for an
+// env var based on the allowProgeny flag.
+func (s *Server) ensureEnvVarProgenyPolicy(ctx context.Context, ev *store.EnvVar) {
+	if ev.Scope != store.ScopeUser {
+		return
+	}
+
+	policyName := envVarProgenyPolicyName(ev.ID)
+
+	if ev.AllowProgeny {
+		existing, err := s.store.ListPolicies(ctx, store.PolicyFilter{Name: policyName}, store.ListOptions{Limit: 1})
+		if err != nil {
+			s.envSecretLog.Warn("failed to check for existing env var progeny policy", "envVar", ev.Key, "error", err)
+			return
+		}
+		if existing.TotalCount > 0 {
+			return
+		}
+
+		policy := &store.Policy{
+			ID:           api.NewUUID(),
+			Name:         policyName,
+			Description:  "Implicit policy granting progeny agents read access to env var " + ev.Key,
+			ScopeType:    store.PolicyScopeResource,
+			ScopeID:      ev.ID,
+			ResourceType: "envvar",
+			ResourceID:   ev.ID,
+			Actions:      []string{"read"},
+			Effect:       store.PolicyEffectAllow,
+			Conditions: &store.PolicyConditions{
+				DelegatedFrom: &store.DelegatedFromCondition{
+					PrincipalType: "user",
+					PrincipalID:   ev.CreatedBy,
+				},
+			},
+			Labels: map[string]string{
+				"scion.dev/managed-by":   "progeny-envvar-access",
+				"scion.dev/envvar-key":   ev.Key,
+				"scion.dev/envvar-id":    ev.ID,
+				"scion.dev/envvar-scope": ev.Scope,
+			},
+			CreatedBy: ev.CreatedBy,
+		}
+		if err := s.store.CreatePolicy(ctx, policy); err != nil {
+			s.envSecretLog.Warn("failed to create env var progeny policy", "envVar", ev.Key, "error", err)
+		}
+	} else {
+		s.deleteEnvVarProgenyPolicy(ctx, ev.ID)
+	}
+}
+
+// deleteEnvVarProgenyPolicy removes the implicit progeny policy for an env var by its ID.
+func (s *Server) deleteEnvVarProgenyPolicy(ctx context.Context, envVarID string) {
+	policyName := envVarProgenyPolicyName(envVarID)
+	existing, err := s.store.ListPolicies(ctx, store.PolicyFilter{Name: policyName}, store.ListOptions{Limit: 1})
+	if err != nil {
+		s.envSecretLog.Warn("failed to look up env var progeny policy for deletion", "envVarID", envVarID, "error", err)
+		return
+	}
+	for _, p := range existing.Items {
+		if err := s.store.DeletePolicy(ctx, p.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+			s.envSecretLog.Warn("failed to delete env var progeny policy", "policyID", p.ID, "error", err)
 		}
 	}
 }
@@ -887,6 +996,7 @@ type AgentSetSecretRequest struct {
 	Type     string `json:"type,omitempty"`     // environment (default), variable, file
 	Target   string `json:"target,omitempty"`   // Injection target path
 	Force    bool   `json:"force,omitempty"`    // Overwrite existing secret
+	Scope    string `json:"scope,omitempty"`    // "project" (default) or "user"
 }
 
 // AgentSetSecretResponse is returned on successful agent secret creation.
@@ -992,6 +1102,35 @@ func (s *Server) handleAgentSecrets(w http.ResponseWriter, r *http.Request, agen
 		return
 	}
 
+	// Determine scope and scopeID.
+	scope := req.Scope
+	if scope == "" {
+		scope = store.ScopeProject
+	}
+	var scopeID string
+	switch scope {
+	case store.ScopeProject:
+		scopeID = projectID
+	case store.ScopeUser:
+		agentIdent := GetAgentIdentityFromContext(ctx)
+		if agentIdent == nil {
+			writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "This endpoint requires agent authentication", nil)
+			return
+		}
+		scopeID = agentIdent.OriginUserID()
+		if scopeID == "" {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "agent token lacks user context required for user-scoped secrets", nil)
+			return
+		}
+	default:
+		ValidationError(w, "scope must be \"project\" or \"user\"", map[string]interface{}{
+			"field":   "scope",
+			"value":   scope,
+			"allowed": []string{"project", "user"},
+		})
+		return
+	}
+
 	var decoded []byte
 	if req.Encoding == "raw" {
 		// Caller explicitly opted in to raw text — store the value as-is.
@@ -1051,9 +1190,9 @@ func (s *Server) handleAgentSecrets(w http.ResponseWriter, r *http.Request, agen
 	// Note: the backend's UpsertSecret has the same check-then-write pattern
 	// internally, so this is consistent with the existing TOCTOU window.
 	if !req.Force {
-		_, err := s.secretBackend.GetMeta(ctx, key, store.ScopeProject, projectID)
+		_, err := s.secretBackend.GetMeta(ctx, key, scope, scopeID)
 		if err == nil {
-			Conflict(w, fmt.Sprintf("Secret %q already exists at project scope. Use force=true to overwrite.", key))
+			Conflict(w, fmt.Sprintf("Secret %q already exists at %s scope. Use force=true to overwrite.", key, scope))
 			return
 		}
 		if !errors.Is(err, store.ErrNotFound) {
@@ -1067,8 +1206,8 @@ func (s *Server) handleAgentSecrets(w http.ResponseWriter, r *http.Request, agen
 		Value:      string(decoded),
 		SecretType: secretType,
 		Target:     target,
-		Scope:      store.ScopeProject,
-		ScopeID:    projectID,
+		Scope:      scope,
+		ScopeID:    scopeID,
 		CreatedBy:  fmt.Sprintf("agent:%s", agentID),
 		UpdatedBy:  fmt.Sprintf("agent:%s", agentID),
 	}
@@ -1082,8 +1221,8 @@ func (s *Server) handleAgentSecrets(w http.ResponseWriter, r *http.Request, agen
 	if created {
 		writeJSON(w, http.StatusCreated, AgentSetSecretResponse{
 			Key:     key,
-			Scope:   store.ScopeProject,
-			ScopeID: projectID,
+			Scope:   scope,
+			ScopeID: scopeID,
 		})
 	} else {
 		w.WriteHeader(http.StatusNoContent)
@@ -1121,6 +1260,7 @@ func (s *Server) validateAgentSecretAccess(w http.ResponseWriter, r *http.Reques
 
 // agentGetSecret handles GET /api/v1/agents/{agentID}/secrets/{key}.
 // Returns the secret value (base64-encoded) along with type and target metadata.
+// Supports both project-scoped and user-scoped secrets via the ?scope= query parameter.
 func (s *Server) agentGetSecret(w http.ResponseWriter, r *http.Request, agentID, key string) {
 	ctx := r.Context()
 
@@ -1130,16 +1270,45 @@ func (s *Server) agentGetSecret(w http.ResponseWriter, r *http.Request, agentID,
 		return
 	}
 
+	// Determine scope and scopeID.
+	scope := r.URL.Query().Get("scope")
+	if scope == "" {
+		scope = store.ScopeProject
+	}
+	var scopeID string
+	switch scope {
+	case store.ScopeProject:
+		scopeID = projectID
+	case store.ScopeUser:
+		agentIdent := GetAgentIdentityFromContext(ctx)
+		if agentIdent == nil {
+			writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "This endpoint requires agent authentication", nil)
+			return
+		}
+		scopeID = agentIdent.OriginUserID()
+		if scopeID == "" {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "agent token lacks user context required for user-scoped secrets", nil)
+			return
+		}
+	default:
+		ValidationError(w, "scope must be \"project\" or \"user\"", map[string]interface{}{
+			"field":   "scope",
+			"value":   scope,
+			"allowed": []string{"project", "user"},
+		})
+		return
+	}
+
 	// Retrieve the secret including its value.
-	secretVal, err := s.secretBackend.Get(ctx, key, store.ScopeProject, projectID)
+	secretVal, err := s.secretBackend.Get(ctx, key, scope, scopeID)
 	if err != nil {
-		LogAgentSecretRead(ctx, s.auditLogger, agentID, projectID, key, false, err.Error())
+		LogAgentSecretRead(ctx, s.auditLogger, agentID, scopeID, key, false, err.Error())
 		writeErrorFromErr(w, err, "")
 		return
 	}
 
 	// Audit log the successful read.
-	LogAgentSecretRead(ctx, s.auditLogger, agentID, projectID, key, true, "")
+	LogAgentSecretRead(ctx, s.auditLogger, agentID, scopeID, key, true, "")
 
 	writeJSON(w, http.StatusOK, AgentGetSecretResponse{
 		Key:    secretVal.Name,
@@ -1150,7 +1319,9 @@ func (s *Server) agentGetSecret(w http.ResponseWriter, r *http.Request, agentID,
 }
 
 // agentListSecrets handles GET /api/v1/agents/{agentID}/secrets (no key).
-// Returns metadata for all secrets in the agent's project (no values).
+// Returns metadata for secrets accessible to the agent.
+// Supports both project-scoped and user-scoped secrets via the ?scope= query parameter.
+// When no scope is specified, secrets from both project and user scopes are returned.
 func (s *Server) agentListSecrets(w http.ResponseWriter, r *http.Request, agentID string) {
 	ctx := r.Context()
 
@@ -1159,17 +1330,82 @@ func (s *Server) agentListSecrets(w http.ResponseWriter, r *http.Request, agentI
 		return
 	}
 
-	metas, err := s.secretBackend.List(ctx, secret.Filter{
-		Scope:   store.ScopeProject,
-		ScopeID: projectID,
-	})
-	if err != nil {
-		writeErrorFromErr(w, err, "")
+	scope := r.URL.Query().Get("scope")
+
+	// Collect secrets based on requested scope.
+	var allMetas []secret.SecretMeta
+
+	switch scope {
+	case "": // No scope filter: include both project and user secrets.
+		projectMetas, err := s.secretBackend.List(ctx, secret.Filter{
+			Scope:   store.ScopeProject,
+			ScopeID: projectID,
+		})
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		allMetas = append(allMetas, projectMetas...)
+
+		// Include user-scoped secrets if agent has user context.
+		agentIdent := GetAgentIdentityFromContext(ctx)
+		if agentIdent != nil {
+			if userID := agentIdent.OriginUserID(); userID != "" {
+				userMetas, err := s.secretBackend.List(ctx, secret.Filter{
+					Scope:   store.ScopeUser,
+					ScopeID: userID,
+				})
+				if err != nil {
+					writeErrorFromErr(w, err, "")
+					return
+				}
+				allMetas = append(allMetas, userMetas...)
+			}
+		}
+
+	case store.ScopeProject:
+		metas, err := s.secretBackend.List(ctx, secret.Filter{
+			Scope:   store.ScopeProject,
+			ScopeID: projectID,
+		})
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		allMetas = metas
+
+	case store.ScopeUser:
+		agentIdent := GetAgentIdentityFromContext(ctx)
+		if agentIdent == nil {
+			writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "This endpoint requires agent authentication", nil)
+			return
+		}
+		userID := agentIdent.OriginUserID()
+		if userID == "" {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "agent token lacks user context required for user-scoped secrets", nil)
+			return
+		}
+		metas, err := s.secretBackend.List(ctx, secret.Filter{
+			Scope:   store.ScopeUser,
+			ScopeID: userID,
+		})
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		allMetas = metas
+
+	default:
+		ValidationError(w, "scope must be \"project\" or \"user\"", map[string]interface{}{
+			"field":   "scope",
+			"value":   scope,
+			"allowed": []string{"project", "user"},
+		})
 		return
 	}
 
-	secrets := make([]AgentSecretMeta, len(metas))
-	for i, m := range metas {
+	secrets := make([]AgentSecretMeta, len(allMetas))
+	for i, m := range allMetas {
 		secrets[i] = AgentSecretMeta{
 			Key:    m.Name,
 			Type:   m.SecretType,

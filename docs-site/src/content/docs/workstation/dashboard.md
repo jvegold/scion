@@ -21,14 +21,19 @@ The dashboard features an integrated notification framework with real-time SSE d
 ### Native Web Chat
 When enabled via the `web.native_chat` feature flag, the dashboard includes a top-level **Native Web Chat** workspace (a fourth ShellType in the SPA). It offers a rich interface for direct communication and coordination with your running agents and team.
 - **Project-Scoped Spaces & Shared Threads**: Conversations are organized into distinct spaces scoped to specific Projects. Within these spaces, users and agents can collaborate on shared discussion threads.
+- **Project Context Preservation (Dashboard ↔ Chat Toggle)**: When you switch between dashboard and chat modes using the header buttons, the system maintains your active project context so you do not lose your place:
+  - **Dashboard → Chat**: Clicking the **Chat** icon while on a project-scoped dashboard page (e.g., `/projects/:id/...`) takes you straight to that project's chat space (`/chat/space/:id`).
+  - **Chat → Dashboard**: Clicking the **Dashboard** icon while in a project chat space (`/chat/space/:id/...` or `/chat/:slug/...`) takes you directly back to that project's detail page (`/projects/:id`).
+  - **DMs / General Chat**: If there is no active project context (such as when in Direct Messages or bare `/chat`), the view defaults back to the top-level dashboard `/`.
 - **Direct Messages (DMs)**: Start 1-on-1 direct messages covering both human-to-human (H2H) and human-to-agent (H2A) communication, consolidated as a single "global pair" thread per pair.
 - **Members Sidebar, Presence & Typing**: A right-hand sidebar displays active project members, showcasing real-time online presence status and typing indicators.
 - **Composer Default-Agent Disambiguation**: When sending messages in spaces with multiple active agents, the composer helps resolve which agent is targeted if no explicit mention is used.
-- **Attachments**: Upload file or image attachments directly within the composer.
+- **Attachments**: Upload file or image attachments directly within the composer, with preview tiles rendered instantly on real-time SSE updates.
 - **Search**: Built-in chat search lets you query across historical messages and threads.
 - **Chat/Log Switcher**: Instantly toggle between standard conversational chat with the agent and a real-time stream of the agent's raw execution logs inside the same view.
 - **@-Mentions & Autocomplete**: Call other agents into the thread by typing `@` to trigger a fuzzy-matching, keyboard-navigable agent dropdown. Protected by code-fence guards to prevent triggering inside Markdown code snippets.
 - **Visibility Density Filters**: Choose from three filter levels—**Conversation** (pure dialogue), **Verbose** (adds mentions/CCs), or **Full** (adds state updates and background processes)—with preferences saved individually per agent.
+- **Agent-to-Agent Message Expansion**: Background inter-agent communications (displayed in the **Full** density view) are collapsed into a compact pill to preserve screen space. Expanding the pill displays the messages with a 2-line limit; truncated messages feature a zoom/expand icon (`arrows-angle-expand`) that opens a rich, full-screen Markdown-rendered dialog overlay, closeable via its X button or by clicking outside.
 - **Coherence Sync**: Real-time sync ensures actions taken on external channels (e.g. Discord or Teams) propagate instantly to the Web UI, with delivery state tooltips indicating whether messages succeeded.
 
 ### Projects
