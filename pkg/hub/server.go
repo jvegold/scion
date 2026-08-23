@@ -1591,9 +1591,22 @@ func (s *Server) ensureSigningKey(ctx context.Context, keyName string, existingK
 			if legacyScopeID == hubID {
 				continue
 			}
-			val, legacyErr := s.store.GetSecretValue(ctx, keyName, store.ScopeHub, legacyScopeID)
-			if legacyErr != nil {
-				continue
+			// When a secret backend is configured, read through it so that
+			// encrypted-at-rest values are decrypted transparently. Fall
+			// back to the raw store for configurations without a backend.
+			var val string
+			if hasSecretBackend {
+				sv, getErr := s.secretBackend.Get(ctx, keyName, store.ScopeHub, legacyScopeID)
+				if getErr == nil {
+					val = sv.Value
+				}
+			}
+			if val == "" {
+				rawVal, legacyErr := s.store.GetSecretValue(ctx, keyName, store.ScopeHub, legacyScopeID)
+				if legacyErr != nil {
+					continue
+				}
+				val = rawVal
 			}
 			slog.Info("Loaded signing key from legacy scope ID, will migrate", "key", keyName, "legacyScopeID", legacyScopeID)
 			key, decErr := base64.StdEncoding.DecodeString(val)
@@ -3559,6 +3572,14 @@ func (s *Server) registerRoutes() {
 		entryID := strings.TrimPrefix(r.URL.Path, "/api/v1/users/me/injected-skills/")
 		entryID = strings.TrimSuffix(entryID, "/")
 		s.handleUserMeInjectedSkillByID(w, r, entryID)
+	})
+
+	// User-scoped template endpoints (/users/me/templates)
+	s.mux.HandleFunc("/api/v1/users/me/templates", s.handleUserMeTemplates)
+	s.mux.HandleFunc("/api/v1/users/me/templates/", func(w http.ResponseWriter, r *http.Request) {
+		templateID := strings.TrimPrefix(r.URL.Path, "/api/v1/users/me/templates/")
+		templateID = strings.TrimSuffix(templateID, "/")
+		s.handleUserMeTemplateByID(w, r, templateID)
 	})
 
 	// Hub-scope injected-skills endpoint
