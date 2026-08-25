@@ -65,8 +65,7 @@ AUTH = scion_harness.AuthSpec(
         scion_harness.env_method(
             "vertex-ai",
             all_of=["GOOGLE_CLOUD_PROJECT"],
-            any_of=["GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_REGION"],
-            hint="provide GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION/GOOGLE_CLOUD_REGION",
+            hint="set GOOGLE_CLOUD_PROJECT for Vertex AI model routing",
         ),
     ],
     fallback_to_none_on_error=True,
@@ -106,7 +105,7 @@ def _write_auth_file(ctx: scion_harness.ProvisionContext) -> None:
         raise scion_harness.ProvisionError(
             f"GROK_AUTH secret is not valid JSON: {exc}"
         ) from exc
-    config_dir = scion_harness.expand_path("~/.grok")
+    config_dir = os.environ.get("GROK_HOME") or scion_harness.expand_path("~/.grok")
     os.makedirs(config_dir, exist_ok=True)
     target = os.path.join(config_dir, "auth.json")
     tmp = target + ".tmp"
@@ -114,6 +113,123 @@ def _write_auth_file(ctx: scion_harness.ProvisionContext) -> None:
         f.write(content)
     os.chmod(tmp, 0o600)
     os.replace(tmp, target)
+
+
+# ---------------------------------------------------------------------------
+# Vertex AI configuration
+# ---------------------------------------------------------------------------
+
+_VERTEX_MODEL_ID = "xai/grok-4.6"
+_VERTEX_AUTH_PROVIDER_NAME = "vertex-grok"
+_VERTEX_MODEL_CONFIG_NAME = "vertex-grok"
+
+
+def _configure_vertex_ai(
+    ctx: scion_harness.ProvisionContext,
+    env: dict[str, str],
+) -> dict[str, Any]:
+    """Configure grok to route inference through Vertex AI Model Garden.
+
+    Writes:
+      - [auth_provider.vertex-grok] with gcloud token command
+      - [model.vertex-grok] with Vertex AI base_url and auth_provider ref
+      - [models] default = "vertex-grok"
+    """
+    project = _read_token(ctx, "GOOGLE_CLOUD_PROJECT")
+    if not project:
+        raise scion_harness.ProvisionError(
+            "vertex-ai auth selected but GOOGLE_CLOUD_PROJECT is empty"
+        )
+    env["GOOGLE_CLOUD_PROJECT"] = project
+
+    # Region is optional — when empty, use the global multi-region endpoint.
+    region = ""
+    for key in ("GOOGLE_CLOUD_REGION", "CLOUD_ML_REGION", "GOOGLE_CLOUD_LOCATION"):
+        val = _read_token(ctx, key)
+        if val:
+            region = val
+            env[key] = val
+            break
+
+    # Construct Vertex AI base URL.
+    if region:
+        base_url = (
+            f"https://{region}-aiplatform.googleapis.com"
+            f"/v1beta1/projects/{project}/locations/{region}/endpoints/openapi"
+        )
+    else:
+        base_url = (
+            f"https://aiplatform.googleapis.com"
+            f"/v1beta1/projects/{project}/locations/global/endpoints/openapi"
+        )
+
+    # Place ADC credentials file if staged.
+    adc_content = ctx.read_file_secret("gcloud-adc")
+    if adc_content:
+        adc_dir = os.path.join(ctx.home, ".config", "gcloud")
+        os.makedirs(adc_dir, exist_ok=True)
+        adc_target = os.path.join(adc_dir, "application_default_credentials.json")
+        scion_harness.atomic_write_text(adc_target, adc_content, mode=0o600)
+        env["GOOGLE_APPLICATION_CREDENTIALS"] = adc_target
+        ctx.info(f"placed ADC credentials at {adc_target}")
+
+    # Resolve model ID — allow SCION_MODEL to override the default.
+    raw_model = os.environ.get("SCION_MODEL", "").strip()
+    model_id = raw_model if raw_model else _VERTEX_MODEL_ID
+
+    # Write Vertex AI model config to config.toml.
+    _write_vertex_config(ctx, base_url, model_id)
+
+    ctx.info(f"vertex-ai: project={project} model={model_id} base_url={base_url}")
+
+    return {"vertex_ai": True, "vertex_base_url": base_url}
+
+
+def _write_vertex_config(
+    ctx: scion_harness.ProvisionContext,
+    base_url: str,
+    model_id: str,
+) -> None:
+    """Append Vertex AI auth_provider and model config to config.toml."""
+    config_path = os.path.join(ctx.home, ".grok", "config.toml")
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+    existing = ""
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+        except OSError:
+            pass
+
+    # Strip any existing vertex config sections to avoid duplicates.
+    cleaned = scion_harness.strip_toml_sections(
+        existing,
+        lambda line: (
+            line == f"[auth_provider.{_VERTEX_AUTH_PROVIDER_NAME}]"
+            or line == f"[model.{_VERTEX_MODEL_CONFIG_NAME}]"
+            or line == "[models]"
+        ),
+    )
+
+    # Build the vertex config block.
+    vertex_toml = f'''[auth_provider.{_VERTEX_AUTH_PROVIDER_NAME}]
+command = "gcloud auth print-access-token"
+
+[model.{_VERTEX_MODEL_CONFIG_NAME}]
+model = "{scion_harness.toml_escape(model_id)}"
+base_url = "{scion_harness.toml_escape(base_url)}"
+auth_provider = "{_VERTEX_AUTH_PROVIDER_NAME}"
+
+[models]
+default = "{_VERTEX_MODEL_CONFIG_NAME}"'''
+
+    content = cleaned.rstrip("\n")
+    if content:
+        content += "\n\n"
+    content += vertex_toml + "\n"
+
+    scion_harness.atomic_write_text(config_path, content)
 
 
 # ---------------------------------------------------------------------------
@@ -447,21 +563,20 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
         extra = {"auth_file_written": True}
 
     if resolved.method == "vertex-ai":
-        region_key = resolved.env_key or "GOOGLE_CLOUD_REGION"
-        region = _read_token(ctx, region_key)
-        project = _read_token(ctx, "GOOGLE_CLOUD_PROJECT")
-        env["GOOGLE_CLOUD_PROJECT"] = project
-        env["GOOGLE_CLOUD_REGION"] = region
-        extra = {"vertex_ai": True}
+        extra = _configure_vertex_ai(ctx, env)
 
     # --- Model resolution ---------------------------------------------------
     # The Go side does not populate ctx.model_resolution for out-of-tree
     # harnesses. Use the SCION_MODEL env var and resolve via model_aliases.
-    raw_model = os.environ.get("SCION_MODEL", "").strip()
-    aliases = ctx.harness_config.get("model_aliases") or {}
-    resolved_model = aliases.get(raw_model.lower(), raw_model) if raw_model else ""
-    if resolved_model:
-        env["GROK_DEFAULT_MODEL"] = resolved_model
+    # When vertex-ai is selected, model routing is handled by the config.toml
+    # [models] block, so skip GROK_DEFAULT_MODEL to avoid conflicts.
+    if resolved.method != "vertex-ai":
+        raw_model = os.environ.get("SCION_MODEL", "").strip()
+        aliases = ctx.harness_config.get("model_aliases") or {}
+        resolved_model = aliases.get(raw_model.lower(), raw_model) if raw_model else ""
+        if resolved_model:
+            env["GROK_DEFAULT_MODEL"] = resolved_model
+    # vertex-ai model resolution handled in _configure_vertex_ai
 
     # --- Telemetry: inject native OTel env vars when enabled ----------------
     telemetry_payload = ctx.telemetry

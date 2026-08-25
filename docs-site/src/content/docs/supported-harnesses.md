@@ -233,10 +233,11 @@ from the `XAI_API_KEY` environment variable.
 Alternatively, a file-based auth method (`auth-file`) is supported using `~/.grok/auth.json`,
 produced by `grok login --device-auth`. Capture the credential with `capture_auth.py` after login.
 
-A third option is **Vertex AI** (auth type `vertex-ai`): provide `GOOGLE_CLOUD_PROJECT` and a
-region (`GOOGLE_CLOUD_REGION` / `CLOUD_ML_REGION` / `GOOGLE_CLOUD_LOCATION`), plus Application
-Default Credentials (ADC). Scion exposes the project and region as environment variables inside
-the container.
+A **Vertex AI** auth method (`vertex-ai`) routes inference through Google Cloud's Vertex AI
+Model Garden. Set `GOOGLE_CLOUD_PROJECT` and optionally `GOOGLE_CLOUD_REGION` (defaults to the
+global endpoint). The provisioner writes `[auth_provider]` and `[model]` entries to
+`~/.grok/config.toml` using `gcloud auth print-access-token` for on-demand token refresh.
+Application Default Credentials (ADC) are placed automatically when staged.
 
 If no credentials are found, the agent drops to a shell — run `grok login --device-auth`
 interactively, then capture the credential with the container's `capture_auth.py`
@@ -246,7 +247,7 @@ interactively, then capture the credential with the container's `capture_auth.py
 |---|---|---|
 | API Key | `XAI_API_KEY` | Set env var with xAI API key |
 | Auth File | `~/.grok/auth.json` | `grok login --device-auth` + capture |
-| Vertex AI | `GOOGLE_CLOUD_PROJECT` + region | Set GCP project and region env vars + ADC |
+| Vertex AI | `GOOGLE_CLOUD_PROJECT` | Set env var with GCP project ID |
 
 ### Configuration
 - **Config directory**: `~/.grok/` (settings in `config.toml`).
