@@ -64,7 +64,7 @@ AUTH = scion_harness.AuthSpec(
         ),
         scion_harness.env_method(
             "vertex-ai",
-            all_of=["GOOGLE_CLOUD_PROJECT"],
+            any_of=["GOOGLE_CLOUD_PROJECT", "SCION_METADATA_PROJECT_ID"],
             hint="set GOOGLE_CLOUD_PROJECT for Vertex AI model routing",
         ),
     ],
@@ -137,6 +137,10 @@ def _configure_vertex_ai(
     """
     project = _read_token(ctx, "GOOGLE_CLOUD_PROJECT")
     if not project:
+        # Fallback: when GCP identity is assigned, the platform injects the
+        # project ID as SCION_METADATA_PROJECT_ID.
+        project = os.environ.get("SCION_METADATA_PROJECT_ID", "").strip()
+    if not project:
         raise scion_harness.ProvisionError(
             "vertex-ai auth selected but GOOGLE_CLOUD_PROJECT is empty"
         )
@@ -173,12 +177,30 @@ def _configure_vertex_ai(
         env["GOOGLE_APPLICATION_CREDENTIALS"] = adc_target
         ctx.info(f"placed ADC credentials at {adc_target}")
 
-    # Resolve model ID — allow SCION_MODEL to override the default.
+    # Resolve model ID — aliases map to the default Vertex AI model since
+    # Vertex AI Model Garden may not have all xAI models available.
     raw_model = os.environ.get("SCION_MODEL", "").strip()
-    model_id = raw_model if raw_model else _VERTEX_MODEL_ID
+    if raw_model:
+        aliases = ctx.harness_config.get("model_aliases")
+        if not isinstance(aliases, dict):
+            aliases = {}
+        if raw_model.lower() in aliases:
+            # Scion alias (small, medium, large) — use default Vertex model.
+            model_id = _VERTEX_MODEL_ID
+            ctx.info(f"vertex-ai: resolved alias '{raw_model}' to {_VERTEX_MODEL_ID}")
+        else:
+            # Explicit model ID (e.g., "xai/grok-4.2") — use as-is.
+            model_id = raw_model
+    else:
+        model_id = _VERTEX_MODEL_ID
 
     # Write Vertex AI model config to config.toml.
     _write_vertex_config(ctx, base_url, model_id)
+
+    # Set GROK_DEFAULT_MODEL so grok uses the vertex-grok config block.
+    # This is belt-and-suspenders alongside [models] default in config.toml —
+    # the env var cannot be overwritten by grok's /model command at runtime.
+    env["GROK_DEFAULT_MODEL"] = _VERTEX_MODEL_CONFIG_NAME
 
     ctx.info(f"vertex-ai: project={project} model={model_id} base_url={base_url}")
 
@@ -568,15 +590,13 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
     # --- Model resolution ---------------------------------------------------
     # The Go side does not populate ctx.model_resolution for out-of-tree
     # harnesses. Use the SCION_MODEL env var and resolve via model_aliases.
-    # When vertex-ai is selected, model routing is handled by the config.toml
-    # [models] block, so skip GROK_DEFAULT_MODEL to avoid conflicts.
+    # vertex-ai sets GROK_DEFAULT_MODEL in _configure_vertex_ai.
     if resolved.method != "vertex-ai":
         raw_model = os.environ.get("SCION_MODEL", "").strip()
         aliases = ctx.harness_config.get("model_aliases") or {}
         resolved_model = aliases.get(raw_model.lower(), raw_model) if raw_model else ""
         if resolved_model:
             env["GROK_DEFAULT_MODEL"] = resolved_model
-    # vertex-ai model resolution handled in _configure_vertex_ai
 
     # --- Telemetry: inject native OTel env vars when enabled ----------------
     telemetry_payload = ctx.telemetry
