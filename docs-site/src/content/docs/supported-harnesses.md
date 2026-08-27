@@ -88,6 +88,7 @@ OpenCode supports two authentication methods (auto-detected in this order):
 - **Config File**: `~/.config/opencode/opencode.json`.
 - **Environment**: Respects standard OpenCode environment variables.
 - **Model Resolution**: Supports model selection via the `SCION_MODEL` environment variable. When `ctx.model_resolution` is empty, the provisioning script automatically falls back to `SCION_MODEL` to resolve and configure the underlying model.
+- **Catalog Pre-fetch**: The provisioner automatically pre-fetches the `models.dev` catalog to ensure fresh model data is available before startup.
 
 ### Known Limitations
 - **Auth File Copy**: The `auth.json` file is copied only when the agent is **created**. If you update your host credentials, you may need to manually update the file in the agent or recreate the agent.
@@ -197,9 +198,9 @@ a containerized workspace agent; choose the managed agent for repo-less, broker-
 :::
 
 ### Authentication
-Antigravity uses **OAuth** (auth type `oauth-token`), with an optional **Vertex AI**
-(`vertex-ai`) mode for enterprise/GCP deployments. It does not use API keys.
+Antigravity supports three authentication methods:
 
+- **API Key** (`api-key`): Provide an environment secret named `GEMINI_API_KEY`. The provisioner will set `modelProvider` in the agent's `settings.json` and authenticate using this key.
 - **OAuth token** (`oauth-token`): provide a JSON file secret named `AGY_TOKEN` containing a `refresh_token`. Scion stages it at `~/.gemini/antigravity-cli/antigravity-oauth-token` and injects it into the container's gnome-keyring at launch.
 - **Vertex AI** (`vertex-ai`): Google Cloud's Vertex AI mode using Google Cloud Application Default Credentials (ADC) plus `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION` (or `GOOGLE_CLOUD_REGION`). This mode no longer requires `AGY_TOKEN`. It uses the `gcloud-adc` file secret or automatically resolves ADC via the assigned GCP Service Account (Hub-managed GCP Identity). Requires AGY CLI >= 1.1.10.
 
@@ -247,19 +248,19 @@ interactively, then capture the credential with the container's `capture_auth.py
 |---|---|---|
 | API Key | `XAI_API_KEY` | Set env var with xAI API key |
 | Auth File | `~/.grok/auth.json` | `grok login --device-auth` + capture |
-| Vertex AI | `GOOGLE_CLOUD_PROJECT` | Set env var with GCP project ID |
+| Vertex AI | `SCION_METADATA_PROJECT_ID` or `GOOGLE_CLOUD_PROJECT` | Detected from GCP identity or env var |
 
 ### Configuration
 - **Config directory**: `~/.grok/` (settings in `config.toml`).
-- **Instructions**: `agent_instructions` and `system_prompt` are projected into `AGENTS.md`. Grok has no native system-prompt flag, so the system prompt is *prepended to `AGENTS.md`*.
+- **Instructions**: `agent_instructions` are projected into `~/.grok/AGENTS.md`.
+- **System Prompt**: Supported natively via the `--system-prompt-override` flag during launch.
 - **MCP**: `~/.grok/config.toml` under `[mcp_servers.*]` TOML sections (supports `stdio`, `sse`, and `streamable-http` transports). Project-scoped MCP servers are not supported (demoted to global).
-- **Model aliases**: `small` → `grok-3-mini`, `medium` → `grok-3`, `large` → `grok-4`, `extra-large` → `grok-4`.
+- **Model aliases**: `small` → `grok-3-mini`, `medium` → `grok-3`, `large` → `grok-4`, `extra-large` → `grok-4` (resolved and injected via `GROK_DEFAULT_MODEL`).
 - **Hooks**: 11 Grok lifecycle event hooks are wired to sciontool via `~/.grok/hooks/scion.json` using the `grok-build` dialect.
 - **OpenTelemetry**: When telemetry is enabled, Scion injects `GROK_TELEMETRY_ENABLED`, `GROK_EXTERNAL_OTEL`, and standard `OTEL_*` env vars pointing at sciontool's local OTLP receiver.
 
 ### Known Limitations
 - **No max_model_calls** — Grok hooks do not expose model-call start/end events. `max_turns` and `max_duration` are supported.
-- **System Prompt**: approximated via `AGENTS.md` (no native override).
 - **No project-scoped MCP**.
 - **OAuth**: not supported — Grok uses xAI auth only.
 
@@ -280,7 +281,7 @@ The following table summarizes the capabilities supported by each agent harness 
 | **Hooks** | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
 | Support | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
 | **OpenTelemetry** | ✅ | ✅  | ❌ | ✅  | ❌ | ❌ | ❌ | ✅ |
-| **System Prompt Override** | ✅ | ✅ | ❌ | ❌ | ◐ | ◐ | ◐ | ◐ |
+| **System Prompt Override** | ✅ | ✅ | ❌ | ❌ | ◐ | ◐ | ◐ | ✅ |
 | **Auth: API Key** | ✅ | ✅ | ✅ | ✅ | ✅¹ | ✅ | ❌ | ✅ |
 | **Auth: OAuth Token** | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **Auth: Auth File** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅² | ✅ |
