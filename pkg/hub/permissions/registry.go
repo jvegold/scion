@@ -31,23 +31,34 @@ const (
 	ResourcePolicy            = "policy"
 	ResourceBroker            = "broker"
 	ResourceGCPServiceAccount = "gcp_service_account"
+	ResourceHub               = "hub"
+	ResourceQuota             = "quota"
+	ResourceRole              = "role"
+	ResourceRoleBinding       = "role_binding"
 
-	ActionCreate       = "create"
-	ActionRead         = "read"
-	ActionUpdate       = "update"
-	ActionDelete       = "delete"
-	ActionList         = "list"
-	ActionManage       = "manage"
-	ActionAttach       = "attach"
-	ActionPortAccess   = "port_access"
-	ActionRegister     = "register"
-	ActionAddMember    = "addMember"
-	ActionRemoveMember = "removeMember"
-	ActionDispatch     = "dispatch"
-	ActionStopAll      = "stop_all"
-	ActionVerify       = "verify"
-	ActionMint         = "mint"
-	ActionAssign       = "assign"
+	ActionCreate         = "create"
+	ActionRead           = "read"
+	ActionUpdate         = "update"
+	ActionDelete         = "delete"
+	ActionList           = "list"
+	ActionManage         = "manage"
+	ActionAttach         = "attach"
+	ActionPortAccess     = "port_access"
+	ActionRegister       = "register"
+	ActionAddMember      = "addMember"
+	ActionRemoveMember   = "removeMember"
+	ActionDispatch       = "dispatch"
+	ActionStopAll        = "stop_all"
+	ActionVerify         = "verify"
+	ActionMint           = "mint"
+	ActionAssign         = "assign"
+	ActionInvite         = "invite"
+	ActionSuspend        = "suspend"
+	ActionPromote        = "promote"
+	ActionClone          = "clone"
+	ActionExecute        = "execute"
+	ActionMessage        = "message"
+	ActionSetMessageMode = "set_message_mode"
 
 	UATScopeAgentManage = "agent:manage"
 )
@@ -90,6 +101,8 @@ var Registry = []Permission{
 	{ID: "agent.attach", Resource: ResourceAgent, Action: ActionAttach, CapabilityKind: CapabilityResource, UATScope: "agent:attach", AgentScopes: []string{"project:agent:lifecycle"}, Description: "Attach to agent sessions", Enforcement: []string{"pkg/hub/authorize.go:authorizeAgentLifecycle", "pkg/hub/pty_handlers.go"}},
 	{ID: "agent.port_access", Resource: ResourceAgent, Action: ActionPortAccess, CapabilityKind: CapabilityResource, UATScope: "agent:port_access", Description: "Access agent forwarded ports", Enforcement: []string{"pkg/hub/port_forward_handlers.go"}},
 	{ID: "agent.stop_all", Resource: ResourceAgent, Action: ActionStopAll, CapabilityKind: CapabilityScope, Description: "Stop all agents", Enforcement: []string{"pkg/hub/handlers_agents_core.go"}},
+	{ID: "agent.message", Resource: ResourceAgent, Action: ActionMessage, CapabilityKind: CapabilityScope, UATScope: "agent:message", Description: "Send messages to agents", NonRouteUse: []string{"Phase 2: pkg/hub/authorize.go:authorizeAgentMessage"}},
+	{ID: "agent.set_message_mode", Resource: ResourceAgent, Action: ActionSetMessageMode, CapabilityKind: CapabilityResource, Description: "Change agent message mode", Enforcement: []string{"pkg/hub/handlers_agents_core.go"}},
 
 	{ID: "project.create", Resource: ResourceProject, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create projects", Enforcement: []string{"pkg/hub/handlers_projects_core.go"}},
 	{ID: "project.read", Resource: ResourceProject, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "project:read", AgentScopes: []string{"project:read"}, Description: "Read project metadata", Enforcement: []string{"pkg/hub/handlers_projects_core.go", "pkg/hub/authz.go"}},
@@ -98,33 +111,33 @@ var Registry = []Permission{
 	{ID: "project.manage", Resource: ResourceProject, Action: ActionManage, CapabilityKind: CapabilityResource, Description: "Manage project administration", Enforcement: []string{"pkg/hub/handlers_projects_core.go"}},
 	{ID: "project.register", Resource: ResourceProject, Action: ActionRegister, CapabilityKind: CapabilityResource, Description: "Register projects", Enforcement: []string{"pkg/hub/handlers_projects_core.go"}},
 
-	{ID: "skill.create", Resource: ResourceSkill, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
-	{ID: "skill.read", Resource: ResourceSkill, Action: ActionRead, CapabilityKind: CapabilityResource, Description: "Read skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
-	{ID: "skill.update", Resource: ResourceSkill, Action: ActionUpdate, CapabilityKind: CapabilityResource, Description: "Update skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
-	{ID: "skill.delete", Resource: ResourceSkill, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
-	{ID: "skill.list", Resource: ResourceSkill, Action: ActionList, CapabilityKind: CapabilityScope, Description: "List skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
+	{ID: "skill.create", Resource: ResourceSkill, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "skill:create", Description: "Create skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
+	{ID: "skill.read", Resource: ResourceSkill, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "skill:read", Description: "Read skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
+	{ID: "skill.update", Resource: ResourceSkill, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "skill:update", Description: "Update skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
+	{ID: "skill.delete", Resource: ResourceSkill, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "skill:delete", Description: "Delete skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
+	{ID: "skill.list", Resource: ResourceSkill, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "skill:list", Description: "List skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
 
-	{ID: "template.create", Resource: ResourceTemplate, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
-	{ID: "template.read", Resource: ResourceTemplate, Action: ActionRead, CapabilityKind: CapabilityResource, Description: "Read templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
-	{ID: "template.update", Resource: ResourceTemplate, Action: ActionUpdate, CapabilityKind: CapabilityResource, Description: "Update templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
-	{ID: "template.delete", Resource: ResourceTemplate, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
-	{ID: "template.list", Resource: ResourceTemplate, Action: ActionList, CapabilityKind: CapabilityScope, Description: "List templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
+	{ID: "template.create", Resource: ResourceTemplate, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "template:create", Description: "Create templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
+	{ID: "template.read", Resource: ResourceTemplate, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "template:read", Description: "Read templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
+	{ID: "template.update", Resource: ResourceTemplate, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "template:update", Description: "Update templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
+	{ID: "template.delete", Resource: ResourceTemplate, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "template:delete", Description: "Delete templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
+	{ID: "template.list", Resource: ResourceTemplate, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "template:list", Description: "List templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
 
-	{ID: "harness_config.create", Resource: ResourceHarnessConfig, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create harness configs", Enforcement: []string{"pkg/hub/harness_config_handlers.go"}},
-	{ID: "harness_config.read", Resource: ResourceHarnessConfig, Action: ActionRead, CapabilityKind: CapabilityResource, Description: "Read harness configs", Enforcement: []string{"pkg/hub/harness_config_handlers.go"}},
-	{ID: "harness_config.update", Resource: ResourceHarnessConfig, Action: ActionUpdate, CapabilityKind: CapabilityResource, Description: "Update harness configs", Enforcement: []string{"pkg/hub/harness_config_handlers.go"}},
-	{ID: "harness_config.delete", Resource: ResourceHarnessConfig, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete harness configs", Enforcement: []string{"pkg/hub/harness_config_handlers.go"}},
-	{ID: "harness_config.list", Resource: ResourceHarnessConfig, Action: ActionList, CapabilityKind: CapabilityScope, Description: "List harness configs", Enforcement: []string{"pkg/hub/harness_config_handlers.go"}},
+	{ID: "harness_config.create", Resource: ResourceHarnessConfig, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "harness_config:create", Description: "Create harness configs", Enforcement: []string{"pkg/hub/harness_config_handlers.go"}},
+	{ID: "harness_config.read", Resource: ResourceHarnessConfig, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "harness_config:read", Description: "Read harness configs", Enforcement: []string{"pkg/hub/harness_config_handlers.go"}},
+	{ID: "harness_config.update", Resource: ResourceHarnessConfig, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "harness_config:update", Description: "Update harness configs", Enforcement: []string{"pkg/hub/harness_config_handlers.go"}},
+	{ID: "harness_config.delete", Resource: ResourceHarnessConfig, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "harness_config:delete", Description: "Delete harness configs", Enforcement: []string{"pkg/hub/harness_config_handlers.go"}},
+	{ID: "harness_config.list", Resource: ResourceHarnessConfig, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "harness_config:list", Description: "List harness configs", Enforcement: []string{"pkg/hub/harness_config_handlers.go"}},
 
-	{ID: "group.create", Resource: ResourceGroup, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create groups", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
-	{ID: "group.read", Resource: ResourceGroup, Action: ActionRead, CapabilityKind: CapabilityResource, Description: "Read groups", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
-	{ID: "group.update", Resource: ResourceGroup, Action: ActionUpdate, CapabilityKind: CapabilityResource, Description: "Update groups", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
-	{ID: "group.delete", Resource: ResourceGroup, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete groups", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
-	{ID: "group.list", Resource: ResourceGroup, Action: ActionList, CapabilityKind: CapabilityScope, Description: "List groups", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
-	{ID: "group.addMember", Resource: ResourceGroup, Action: ActionAddMember, CapabilityKind: CapabilityResource, Description: "Add group members", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
-	{ID: "group.removeMember", Resource: ResourceGroup, Action: ActionRemoveMember, CapabilityKind: CapabilityResource, Description: "Remove group members", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
+	{ID: "group.create", Resource: ResourceGroup, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "group:create", Description: "Create groups", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
+	{ID: "group.read", Resource: ResourceGroup, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "group:read", Description: "Read groups", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
+	{ID: "group.update", Resource: ResourceGroup, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "group:update", Description: "Update groups", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
+	{ID: "group.delete", Resource: ResourceGroup, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "group:delete", Description: "Delete groups", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
+	{ID: "group.list", Resource: ResourceGroup, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "group:list", Description: "List groups", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
+	{ID: "group.addMember", Resource: ResourceGroup, Action: ActionAddMember, CapabilityKind: CapabilityResource, UATScope: "group:addMember", Description: "Add group members", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
+	{ID: "group.removeMember", Resource: ResourceGroup, Action: ActionRemoveMember, CapabilityKind: CapabilityResource, UATScope: "group:removeMember", Description: "Remove group members", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
 
-	{ID: "user.read", Resource: ResourceUser, Action: ActionRead, CapabilityKind: CapabilityResource, Description: "Read users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
+	{ID: "user.read", Resource: ResourceUser, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "user:read", Description: "Read users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
 	{ID: "user.update", Resource: ResourceUser, Action: ActionUpdate, CapabilityKind: CapabilityResource, Description: "Update users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
 
 	{ID: "policy.create", Resource: ResourcePolicy, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create policies", Enforcement: []string{"pkg/hub/handlers_policies.go", "pkg/hub/route_metadata.go:requireAdmin"}},
@@ -134,19 +147,74 @@ var Registry = []Permission{
 	{ID: "policy.list", Resource: ResourcePolicy, Action: ActionList, CapabilityKind: CapabilityScope, Description: "List policies", Enforcement: []string{"pkg/hub/handlers_policies.go", "pkg/hub/route_metadata.go:requireAdmin"}},
 
 	{ID: "broker.create", Resource: ResourceBroker, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
-	{ID: "broker.read", Resource: ResourceBroker, Action: ActionRead, CapabilityKind: CapabilityResource, Description: "Read brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
+	{ID: "broker.read", Resource: ResourceBroker, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "broker:read", Description: "Read brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
 	{ID: "broker.update", Resource: ResourceBroker, Action: ActionUpdate, CapabilityKind: CapabilityResource, Description: "Update brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
 	{ID: "broker.delete", Resource: ResourceBroker, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
-	{ID: "broker.list", Resource: ResourceBroker, Action: ActionList, CapabilityKind: CapabilityScope, Description: "List brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
+	{ID: "broker.list", Resource: ResourceBroker, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "broker:list", Description: "List brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
 	{ID: "broker.dispatch", Resource: ResourceBroker, Action: ActionDispatch, CapabilityKind: CapabilityResource, Description: "Dispatch through brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
 
 	{ID: "gcp_service_account.create", Resource: ResourceGCPServiceAccount, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
-	{ID: "gcp_service_account.read", Resource: ResourceGCPServiceAccount, Action: ActionRead, CapabilityKind: CapabilityResource, Description: "Read GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
+	{ID: "gcp_service_account.read", Resource: ResourceGCPServiceAccount, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "gcp_service_account:read", Description: "Read GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
 	{ID: "gcp_service_account.delete", Resource: ResourceGCPServiceAccount, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
-	{ID: "gcp_service_account.list", Resource: ResourceGCPServiceAccount, Action: ActionList, CapabilityKind: CapabilityScope, Description: "List GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
-	{ID: "gcp_service_account.verify", Resource: ResourceGCPServiceAccount, Action: ActionVerify, CapabilityKind: CapabilityResource, Description: "Verify GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
+	{ID: "gcp_service_account.list", Resource: ResourceGCPServiceAccount, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "gcp_service_account:list", Description: "List GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
+	{ID: "gcp_service_account.verify", Resource: ResourceGCPServiceAccount, Action: ActionVerify, CapabilityKind: CapabilityResource, UATScope: "gcp_service_account:verify", Description: "Verify GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
 	{ID: "gcp_service_account.mint", Resource: ResourceGCPServiceAccount, Action: ActionMint, CapabilityKind: CapabilityScope, Description: "Mint GCP service account tokens", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
-	{ID: "gcp_service_account.assign", Resource: ResourceGCPServiceAccount, Action: ActionAssign, CapabilityKind: CapabilityResource, Description: "Assign GCP service accounts to agents", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go", "pkg/hub/authz.go"}},
+	{ID: "gcp_service_account.assign", Resource: ResourceGCPServiceAccount, Action: ActionAssign, CapabilityKind: CapabilityResource, UATScope: "gcp_service_account:assign", Description: "Assign GCP service accounts to agents", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go", "pkg/hub/authz.go"}},
+
+	// Hub resource type — hub-level administrative operations (Phase 2 D4 resolution)
+	{ID: "hub.settings.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read hub settings", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.settings.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update hub settings", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.config.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read server configuration", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.config.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update server configuration", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.maintenance.execute", Resource: ResourceHub, Action: ActionExecute, CapabilityKind: CapabilityScope, Description: "Execute maintenance operations", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.diagnostics.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read diagnostics and logs", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.health.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read health summary", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.admin_mode.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read admin mode state", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.admin_mode.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update admin mode", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.integrations.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read integrations", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.integrations.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update integrations", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.lifecycle_hooks.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read lifecycle hooks", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.lifecycle_hooks.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update lifecycle hooks", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.allow_list.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read allow list", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.allow_list.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update allow list", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.project_defaults.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read project defaults", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.project_defaults.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update project defaults", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.auth_reset.execute", Resource: ResourceHub, Action: ActionExecute, CapabilityKind: CapabilityScope, Description: "Reset all auth", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.scheduler.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read scheduler", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.scheduler.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update scheduler", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.federation.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read federation config", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.federation.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update federation config", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.teams_manifest.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read teams manifest", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.teams_manifest.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update teams manifest", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.validate.execute", Resource: ResourceHub, Action: ActionExecute, CapabilityKind: CapabilityScope, Description: "Validate resources", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.github_app.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read GitHub app configuration", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.github_app.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update GitHub app configuration", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.metrics.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read metrics dashboard", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.audit.read", Resource: ResourceHub, Action: ActionManage, CapabilityKind: CapabilityNone, Description: "Explain authorization decisions for other principals (super-admin only)", NonRouteUse: []string{"audit_authz.go explain-for-other-principal gate"}},
+
+	// Quota management (Phase 2B — Limits/Quotas)
+	{ID: "quota.read", Resource: ResourceQuota, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read limit definitions, entitlements, and usage", Enforcement: []string{"pkg/hub/handlers_quota.go"}},
+	{ID: "quota.create", Resource: ResourceQuota, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create limit definitions and entitlement bindings", Enforcement: []string{"pkg/hub/handlers_quota.go"}},
+	{ID: "quota.update", Resource: ResourceQuota, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update limit definitions and entitlement bindings", Enforcement: []string{"pkg/hub/handlers_quota.go"}},
+	{ID: "quota.delete", Resource: ResourceQuota, Action: ActionDelete, CapabilityKind: CapabilityScope, Description: "Delete limit definitions and entitlement bindings", Enforcement: []string{"pkg/hub/handlers_quota.go"}},
+
+	// Role management (Phase 2 PR-C1)
+	{ID: "role.read", Resource: ResourceRole, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read role definitions", Enforcement: []string{"pkg/hub/handlers_roles.go"}},
+	{ID: "role.create", Resource: ResourceRole, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create custom role definitions", Enforcement: []string{"pkg/hub/handlers_roles.go"}},
+	{ID: "role.update", Resource: ResourceRole, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update custom role definitions", Enforcement: []string{"pkg/hub/handlers_roles.go"}},
+	{ID: "role.delete", Resource: ResourceRole, Action: ActionDelete, CapabilityKind: CapabilityScope, Description: "Delete custom role definitions", Enforcement: []string{"pkg/hub/handlers_roles.go"}},
+	{ID: "role_binding.read", Resource: ResourceRoleBinding, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read role bindings", Enforcement: []string{"pkg/hub/handlers_roles.go"}},
+	{ID: "role_binding.create", Resource: ResourceRoleBinding, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create role bindings", Enforcement: []string{"pkg/hub/handlers_roles.go"}},
+	{ID: "role_binding.delete", Resource: ResourceRoleBinding, Action: ActionDelete, CapabilityKind: CapabilityScope, Description: "Delete role bindings", Enforcement: []string{"pkg/hub/handlers_roles.go"}},
+
+	// Extensions to existing resource types (Phase 2 D4 resolution)
+	{ID: "user.invite", Resource: ResourceUser, Action: ActionInvite, CapabilityKind: CapabilityScope, UATScope: "user:invite", Description: "Invite users", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "user.suspend", Resource: ResourceUser, Action: ActionSuspend, CapabilityKind: CapabilityResource, Description: "Suspend users", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "user.promote", Resource: ResourceUser, Action: ActionPromote, CapabilityKind: CapabilityResource, Description: "Promote or demote users", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "user.list", Resource: ResourceUser, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "user:list", Description: "List users", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "project.clone", Resource: ResourceProject, Action: ActionClone, CapabilityKind: CapabilityResource, UATScope: "project:clone", Description: "Clone projects", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "project.list", Resource: ResourceProject, Action: ActionList, CapabilityKind: CapabilityScope, Description: "List projects", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "skill.register", Resource: ResourceSkill, Action: ActionRegister, CapabilityKind: CapabilityScope, UATScope: "skill:register", Description: "Register skills in registries", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
 
 	{ID: "agent.status_update", Resource: ResourceAgent, Action: "status_update", AgentScopes: []string{"agent:status:update"}, Description: "Update own agent status", NonRouteUse: []string{"agent token self-status endpoint"}},
 	{ID: "agent.log_append", Resource: ResourceAgent, Action: "log_append", AgentScopes: []string{"agent:log:append"}, Description: "Append own agent logs", NonRouteUse: []string{"agent token log append endpoint"}},

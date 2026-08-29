@@ -85,9 +85,10 @@ type Agent struct {
 	DeletedAt         time.Time `json:"deletedAt,omitempty"`
 
 	// Ownership
-	CreatedBy  string `json:"createdBy,omitempty"`
-	OwnerID    string `json:"ownerId,omitempty"`
-	Visibility string `json:"visibility"` // private, team, public
+	CreatedBy   string `json:"createdBy,omitempty"`
+	OwnerID     string `json:"ownerId,omitempty"`
+	Visibility  string `json:"visibility"`  // private, team, public
+	MessageMode string `json:"messageMode"` // none, lineage, branch, project
 
 	// Ancestry chain for transitive access control.
 	// Ordered list of ancestor IDs: [root, ..., parent].
@@ -699,6 +700,7 @@ type TemplateConfig struct {
 	HubAccess   *HubAccessConfig     `json:"hubAccess,omitempty"`
 	Secrets     []api.RequiredSecret `json:"secrets,omitempty"`
 	Telemetry   *api.TelemetryConfig `json:"telemetry,omitempty"`
+	MessageMode string               `json:"messageMode,omitempty"` // none, lineage, branch, project
 }
 
 // HubAccessConfig defines what Hub API scopes an agent created from this template receives.
@@ -771,6 +773,30 @@ const (
 	VisibilityTeam    = api.VisibilityTeam
 	VisibilityPublic  = api.VisibilityPublic
 )
+
+// MessageMode constants define the per-agent message mode that controls who
+// can deliver messages to the agent. The mode is orthogonal to agent role
+// (D5) and is read live from the agent record at delivery time (D10).
+//
+// See docs/messaging-authorization.md for the full decision table and
+// piercing rules. See pkg/hub/authorize_message.go for the enforcement
+// choke point.
+const (
+	MessageModeNone    = "none"    // Sealed: no message-plane delivery except super-admin (D6)
+	MessageModeLineage = "lineage" // Ancestry users + project owners only; zero agent-to-agent edges (D4)
+	MessageModeBranch  = "branch"  // Ancestry users + project owners + direct parent/child agents (both must be branch mode)
+	MessageModeProject = "project" // Bidirectional with all agents and users in project (default; matches pre-mode behavior)
+)
+
+// IsValidMessageMode returns true if mode is one of the four valid message modes.
+func IsValidMessageMode(mode string) bool {
+	switch mode {
+	case MessageModeNone, MessageModeLineage, MessageModeBranch, MessageModeProject:
+		return true
+	default:
+		return false
+	}
+}
 
 // =============================================================================
 // Allow List (User Access Control)
@@ -1541,7 +1567,7 @@ const (
 	UATScopeAgentList       = permissions.ResourceAgent + ":" + permissions.ActionList
 	UATScopeAgentStart      = "agent:start"    // legacy stale scope; not valid for new tokens
 	UATScopeAgentStop       = "agent:stop"     // legacy stale scope; not valid for new tokens
-	UATScopeAgentMessage    = "agent:message"  // legacy stale scope; not valid for new tokens
+	UATScopeAgentMessage    = "agent:message"  // registry-backed scope (D2); valid for new tokens
 	UATScopeAgentDispatch   = "agent:dispatch" // legacy stale scope; not valid for new tokens
 	UATScopeAgentDelete     = permissions.ResourceAgent + ":" + permissions.ActionDelete
 	UATScopeAgentAttach     = permissions.ResourceAgent + ":" + permissions.ActionAttach
@@ -1686,23 +1712,24 @@ const (
 
 // Message represents a persisted structured message between agents and humans.
 type Message struct {
-	ID          string    `json:"id"`
-	ProjectID   string    `json:"projectId"`
-	Sender      string    `json:"sender"`    // "user:alice", "agent:code-reviewer"
-	SenderID    string    `json:"senderId"`  // UUID or identity key
-	Recipient   string    `json:"recipient"` // "user:alice", "agent:code-reviewer"
-	RecipientID string    `json:"recipientId"`
-	Msg         string    `json:"msg"`
-	Type        string    `json:"type"` // "instruction", "input-needed", "state-change"
-	Urgent      bool      `json:"urgent,omitempty"`
-	Broadcasted bool      `json:"broadcasted,omitempty"`
-	Read        bool      `json:"read"`    // Whether recipient has read/acknowledged
-	AgentID     string    `json:"agentId"` // The agent involved (sender or recipient)
-	GroupID     string    `json:"groupId,omitempty"`
-	Channel     string    `json:"channel,omitempty"`
-	ThreadID    string    `json:"threadId,omitempty"`
-	Visibility  string    `json:"visibility,omitempty"`
-	CreatedAt   time.Time `json:"createdAt"`
+	ID             string    `json:"id"`
+	ProjectID      string    `json:"projectId"`
+	Sender         string    `json:"sender"`    // "user:alice", "agent:code-reviewer"
+	SenderID       string    `json:"senderId"`  // UUID or identity key
+	Recipient      string    `json:"recipient"` // "user:alice", "agent:code-reviewer"
+	RecipientID    string    `json:"recipientId"`
+	Msg            string    `json:"msg"`
+	Type           string    `json:"type"` // "instruction", "input-needed", "state-change"
+	Urgent         bool      `json:"urgent,omitempty"`
+	Broadcasted    bool      `json:"broadcasted,omitempty"`
+	Read           bool      `json:"read"`    // Whether recipient has read/acknowledged
+	AgentID        string    `json:"agentId"` // The agent involved (sender or recipient)
+	GroupID        string    `json:"groupId,omitempty"`
+	Channel        string    `json:"channel,omitempty"`
+	ThreadID       string    `json:"threadId,omitempty"`
+	ConversationID string    `json:"conversationId,omitempty"`
+	Visibility     string    `json:"visibility,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
 	// DispatchState tracks cross-node delivery of the message to the broker:
 	// pending|dispatched|failed. The message row is its own durable dispatch
 	// intent (design §5.2/§6.1).
@@ -1760,14 +1787,69 @@ type MessageFilter struct {
 	// the sender_id UUID column), this matches the human-readable
 	// sender label. Useful for finding messages from agents that were
 	// persisted before SenderID was reliably populated.
-	Sender     string
-	OnlyUnread bool      // Only unread messages
-	Type       string    // Filter by message type
-	Channel    string    // Filter by channel (e.g. "web", "discord")
-	ThreadID   string    // Filter by thread_id (wave-2 conversation key)
-	Visibility []string  // Filter to listed visibility levels
-	Before     time.Time // Upper bound for created_at (exclusive)
-	After      time.Time // Lower bound for created_at (exclusive)
+	Sender         string
+	OnlyUnread     bool      // Only unread messages
+	Type           string    // Filter by message type
+	Channel        string    // Filter by channel (e.g. "web", "discord")
+	ThreadID       string    // Filter by thread_id (wave-2 conversation key)
+	ConversationID string    // Filter by conversation_id (S4 conversation model)
+	Visibility     []string  // Filter to listed visibility levels
+	Before         time.Time // Upper bound for created_at (exclusive)
+	After          time.Time // Lower bound for created_at (exclusive)
+}
+
+// =============================================================================
+// Conversations (Multi-Party Messaging)
+// =============================================================================
+
+// Conversation represents a conversation container for a thread of messages.
+// It may be a direct (1:1) or group conversation, and may originate from a
+// native or external surface (Discord, Slack, etc.).
+type Conversation struct {
+	ID             string     `json:"id"`
+	ProjectID      *string    `json:"projectId,omitempty"` // nil for direct conversations
+	Kind           string     `json:"kind"`                // direct | group
+	Surface        string     `json:"surface"`             // native | discord | slack | telegram | gchat | teams
+	ExternalRef    string     `json:"externalRef,omitempty"`
+	ParentRef      string     `json:"parentRef,omitempty"`
+	DisplayName    string     `json:"displayName,omitempty"`
+	DefaultAgentID *string    `json:"defaultAgentId,omitempty"` // MUST be a valid UUID; slugs rejected
+	DriftState     string     `json:"driftState"`               // active | orphaned | unresolvable
+	LastActivityAt time.Time  `json:"lastActivityAt"`
+	CreatedAt      time.Time  `json:"createdAt"`
+	ArchivedAt     *time.Time `json:"archivedAt,omitempty"`
+	DeletedAt      *time.Time `json:"deletedAt,omitempty"`
+}
+
+// ConversationParticipant links a principal (user or agent) to a conversation.
+type ConversationParticipant struct {
+	ID             string     `json:"id"`
+	ConversationID string     `json:"conversationId"`
+	PrincipalKind  string     `json:"principalKind"` // user | agent
+	PrincipalID    string     `json:"principalId"`
+	Role           string     `json:"role"` // member | observer
+	JoinedAt       time.Time  `json:"joinedAt"`
+	LeftAt         *time.Time `json:"leftAt,omitempty"`
+}
+
+// MessageAddressee records one principal that a message is addressed to,
+// how the addressing was resolved, and the current delivery state.
+type MessageAddressee struct {
+	ID            string  `json:"id"`
+	MessageID     string  `json:"messageId"`
+	PrincipalKind string  `json:"principalKind"` // user | agent
+	PrincipalID   string  `json:"principalId"`
+	Via           string  `json:"via"`           // explicit | body-mention | default-agent | direct
+	DeliveryState string  `json:"deliveryState"` // pending | delivered | failed
+	FailureReason *string `json:"failureReason,omitempty"`
+}
+
+// ConversationFilter defines query parameters for listing conversations.
+type ConversationFilter struct {
+	ProjectID  string
+	Kind       string
+	Surface    string
+	DriftState string
 }
 
 // =============================================================================
@@ -2383,6 +2465,7 @@ const (
 // System role names
 const (
 	SystemRoleSuperAdmin = "super-admin"
+	SystemRoleHubAdmin   = "hub-admin"
 	SystemRoleHubMember  = "hub-member"
 	SystemRoleHubViewer  = "hub-viewer"
 )
@@ -2559,3 +2642,67 @@ type MutationAuditFilter struct {
 	Limit              int
 	Offset             int
 }
+
+// =============================================================================
+// Limit Definitions and Quota Bindings (Permissions Phase 2B)
+// =============================================================================
+
+// LimitDefinition represents a configurable resource limit.
+type LimitDefinition struct {
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`         // e.g. "max_agents_per_project"
+	ResourceType string    `json:"resourceType"` // e.g. "agent", "project", "group"
+	Unit         string    `json:"unit"`         // e.g. "count"
+	Description  string    `json:"description"`
+	DefaultValue int64     `json:"defaultValue"` // 0 = unlimited
+	System       bool      `json:"system"`       // true = seeded, not user-modifiable
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
+// EntitlementBinding associates a limit with a subject (user, group, or system default).
+type EntitlementBinding struct {
+	ID                string    `json:"id"`
+	LimitDefinitionID string    `json:"limitDefinitionId"`
+	SubjectType       string    `json:"subjectType"` // "user", "group", "system_default"
+	SubjectID         string    `json:"subjectId"`
+	ScopeType         string    `json:"scopeType"` // "system" or "project"
+	ScopeID           string    `json:"scopeId"`   // "" for system, project ID for project
+	Value             int64     `json:"value"`
+	CreatedBy         string    `json:"createdBy"`
+	CreatedAt         time.Time `json:"createdAt"`
+	UpdatedAt         time.Time `json:"updatedAt"`
+}
+
+// UsageReservation tracks a single unit of quota consumption.
+type UsageReservation struct {
+	ID                string     `json:"id"`
+	LimitDefinitionID string     `json:"limitDefinitionId"`
+	SubjectID         string     `json:"subjectId"`
+	ScopeType         string     `json:"scopeType"` // "system" or "project"
+	ScopeID           string     `json:"scopeId"`
+	ResourceID        string     `json:"resourceId"`
+	Reserved          int64      `json:"reserved"`
+	CreatedAt         time.Time  `json:"createdAt"`
+	ReleasedAt        *time.Time `json:"releasedAt,omitempty"`
+}
+
+// Entitlement binding subject types
+const (
+	EntitlementSubjectUser          = "user"
+	EntitlementSubjectGroup         = "group"
+	EntitlementSubjectSystemDefault = "system_default"
+)
+
+// Quota scope types
+const (
+	QuotaScopeSystem  = "system"
+	QuotaScopeProject = "project"
+)
+
+// System limit definition names
+const (
+	LimitMaxAgentsPerProject = "max_agents_per_project"
+	LimitMaxProjectsPerUser  = "max_projects_per_user"
+	LimitMaxMembersPerGroup  = "max_members_per_group"
+)

@@ -158,6 +158,10 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Pattern: "/api/v1/auth/tokens/", RouteID: "auth.tokens.byId",
 		Classification: RouteAuthenticated,
 	},
+	"/api/v1/auth/scopes": {
+		Pattern: "/api/v1/auth/scopes", RouteID: "auth.scopes",
+		Classification: RouteAuthenticated,
+	},
 	"/api/v1/metrics/session/": {
 		Pattern: "/api/v1/metrics/session/", RouteID: "metrics.session",
 		Classification: RouteAuthenticated,
@@ -369,17 +373,17 @@ var routeMetadataTable = map[string]RouteMetadata{
 	},
 
 	// -------------------------------------------------------------------------
-	// Policy: Skill registries
+	// Hub admin: Skill registries (admin-only management)
 	// -------------------------------------------------------------------------
 	"/api/v1/skill-registries": {
 		Pattern: "/api/v1/skill-registries", RouteID: "skillRegistries.list",
-		Classification: RoutePolicy,
-		Permission:     "skill.read", Resource: "skill", Action: "read",
+		Classification: RouteHubAdmin,
+		Permission:     "skill.register", Resource: "skill", Action: "register",
 	},
 	"/api/v1/skill-registries/": {
 		Pattern: "/api/v1/skill-registries/", RouteID: "skillRegistries.byId",
-		Classification: RoutePolicy,
-		Permission:     "skill.read", Resource: "skill", Action: "read",
+		Classification: RouteHubAdmin,
+		Permission:     "skill.register", Resource: "skill", Action: "register",
 	},
 
 	// -------------------------------------------------------------------------
@@ -536,15 +540,18 @@ var routeMetadataTable = map[string]RouteMetadata{
 	},
 
 	// -------------------------------------------------------------------------
-	// Hub admin: Policies
+	// Hub admin: Policies (super-admin-only: policy permissions are not in
+	// the hub-admin role, so only super-admins pass via the step-1 bypass)
 	// -------------------------------------------------------------------------
 	"/api/v1/policies": {
 		Pattern: "/api/v1/policies", RouteID: "policies.list",
 		Classification: RouteHubAdmin,
+		Permission:     "policy.read", Resource: "policy", Action: "read",
 	},
 	"/api/v1/policies/": {
 		Pattern: "/api/v1/policies/", RouteID: "policies.byId",
 		Classification: RouteHubAdmin,
+		Permission:     "policy.read", Resource: "policy", Action: "read",
 	},
 
 	// -------------------------------------------------------------------------
@@ -570,122 +577,218 @@ var routeMetadataTable = map[string]RouteMetadata{
 	"/api/v1/admin/maintenance": {
 		Pattern: "/api/v1/admin/maintenance", RouteID: "admin.maintenance",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.admin_mode.update", Resource: "hub", Action: "update",
 	},
 	"/api/v1/admin/maintenance/operations": {
 		Pattern: "/api/v1/admin/maintenance/operations", RouteID: "admin.maintenance.operations",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.maintenance.execute", Resource: "hub", Action: "execute",
 	},
 	"/api/v1/admin/maintenance/operations/": {
 		Pattern: "/api/v1/admin/maintenance/operations/", RouteID: "admin.maintenance.operations.byId",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.maintenance.execute", Resource: "hub", Action: "execute",
 	},
 	"/api/v1/admin/maintenance/migrations/": {
 		Pattern: "/api/v1/admin/maintenance/migrations/", RouteID: "admin.maintenance.migrations.byId",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.maintenance.execute", Resource: "hub", Action: "execute",
 	},
 	"/api/v1/admin/maintenance/check-updates": {
 		Pattern: "/api/v1/admin/maintenance/check-updates", RouteID: "admin.maintenance.checkUpdates",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.maintenance.execute", Resource: "hub", Action: "execute",
 	},
 	"/api/v1/admin/maintenance/restart": {
 		Pattern: "/api/v1/admin/maintenance/restart", RouteID: "admin.maintenance.restart",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.maintenance.execute", Resource: "hub", Action: "execute",
 	},
 	"/api/v1/admin/scheduler": {
 		Pattern: "/api/v1/admin/scheduler", RouteID: "admin.scheduler",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.scheduler.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/allow-list": {
 		Pattern: "/api/v1/admin/allow-list", RouteID: "admin.allowList",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.allow_list.update", Resource: "hub", Action: "update",
 	},
 	"/api/v1/admin/allow-list/": {
 		Pattern: "/api/v1/admin/allow-list/", RouteID: "admin.allowList.byEmail",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.allow_list.update", Resource: "hub", Action: "update",
 	},
 	"/api/v1/admin/users/invite/bulk": {
 		Pattern: "/api/v1/admin/users/invite/bulk", RouteID: "admin.users.invite.bulk",
 		Classification: RouteHubAdmin,
+		Permission:     "user.invite", Resource: "user", Action: "invite",
 	},
 	"/api/v1/admin/users/invite": {
 		Pattern: "/api/v1/admin/users/invite", RouteID: "admin.users.invite",
 		Classification: RouteHubAdmin,
+		Permission:     "user.invite", Resource: "user", Action: "invite",
 	},
 	"/api/v1/admin/invites": {
 		Pattern: "/api/v1/admin/invites", RouteID: "admin.invites",
 		Classification: RouteHubAdmin,
+		Permission:     "user.invite", Resource: "user", Action: "invite",
 	},
 	"/api/v1/admin/invites/": {
 		Pattern: "/api/v1/admin/invites/", RouteID: "admin.invites.byId",
 		Classification: RouteHubAdmin,
+		Permission:     "user.invite", Resource: "user", Action: "invite",
 	},
 	"/api/v1/admin/server-config/schema": {
 		Pattern: "/api/v1/admin/server-config/schema", RouteID: "admin.serverConfig.schema",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.config.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/server-config/sections/": {
 		Pattern: "/api/v1/admin/server-config/sections/", RouteID: "admin.serverConfig.sections.byId",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.config.update", Resource: "hub", Action: "update",
 	},
 	"/api/v1/admin/server-config": {
 		Pattern: "/api/v1/admin/server-config", RouteID: "admin.serverConfig",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.config.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/project-defaults": {
 		Pattern: "/api/v1/admin/project-defaults", RouteID: "admin.projectDefaults",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.project_defaults.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/agents/reset-auth-all": {
 		Pattern: "/api/v1/admin/agents/reset-auth-all", RouteID: "admin.agents.resetAuthAll",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.auth_reset.execute", Resource: "hub", Action: "execute",
 	},
 	"/api/v1/admin/gcp-quota": {
 		Pattern: "/api/v1/admin/gcp-quota", RouteID: "admin.gcpQuota",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.health.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/lifecycle-hooks": {
 		Pattern: "/api/v1/admin/lifecycle-hooks", RouteID: "admin.lifecycleHooks",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.lifecycle_hooks.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/lifecycle-hooks/": {
 		Pattern: "/api/v1/admin/lifecycle-hooks/", RouteID: "admin.lifecycleHooks.byId",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.lifecycle_hooks.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/validate-resources": {
 		Pattern: "/api/v1/admin/validate-resources", RouteID: "admin.validateResources",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.validate.execute", Resource: "hub", Action: "execute",
 	},
 	"/api/v1/admin/integrations": {
 		Pattern: "/api/v1/admin/integrations", RouteID: "admin.integrations",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.integrations.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/integrations/teams/manifest": {
 		Pattern: "/api/v1/admin/integrations/teams/manifest", RouteID: "admin.integrations.teamsManifest",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.teams_manifest.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/integrations/": {
 		Pattern: "/api/v1/admin/integrations/", RouteID: "admin.integrations.byName",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.integrations.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/diagnostics/logs/stream": {
 		Pattern: "/api/v1/admin/diagnostics/logs/stream", RouteID: "admin.diagnostics.logsStream",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.diagnostics.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/diagnostics/logs": {
 		Pattern: "/api/v1/admin/diagnostics/logs", RouteID: "admin.diagnostics.logs",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.diagnostics.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/health/summary": {
 		Pattern: "/api/v1/admin/health/summary", RouteID: "admin.health.summary",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.health.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/metrics/": {
 		Pattern: "/api/v1/metrics/", RouteID: "admin.metricsDashboard",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.metrics.read", Resource: "hub", Action: "read",
 	},
 	"/api/v1/admin/metrics-dashboard": {
 		Pattern: "/api/v1/admin/metrics-dashboard", RouteID: "admin.metricsDashboard.legacy",
 		Classification: RouteHubAdmin,
+		Permission:     "hub.metrics.read", Resource: "hub", Action: "read",
+	},
+
+	// -------------------------------------------------------------------------
+	// Hub admin: Quota management (PR-B3)
+	// -------------------------------------------------------------------------
+	"/api/v1/admin/limits": {
+		Pattern: "/api/v1/admin/limits", RouteID: "admin.limits",
+		Classification: RouteHubAdmin,
+		Permission:     "quota.read", Resource: "quota", Action: "read",
+	},
+	"/api/v1/admin/limits/": {
+		Pattern: "/api/v1/admin/limits/", RouteID: "admin.limits.byId",
+		Classification: RouteHubAdmin,
+		Permission:     "quota.read", Resource: "quota", Action: "read",
+	},
+	"/api/v1/admin/entitlements/": {
+		Pattern: "/api/v1/admin/entitlements/", RouteID: "admin.entitlements.byId",
+		Classification: RouteHubAdmin,
+		Permission:     "quota.read", Resource: "quota", Action: "read",
+	},
+	"/api/v1/admin/usage": {
+		Pattern: "/api/v1/admin/usage", RouteID: "admin.usage",
+		Classification: RouteHubAdmin,
+		Permission:     "quota.read", Resource: "quota", Action: "read",
+	},
+	"/api/v1/admin/usage/": {
+		Pattern: "/api/v1/admin/usage/", RouteID: "admin.usage.byLimit",
+		Classification: RouteHubAdmin,
+		Permission:     "quota.read", Resource: "quota", Action: "read",
+	},
+
+	// -------------------------------------------------------------------------
+	// Hub admin: Role management (PR-C1)
+	// -------------------------------------------------------------------------
+	"/api/v1/admin/roles": {
+		Pattern: "/api/v1/admin/roles", RouteID: "admin.roles",
+		Classification: RouteHubAdmin,
+		Permission:     "role.read", Resource: "role", Action: "read",
+	},
+	"/api/v1/admin/roles/": {
+		Pattern: "/api/v1/admin/roles/", RouteID: "admin.roles.byId",
+		Classification: RouteHubAdmin,
+		Permission:     "role.read", Resource: "role", Action: "read",
+	},
+	"/api/v1/admin/role-bindings": {
+		Pattern: "/api/v1/admin/role-bindings", RouteID: "admin.roleBindings",
+		Classification: RouteHubAdmin,
+		Permission:     "role_binding.read", Resource: "role_binding", Action: "read",
+	},
+	"/api/v1/admin/role-bindings/": {
+		Pattern: "/api/v1/admin/role-bindings/", RouteID: "admin.roleBindings.byId",
+		Classification: RouteHubAdmin,
+		Permission:     "role_binding.read", Resource: "role_binding", Action: "read",
+	},
+	"/api/v1/admin/permissions": {
+		Pattern: "/api/v1/admin/permissions", RouteID: "admin.permissions",
+		Classification: RouteHubAdmin,
+		Permission:     "role.read", Resource: "role", Action: "read",
+	},
+
+	// -------------------------------------------------------------------------
+	// Authenticated: Usage self-service
+	// -------------------------------------------------------------------------
+	"/api/v1/usage/me": {
+		Pattern: "/api/v1/usage/me", RouteID: "usage.me",
+		Classification: RouteAuthenticated,
 	},
 
 	// -------------------------------------------------------------------------
@@ -857,11 +960,51 @@ func (s *Server) routeGuard(meta RouteMetadata, next http.HandlerFunc) http.Hand
 			// the handler where resource IDs, ownership, and visibility are known.
 			next(w, r)
 		case RouteHubAdmin:
-			// Delegate to existing requireAdmin — already handles scoped/federated rejection
-			if _, ok := s.requireAdmin(w, r); !ok {
-				return
+			if meta.Permission != "" && s.authzService != nil {
+				// Validate route metadata completeness
+				if meta.Resource == "" || meta.Action == "" {
+					writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError,
+						"route misconfigured: Resource and Action must be set when Permission is set", nil)
+					return
+				}
+				// D4 conversion: permission-based check via Decide.
+				// Routes that declare a Permission in their metadata are
+				// evaluated through the authorization pipeline, which
+				// preserves the super-admin bypass and enables scoped
+				// admin access through role bindings.
+				identity := GetIdentityFromContext(r.Context())
+				if identity == nil {
+					writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "authentication required", nil)
+					return
+				}
+				user, ok := identity.(UserIdentity)
+				if !ok {
+					logAuthzDenial(r, identity, Resource{Type: meta.Resource}, Action(meta.Action), "non-user identity")
+					Forbidden(w)
+					return
+				}
+				decision := s.authzService.Decide(r.Context(), AuthzRequest{
+					Principal:  principalContextForIdentity(user),
+					Credential: credentialContextForIdentity(user),
+					Resource:   Resource{Type: meta.Resource, ID: "hub"},
+					Action:     Action(meta.Action),
+					Permission: meta.Permission,
+				})
+				if !decision.Allowed {
+					logAuthzDenial(r, identity, Resource{Type: meta.Resource, ID: "hub"}, Action(meta.Action), decision.Reason)
+					Forbidden(w)
+					return
+				}
+				next(w, r)
+			} else {
+				// Fallback: unconverted route still uses requireAdmin.
+				// This makes incremental D4 conversion safe — routes
+				// without a declared Permission behave exactly as before.
+				if _, ok := s.requireAdmin(w, r); !ok {
+					return
+				}
+				next(w, r)
 			}
-			next(w, r)
 		case RouteWorkstation:
 			// Delegate to existing requireWorkstation check
 			s.requireWorkstation(http.HandlerFunc(next)).ServeHTTP(w, r)

@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -210,8 +211,29 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 	var nextCursor string
 	var totalCount int
 
-	if user, ok := identity.(UserIdentity); identity != nil && (!ok || !IsUnscopedLocalPlatformAdmin(user)) {
-		// Non-admin: use authorizedList for policy-enforced filtering.
+	// Check if user has admin-level list visibility via permission.
+	hasAdminView := false
+	if identity != nil {
+		if user, ok := identity.(UserIdentity); ok {
+			hasAdminView = s.authzService.Decide(ctx, AuthzRequest{
+				Principal:  principalContextForIdentity(user),
+				Credential: credentialContextForIdentity(user),
+				Resource:   Resource{Type: "project", ID: "hub"},
+				Action:     Action("list"),
+				Permission: "project.list",
+			}).Allowed
+		}
+	}
+	if hasAdminView {
+		// Admin view: direct store query without authorization filtering.
+		result, err := s.store.ListProjects(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, CursorBinding: cursorBinding})
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		items, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+	} else if identity != nil {
+		// Authenticated non-admin: use authorizedList for policy-enforced filtering.
 		result, err := authorizedList(ctx, identity, cursor, limit, func(ctx context.Context, cursor string, limit int) (authorizedCandidatePage[store.Project], error) {
 			page, err := s.store.ListProjects(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, SkipTotalCount: true, CursorBinding: cursorBinding})
 			if err != nil {
@@ -225,13 +247,8 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 		}
 		items, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
 	} else {
-		// Admin or unauthenticated: direct store query.
-		result, err := s.store.ListProjects(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, CursorBinding: cursorBinding})
-		if err != nil {
-			writeErrorFromErr(w, err, "")
-			return
-		}
-		items, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+		// Unauthenticated: return empty list (no identity to authorize against).
+		items = []store.Project{}
 	}
 
 	// Enrich owner display names
@@ -395,7 +412,28 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Quota enforcement: check projects-per-user limit before creation.
+	if s.quotaService != nil && project.CreatedBy != "" {
+		if err := s.quotaService.CheckAndReserve(ctx, "max_projects_per_user", project.CreatedBy, "system", "system", project.ID); err != nil {
+			if errors.Is(err, store.ErrQuotaExceeded) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota exceeded: max_projects_per_user", nil)
+				return
+			}
+			if errors.Is(err, ErrQuotaLockContention) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota check temporarily unavailable, please retry", nil)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "quota check failed", nil)
+			return
+		}
+	}
+
 	if err := s.store.CreateProject(ctx, project); err != nil {
+		if s.quotaService != nil && project.CreatedBy != "" {
+			s.quotaService.Release(ctx, "max_projects_per_user", project.ID)
+		}
 		writeErrorFromErr(w, err, "")
 		return
 	}
@@ -778,16 +816,18 @@ func (s *Server) createProjectMembersGroupAndPolicy(ctx context.Context, project
 		}
 	}
 
-	// Create project-level policy for member agent creation and stop-all
+	// Create project-level policy for member agent creation, stop-all, and messaging.
+	// The "message" action was added in Phase 2 (msg-authz D1/D2): project members
+	// hold agent.message by default so basic project usage never requires owner/admin.
 	policyName := "project:" + project.Slug + ":member-create-agents"
 	policy := &store.Policy{
 		ID:           api.NewUUID(),
 		Name:         policyName,
-		Description:  "Allow project members to create and stop agents",
+		Description:  "Allow project members to create, stop, and message agents",
 		ScopeType:    "project",
 		ScopeID:      project.ID,
 		ResourceType: "agent",
-		Actions:      []string{"create", "stop_all"},
+		Actions:      []string{"create", "stop_all", "message"},
 		Effect:       "allow",
 	}
 	if err := s.store.CreatePolicy(ctx, policy); err != nil {
@@ -820,6 +860,18 @@ func (s *Server) createProjectMembersGroupAndPolicy(ctx context.Context, project
 		}
 		if !hasStopAll {
 			policy.Actions = append(policy.Actions, "stop_all")
+			needsUpdate = true
+		}
+		// Backfill: ensure message action is present for existing projects
+		hasMessage := false
+		for _, a := range policy.Actions {
+			if a == "message" {
+				hasMessage = true
+				break
+			}
+		}
+		if !hasMessage {
+			policy.Actions = append(policy.Actions, "message")
 			needsUpdate = true
 		}
 		if needsUpdate {
@@ -1360,7 +1412,28 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Quota enforcement: check projects-per-user limit before creation.
+		if s.quotaService != nil && project.CreatedBy != "" {
+			if err := s.quotaService.CheckAndReserve(ctx, "max_projects_per_user", project.CreatedBy, "system", "system", project.ID); err != nil {
+				if errors.Is(err, store.ErrQuotaExceeded) {
+					writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+						"quota exceeded: max_projects_per_user", nil)
+					return
+				}
+				if errors.Is(err, ErrQuotaLockContention) {
+					writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+						"quota check temporarily unavailable, please retry", nil)
+					return
+				}
+				writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "quota check failed", nil)
+				return
+			}
+		}
+
 		if err := s.store.CreateProject(ctx, project); err != nil {
+			if s.quotaService != nil && project.CreatedBy != "" {
+				s.quotaService.Release(ctx, "max_projects_per_user", project.ID)
+			}
 			writeErrorFromErr(w, err, "")
 			return
 		}
@@ -2340,11 +2413,43 @@ func (s *Server) handleProjectAgentAction(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// set_message_mode action: own permission model (D7).
+	if action == api.AgentActionSetMessageMode {
+		s.handleSetMessageMode(w, r, agent.ID)
+		return
+	}
+
+	// Message action: route through authorizeAgentMessage (D1/D8).
+	if action == api.AgentActionMessage {
+		identity := GetIdentityFromContext(r.Context())
+		if identity == nil {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				"This action requires user or agent authentication", nil)
+			return
+		}
+		isSystemPlane := false
+		allowed, reason := s.authorizeAgentMessage(r.Context(), identity, agent, isSystemPlane)
+		if !allowed {
+			slog.Warn("message authorization denied",
+				"sender_type", identity.Type(),
+				"sender_id", identity.ID(),
+				"target_agent", agent.ID,
+				"reason", reason,
+			)
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				"Message delivery denied", nil)
+			return
+		}
+		// Skip lifecycle authorization for messages — dispatch directly.
+		s.handleAgentMessage(w, r, agent.ID)
+		return
+	}
+
 	// For interactive actions, enforce lifecycle authorization for every caller
 	// kind: users via policy, agents via ScopeAgentLifecycle within their own
 	// project, everything else denied. authorizeAgentLifecycle logs the denial.
 	switch action {
-	case api.AgentActionStart, api.AgentActionStop, api.AgentActionSuspend, api.AgentActionRestart, api.AgentActionMessage, api.AgentActionExec:
+	case api.AgentActionStart, api.AgentActionStop, api.AgentActionSuspend, api.AgentActionRestart, api.AgentActionExec:
 		if !s.authorizeAgentLifecycle(w, r, agent) {
 			return
 		}
@@ -2355,8 +2460,6 @@ func (s *Server) handleProjectAgentAction(w http.ResponseWriter, r *http.Request
 		s.updateAgentStatus(w, r, agent.ID)
 	case api.AgentActionStart, api.AgentActionStop, api.AgentActionSuspend, api.AgentActionRestart:
 		s.handleAgentLifecycle(w, r, agent.ID, action)
-	case api.AgentActionMessage:
-		s.handleAgentMessage(w, r, agent.ID)
 	case api.AgentActionExec:
 		s.handleAgentExec(w, r, agent.ID)
 	case api.AgentActionEnv:
@@ -2719,6 +2822,11 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, id string
 	if err := s.store.DeleteProject(ctx, id); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
+	}
+
+	// Release quota reservation for the deleted project (best-effort).
+	if s.quotaService != nil {
+		s.quotaService.Release(ctx, "max_projects_per_user", id)
 	}
 
 	// For hub-native and shared-workspace projects, remove the filesystem directory

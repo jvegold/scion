@@ -307,7 +307,18 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 	var nextCursor string
 	var totalCount int
 
-	if user, ok := identity.(UserIdentity); identity != nil && (!ok || !IsUnscopedLocalPlatformAdmin(user)) {
+	// Check if user has admin-level list visibility via permission.
+	hasAdminView := false
+	if user, ok := identity.(UserIdentity); ok {
+		hasAdminView = s.authzService.Decide(ctx, AuthzRequest{
+			Principal:  principalContextForIdentity(user),
+			Credential: credentialContextForIdentity(user),
+			Resource:   Resource{Type: "agent", ID: "hub"},
+			Action:     Action("list"),
+			Permission: "agent.list",
+		}).Allowed
+	}
+	if identity != nil && !hasAdminView {
 		// Non-admin: use authorizedList for policy-enforced filtering.
 		result, err := authorizedList(ctx, identity, cursor, limit, func(ctx context.Context, cursor string, limit int) (authorizedCandidatePage[store.Agent], error) {
 			page, err := s.store.ListAgents(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, SkipTotalCount: true, CursorBinding: cursorBinding})
@@ -347,6 +358,13 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 		}
 		for i, cap := range s.authzService.ComputeCapabilitiesBatch(ctx, identity, resources, "agent") {
 			agents = append(agents, AgentWithCapabilities{Agent: items[i], Cap: cap})
+		}
+	}
+
+	// Compute messageability for each agent relative to the viewer.
+	if identity != nil {
+		for i := range agents {
+			agents[i].Messageability = s.ComputeMessageability(ctx, identity, &agents[i].Agent)
 		}
 	}
 
@@ -559,7 +577,8 @@ func (s *Server) createAgentInProject(
 	// Computed early (before broker resolution) so that fail-loud 403 on
 	// role over-requests fires before resource-intensive operations.
 	var effectiveRole AgentRole
-	var parentRole AgentRole // empty for user-created agents; set in agent-caller branch
+	var parentRole AgentRole     // empty for user-created agents; set in agent-caller branch
+	var parentMessageMode string // parent's message_mode for inheritance (D10)
 	requestedRole := AgentRole(req.AgentRole)
 
 	// Read project max agent role from annotations (default: full)
@@ -604,6 +623,7 @@ func (s *Server) createAgentInProject(
 				"parent_agent_id", agentIdent.ID(), "error", err)
 		} else {
 			parentRole, _ = agentRoleAndScopes(creatorAgent)
+			parentMessageMode = creatorAgent.MessageMode
 		}
 
 		// Validate stored parentRole to guard against corrupted data.
@@ -995,6 +1015,22 @@ func (s *Server) createAgentInProject(
 
 	agent.AppliedConfig = s.buildAppliedConfig(req, harnessConfig, creatorName, effectiveRole)
 
+	// Resolve message_mode (D10 spawn defaults):
+	//   1. Template specifies message_mode → use it.
+	//   2. Parent agent exists → inherit parent's message_mode.
+	//   3. Otherwise → default to "project" (handled by Ent schema default).
+	if resolvedTemplate != nil && resolvedTemplate.Config != nil && resolvedTemplate.Config.MessageMode != "" {
+		if !store.IsValidMessageMode(resolvedTemplate.Config.MessageMode) {
+			ValidationError(w, "invalid template message mode: "+resolvedTemplate.Config.MessageMode, nil)
+			return
+		}
+		agent.MessageMode = resolvedTemplate.Config.MessageMode
+	} else if parentMessageMode != "" {
+		agent.MessageMode = parentMessageMode
+	} else {
+		agent.MessageMode = store.MessageModeProject
+	}
+
 	// Populate GCP identity in applied config.
 	// Default to "block" mode when no GCP identity is specified, so agents
 	// cannot access the underlying compute identity via the GCE metadata
@@ -1143,7 +1179,28 @@ func (s *Server) createAgentInProject(
 
 	s.populateAgentConfig(ctx, agent, project, resolvedTemplate)
 
+	// Quota enforcement: check agent-per-project limit before creation.
+	if s.quotaService != nil {
+		if err := s.quotaService.CheckAndReserve(ctx, "max_agents_per_project", createdBy, "project", projectID, agent.ID); err != nil {
+			if errors.Is(err, store.ErrQuotaExceeded) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota exceeded: max_agents_per_project", nil)
+				return
+			}
+			if errors.Is(err, ErrQuotaLockContention) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota check temporarily unavailable, please retry", nil)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "quota check failed", nil)
+			return
+		}
+	}
+
 	if err := s.store.CreateAgent(ctx, agent); err != nil {
+		if s.quotaService != nil {
+			s.quotaService.Release(ctx, "max_agents_per_project", agent.ID)
+		}
 		writeErrorFromErr(w, err, "")
 		return
 	}
@@ -2029,6 +2086,14 @@ func (s *Server) getAgent(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	if identity := GetIdentityFromContext(ctx); identity != nil {
 		resp.Cap = s.authzService.ComputeCapabilities(ctx, identity, agentResource(agent))
+
+		// Compute detailed messageability with reachable counts for the detail endpoint.
+		projectAgentsResult, err := s.store.ListAgents(ctx, store.AgentFilter{ProjectID: agent.ProjectID}, store.ListOptions{})
+		if err == nil {
+			resp.Messageability = s.ComputeMessageabilityDetail(ctx, identity, agent, projectAgentsResult.Items)
+		} else {
+			resp.Messageability = s.ComputeMessageability(ctx, identity, agent)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -2416,6 +2481,11 @@ func (s *Server) performAgentDelete(w http.ResponseWriter, r *http.Request, agen
 		}
 	}
 
+	// Release quota reservation for the deleted agent (best-effort).
+	if s.quotaService != nil {
+		s.quotaService.Release(ctx, "max_agents_per_project", agent.ID)
+	}
+
 	// A deleted agent must not remain a thread's default — the binding would
 	// route new messages at an agent that no longer exists.
 	s.ClearTopicDefaultAgent(ctx, agent.ID, agent.Slug, agent.ProjectID)
@@ -2505,15 +2575,52 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, a
 		action == api.AgentActionRefreshToken ||
 		action == api.AgentActionOutboundMessage
 
-	// Self-message: allow an agent to deliver a message to itself using its
-	// own token, without requiring the ScopeAgentLifecycle scope. This mirrors
-	// the outbound-message self-access pattern and is used by sciontool to
-	// send system notifications (e.g. port auto-expose) to the agent's own
-	// harness input.
+	// --- set_message_mode action: own permission model (D7) ---
+	// Mode changes are human-only and use agent.set_message_mode permission,
+	// not lifecycle authorization. Must be routed before the generic authz block.
+	if action == api.AgentActionSetMessageMode {
+		s.handleSetMessageMode(w, r, id)
+		return
+	}
+
+	// --- Message action: routed through authorizeAgentMessage (D1) ---
+	// Messaging is a first-class axis, split from lifecycle/attach. The choke
+	// point handles user senders, agent senders, mode checks, and piercing.
 	if action == api.AgentActionMessage {
-		if claims := GetAgentFromContext(r.Context()); claims != nil && claims.Subject == id {
-			selfAccess = true
+		identity := GetIdentityFromContext(r.Context())
+		if identity == nil {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "This action requires user or agent authentication", nil)
+			return
 		}
+
+		// Self-message is handled inside authorizeAgentMessage as a
+		// self-access exemption, separate from system-plane (D8).
+		isSystemPlane := false
+
+		targetAgent, err := s.store.GetAgent(r.Context(), id)
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+
+		allowed, reason := s.authorizeAgentMessage(r.Context(), identity, targetAgent, isSystemPlane)
+		if !allowed {
+			slog.Warn("message authorization denied",
+				"sender_type", identity.Type(),
+				"sender_id", identity.ID(),
+				"target_agent", id,
+				"reason", reason,
+			)
+			writeError(w, http.StatusForbidden, ErrCodeMessageDenied,
+				"Message delivery denied", map[string]interface{}{
+					"reason":        mapReasonToCode(reason),
+					"senderMode":    s.getSenderMode(r.Context(), identity),
+					"recipientMode": targetAgent.MessageMode,
+				})
+			return
+		}
+		// Authorization passed — fall through to action dispatch below.
+		goto actionDispatch
 	}
 
 	if !selfAccess {
@@ -2555,6 +2662,8 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, a
 			}
 		}
 	}
+
+actionDispatch:
 
 	switch action {
 	case api.AgentActionStatus:

@@ -485,6 +485,18 @@ type RemoteCreateAgentRequest struct {
 	UserID      string             `json:"userId,omitempty"`
 	Config      *RemoteAgentConfig `json:"config,omitempty"`
 	ResolvedEnv map[string]string  `json:"resolvedEnv,omitempty"`
+	// EnvClassifications records the classification (plain, secret-fetchable,
+	// secret-injected) for each key in ResolvedEnv. Parallel structure:
+	// same key names, independent lifecycle (#127, P3a).
+	//
+	// Three-state semantics:
+	//   - Non-nil map, key present: classified as that kind.
+	//   - Non-nil map, key absent: unclassified → default secret + loud error.
+	//   - Nil map: classification unavailable (old hub). Distinct from "all unclassified".
+	//
+	// Additive wire field: old brokers ignore it (omitempty), new brokers
+	// receiving from old hubs see nil and must not treat it as "all secret".
+	EnvClassifications map[string]api.EnvKind `json:"envClassifications,omitempty"`
 	// ResolvedSecrets contains type-aware secrets resolved by the Hub.
 	// These are projected into the agent container based on their type.
 	ResolvedSecrets []ResolvedSecret `json:"resolvedSecrets,omitempty"`
@@ -763,6 +775,10 @@ type Server struct {
 	// Single-node only; see design §4.5 HA limitation.
 	presenceManager *PresenceManager
 
+	// Quota enforcement service (Permissions Phase 2B). Nil-safe — callers
+	// must nil-check before invoking; nil means quota enforcement is disabled.
+	quotaService *QuotaService
+
 	// Per-sender token-bucket limiter for the chat send paths (#1054).
 	// Set once in New and read without the lock; nil-safe.
 	chatSendLimiter *chatSendLimiter
@@ -1018,6 +1034,12 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 
 	// Initialize GCP token metrics
 	srv.gcpTokenMetrics = NewGCPTokenMetrics()
+
+	// Initialize quota enforcement service (Permissions Phase 2B).
+	srv.quotaService = &QuotaService{
+		store:  s,
+		logger: slog.Default().With("component", "quota"),
+	}
 
 	// Per-sender chat send rate limiter (#1054).
 	srv.chatSendLimiter = newChatSendLimiter()
@@ -1340,9 +1362,18 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// would silently lose assign when the gate moves to ActionAssign.
 	backfillProjectAssignPolicies(ctx, s)
 
+	// Backfill the "message" action into existing project member-create-agents
+	// policies. Projects created before msg-authz (PR #1371) lack this action,
+	// causing non-owner/non-admin members to be denied agent messaging.
+	backfillProjectMessageAction(ctx, s)
+
 	// Seed role definitions for the role-binding authorization model (Phase 1E).
 	// Must run after seedDefaultPoliciesAndGroups so the hub-members group exists.
 	seedRoleDefinitions(ctx, s)
+
+	// Seed system limit definitions for the quota/limits subsystem (Phase 2B).
+	// Shipped with unlimited defaults (DefaultValue=0) per sponsor decision OQ-2.
+	seedLimitDefinitions(ctx, s)
 
 	// Backfill role bindings from existing User.Role and project group memberships.
 	// Must run after seedRoleDefinitions so the role definitions exist.
@@ -3677,6 +3708,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/auth/me", s.guarded("/api/v1/auth/me", s.handleAuthMe))
 	s.mux.HandleFunc("/api/v1/auth/tokens", s.guarded("/api/v1/auth/tokens", s.handleTokens))
 	s.mux.HandleFunc("/api/v1/auth/tokens/", s.guarded("/api/v1/auth/tokens/", s.handleTokenByID))
+	s.mux.HandleFunc("/api/v1/auth/scopes", s.guarded("/api/v1/auth/scopes", s.handleAuthScopes))
 	s.mux.HandleFunc("/api/v1/auth/providers", s.guarded("/api/v1/auth/providers", s.handleCLIAuthProviders))
 
 	// CLI OAuth endpoints (unauthenticated - used for login)
@@ -3823,6 +3855,21 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/health/summary", s.guarded("/api/v1/admin/health/summary", s.handleHealthSummary))
 	s.mux.HandleFunc("/api/v1/metrics/", s.guarded("/api/v1/metrics/", s.handleMetricsDashboard))
 	s.mux.HandleFunc("/api/v1/admin/metrics-dashboard", s.guarded("/api/v1/admin/metrics-dashboard", s.handleAdminMetricsDashboard)) // legacy backward-compat
+
+	// Quota management (PR-B3)
+	s.mux.HandleFunc("/api/v1/admin/limits", s.guarded("/api/v1/admin/limits", s.handleAdminLimits))
+	s.mux.HandleFunc("/api/v1/admin/limits/", s.guarded("/api/v1/admin/limits/", s.handleAdminLimitByID))
+	s.mux.HandleFunc("/api/v1/admin/entitlements/", s.guarded("/api/v1/admin/entitlements/", s.handleAdminEntitlementByID))
+	s.mux.HandleFunc("/api/v1/admin/usage", s.guarded("/api/v1/admin/usage", s.handleAdminUsage))
+	s.mux.HandleFunc("/api/v1/admin/usage/", s.guarded("/api/v1/admin/usage/", s.handleAdminUsageByLimit))
+	s.mux.HandleFunc("/api/v1/usage/me", s.guarded("/api/v1/usage/me", s.handleUsageMe))
+
+	// Role management (PR-C1)
+	s.mux.HandleFunc("/api/v1/admin/roles", s.guarded("/api/v1/admin/roles", s.handleAdminRoles))
+	s.mux.HandleFunc("/api/v1/admin/roles/", s.guarded("/api/v1/admin/roles/", s.handleAdminRoleByID))
+	s.mux.HandleFunc("/api/v1/admin/role-bindings", s.guarded("/api/v1/admin/role-bindings", s.handleAdminRoleBindings))
+	s.mux.HandleFunc("/api/v1/admin/role-bindings/", s.guarded("/api/v1/admin/role-bindings/", s.handleAdminRoleBindingByID))
+	s.mux.HandleFunc("/api/v1/admin/permissions", s.guarded("/api/v1/admin/permissions", s.handleAdminPermissions))
 
 	// Notification endpoints (user-facing)
 	s.mux.HandleFunc("/api/v1/notifications", s.guarded("/api/v1/notifications", s.handleNotifications))

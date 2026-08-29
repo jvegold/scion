@@ -290,6 +290,59 @@ func backfillProjectAssignPolicies(ctx context.Context, s store.Store) {
 	}
 }
 
+// backfillProjectMessageAction ensures every existing project's member-create-agents
+// policy includes the "message" action. Projects created before msg-authz (PR #1371)
+// only had "create" (and possibly "stop_all") — without "message", non-owner/non-admin
+// project members silently lose the ability to message agents. The inline backfill in
+// createProjectMembersGroupAndPolicy covers projects that are touched after the
+// upgrade, but a project nobody touches never runs that path. This startup backfill
+// closes the gap.
+func backfillProjectMessageAction(ctx context.Context, s store.Store) {
+	var cursor string
+	for {
+		res, err := s.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{
+			Limit:  500,
+			Cursor: cursor,
+		})
+		if err != nil {
+			slog.Warn("failed to list projects for message-action backfill", "error", err)
+			return
+		}
+		for i := range res.Items {
+			project := &res.Items[i]
+			policyName := "project:" + project.Slug + ":member-create-agents"
+			policies, err := s.ListPolicies(ctx, store.PolicyFilter{Name: policyName}, store.ListOptions{Limit: 1})
+			if err != nil || len(policies.Items) == 0 {
+				slog.Debug("skipping message-action backfill, no member policy",
+					"project_id", project.ID, "slug", project.Slug)
+				continue
+			}
+			policy := &policies.Items[0]
+			hasMessage := false
+			for _, a := range policy.Actions {
+				if a == "message" {
+					hasMessage = true
+					break
+				}
+			}
+			if !hasMessage {
+				policy.Actions = append(policy.Actions, "message")
+				if err := s.UpdatePolicy(ctx, policy); err != nil {
+					slog.Warn("failed to backfill message action into project member policy",
+						"project_id", project.ID, "policy", policyName, "error", err)
+				} else {
+					slog.Info("backfilled message action into project member policy",
+						"project_id", project.ID, "policy", policyName)
+				}
+			}
+		}
+		if res.NextCursor == "" {
+			break
+		}
+		cursor = res.NextCursor
+	}
+}
+
 // seedPolicyTombstoneKey returns the hub-setting key used to record that a
 // seeded policy was intentionally deleted by an operator.
 func seedPolicyTombstoneKey(policyName string) string {
@@ -421,6 +474,7 @@ func seedDevUser(ctx context.Context, s store.Store, cfg DevUserConfig) {
 // already exist. It is called once during Hub initialization and is idempotent.
 func seedRoleDefinitions(ctx context.Context, s store.Store) {
 	allPermIDs := allPermissionIDs()
+	hubAdminPermIDs := hubAdminPermissionIDs()
 	readListPermIDs := permissionIDsByActions("read", "list")
 	readOnlyPermIDs := permissionIDsByActions("read")
 
@@ -441,6 +495,7 @@ func seedRoleDefinitions(ctx context.Context, s store.Store) {
 		permissions []string
 	}{
 		{store.SystemRoleSuperAdmin, "Full platform administrator with all permissions", store.RoleScopeSystem, allPermIDs},
+		{store.SystemRoleHubAdmin, "Hub administrator with scopeable admin permissions", store.RoleScopeSystem, hubAdminPermIDs},
 		{store.SystemRoleHubMember, "Hub member with read access and project creation", store.RoleScopeSystem, readListPermIDs},
 		{store.SystemRoleHubViewer, "Hub viewer with read-only access", store.RoleScopeSystem, readOnlyPermIDs},
 		{store.ProjectRoleOwner, "Project owner with full project permissions", store.RoleScopeProject, projectAllPermIDs},
@@ -490,6 +545,86 @@ func allPermissionIDs() []string {
 	return ids
 }
 
+// hubAdminPermissionIDs returns the curated permission set for the hub-admin
+// role. This is a subset of all permissions — it excludes super-admin-only
+// operations (maintenance, auth reset, diagnostics, admin mode, policies,
+// user suspend/promote) and non-route internal permissions.
+func hubAdminPermissionIDs() []string {
+	// Explicit set of permission IDs included in the hub-admin role.
+	// This set is a product decision; changes require architect or sponsor review.
+	included := map[string]bool{
+		// User management (not suspend/promote — those remain super-admin-only)
+		"user.read":   true,
+		"user.list":   true,
+		"user.update": true,
+		"user.invite": true,
+		// Group management
+		"group.read":         true,
+		"group.list":         true,
+		"group.create":       true,
+		"group.update":       true,
+		"group.delete":       true,
+		"group.addMember":    true,
+		"group.removeMember": true,
+		// Hub settings (read + update, but not maintenance/reset)
+		"hub.settings.read":           true,
+		"hub.settings.update":         true,
+		"hub.config.read":             true,
+		"hub.config.update":           true,
+		"hub.health.read":             true,
+		"hub.integrations.read":       true,
+		"hub.integrations.update":     true,
+		"hub.lifecycle_hooks.read":    true,
+		"hub.lifecycle_hooks.update":  true,
+		"hub.allow_list.read":         true,
+		"hub.allow_list.update":       true,
+		"hub.project_defaults.read":   true,
+		"hub.project_defaults.update": true,
+		"hub.scheduler.read":          true,
+		"hub.scheduler.update":        true,
+		"hub.federation.read":         true,
+		"hub.federation.update":       true,
+		"hub.teams_manifest.read":     true,
+		"hub.teams_manifest.update":   true,
+		"hub.github_app.read":         true,
+		"hub.github_app.update":       true,
+		"hub.metrics.read":            true,
+		"hub.validate.execute":        true,
+		// Quota management
+		"quota.read":   true,
+		"quota.create": true,
+		"quota.update": true,
+		"quota.delete": true,
+		// Role and binding management (PR-C1)
+		"role.read":           true,
+		"role.create":         true,
+		"role.update":         true,
+		"role.delete":         true,
+		"role_binding.read":   true,
+		"role_binding.create": true,
+		"role_binding.delete": true,
+		// Project oversight
+		"project.read":   true,
+		"project.list":   true,
+		"project.update": true,
+		// Skill registries
+		"skill.read":     true,
+		"skill.list":     true,
+		"skill.create":   true,
+		"skill.update":   true,
+		"skill.delete":   true,
+		"skill.register": true,
+	}
+
+	var ids []string
+	for _, p := range permissions.Registry {
+		if included[p.ID] {
+			ids = append(ids, p.ID)
+		}
+	}
+	return ids
+}
+
 // permissionIDsByActions returns permission IDs for permissions whose action matches any given action.
 func permissionIDsByActions(actions ...string) []string {
 	actionSet := make(map[string]bool, len(actions))
@@ -535,9 +670,15 @@ func projectPermissionIDsExcluding(excludeAction string) []string {
 		permissions.ResourceHarnessConfig: true,
 		permissions.ResourceSkill:         true,
 	}
+	// Explicit permission IDs excluded from this role regardless of action.
+	// agent.set_message_mode must NOT be held by project admins — only project
+	// owners may unseal none-mode agents (D7).
+	excludeIDs := map[string]bool{
+		"agent.set_message_mode": true,
+	}
 	var ids []string
 	for _, p := range permissions.Registry {
-		if projectResources[p.Resource] && p.Action != excludeAction {
+		if projectResources[p.Resource] && p.Action != excludeAction && !excludeIDs[p.ID] {
 			ids = append(ids, p.ID)
 		}
 	}
@@ -548,9 +689,10 @@ func projectPermissionIDsExcluding(excludeAction string) []string {
 // project member gets: create agents, read/list most things.
 func projectMemberPermissionIDs() []string {
 	memberActions := map[string]bool{
-		"create": true,
-		"read":   true,
-		"list":   true,
+		"create":  true,
+		"read":    true,
+		"list":    true,
+		"message": true,
 	}
 	projectResources := map[string]bool{
 		permissions.ResourceAgent:         true,
@@ -953,6 +1095,57 @@ func ReconcileSuperAdminBindings(ctx context.Context, s store.Store, adminEmails
 	}
 
 	return canDemote, nil
+}
+
+// seedLimitDefinitions creates the system limit definitions if they don't
+// already exist. Shipped with DefaultValue=0 (unlimited) for discoverability
+// per sponsor decision OQ-2 Option B. It is called once during Hub
+// initialization and is idempotent.
+func seedLimitDefinitions(ctx context.Context, s store.Store) {
+	systemLimits := []struct {
+		name         string
+		resourceType string
+		unit         string
+		description  string
+		defaultValue int64
+	}{
+		{store.LimitMaxAgentsPerProject, "agent", "count", "Maximum agents per project", 0},
+		{store.LimitMaxProjectsPerUser, "project", "count", "Maximum projects per user", 0},
+		{store.LimitMaxMembersPerGroup, "group", "count", "Maximum members per group", 0},
+	}
+
+	for _, lim := range systemLimits {
+		seedLimitDefinition(ctx, s, lim.name, lim.resourceType, lim.unit, lim.description, lim.defaultValue)
+	}
+}
+
+// seedLimitDefinition creates a single system limit definition if it doesn't
+// already exist.
+func seedLimitDefinition(ctx context.Context, s store.Store, name, resourceType, unit, description string, defaultValue int64) {
+	_, err := s.GetLimitDefinitionByName(ctx, name)
+	if err == nil {
+		return // already exists
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		slog.Warn("failed to check for existing limit definition", "name", name, "error", err)
+		return
+	}
+	ld := &store.LimitDefinition{
+		Name:         name,
+		ResourceType: resourceType,
+		Unit:         unit,
+		Description:  description,
+		DefaultValue: defaultValue,
+		System:       true,
+	}
+	if _, err := s.CreateLimitDefinition(ctx, ld); err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			return // Another instance already seeded this — expected in multi-node
+		}
+		slog.Warn("failed to seed limit definition", "name", name, "error", err)
+		return
+	}
+	slog.Info("seeded limit definition", "name", name, "resource_type", resourceType)
 }
 
 // ensureHubMembership adds the given user to the hub-members group.

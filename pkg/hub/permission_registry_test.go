@@ -83,7 +83,6 @@ func TestUATScopesAreRegistryDerived(t *testing.T) {
 	for _, stale := range []string{
 		store.UATScopeAgentStart,
 		store.UATScopeAgentStop,
-		store.UATScopeAgentMessage,
 		store.UATScopeAgentDispatch,
 	} {
 		if store.UATValidScopes[stale] {
@@ -123,7 +122,7 @@ func TestAgentTokenScopesMapToRegistry(t *testing.T) {
 
 func TestTokenScopeSurfacesDoNotExposeStaleUATScopes(t *testing.T) {
 	cliHelp := permissions.UATScopeHelp()
-	for _, stale := range []string{"agent:start", "agent:stop", "agent:message", "agent:dispatch"} {
+	for _, stale := range []string{"agent:start", "agent:stop", "agent:dispatch"} {
 		if strings.Contains(cliHelp, stale) {
 			t.Fatalf("generated CLI help still exposes stale UAT scope %q", stale)
 		}
@@ -142,7 +141,7 @@ func TestTokenScopeSurfacesDoNotExposeStaleUATScopes(t *testing.T) {
 		got := extractWebTokenScopes(t, path, string(content))
 		want := registryUATScopes(true)
 		if strings.Join(got, "\n") != strings.Join(want, "\n") {
-			t.Fatalf("%s AVAILABLE_SCOPES drifted from registry\ngot:  %v\nwant: %v", path, got, want)
+			t.Fatalf("%s FALLBACK_SCOPES drifted from registry\ngot:  %v\nwant: %v", path, got, want)
 		}
 	}
 }
@@ -222,26 +221,27 @@ func assertEnforcementReferenceExists(t *testing.T, permissionID, enforcement st
 func extractWebTokenScopes(t *testing.T, path, content string) []string {
 	t.Helper()
 
-	start := strings.Index(content, "const AVAILABLE_SCOPES = [")
+	start := strings.Index(content, "const FALLBACK_SCOPES: ScopeOption[] = [")
 	if start < 0 {
-		t.Fatalf("%s missing AVAILABLE_SCOPES declaration", path)
+		t.Fatalf("%s missing FALLBACK_SCOPES declaration", path)
 	}
-	end := strings.Index(content[start:], "] as const;")
+	// The array ends with "];\n" (no "as const" after the rename to typed ScopeOption[]).
+	end := strings.Index(content[start:], "];")
 	if end < 0 {
-		t.Fatalf("%s missing AVAILABLE_SCOPES terminator", path)
+		t.Fatalf("%s missing FALLBACK_SCOPES terminator", path)
 	}
 	block := content[start : start+end]
 
 	matches := regexp.MustCompile(`value:\s*'([^']+)'`).FindAllStringSubmatch(block, -1)
 	if len(matches) == 0 {
-		t.Fatalf("%s AVAILABLE_SCOPES has no scope values", path)
+		t.Fatalf("%s FALLBACK_SCOPES has no scope values", path)
 	}
 	scopes := make([]string, 0, len(matches))
 	seen := map[string]bool{}
 	for _, match := range matches {
 		scope := match[1]
 		if seen[scope] {
-			t.Fatalf("%s AVAILABLE_SCOPES contains duplicate scope %q", path, scope)
+			t.Fatalf("%s FALLBACK_SCOPES contains duplicate scope %q", path, scope)
 		}
 		seen[scope] = true
 		scopes = append(scopes, scope)

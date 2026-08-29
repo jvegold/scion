@@ -16,6 +16,8 @@ package hub
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -121,7 +123,29 @@ func (s *Server) listGroups(w http.ResponseWriter, r *http.Request) {
 	var groupItems []store.Group
 	var nextCursor string
 	var totalCount int
-	if user, ok := identity.(UserIdentity); identity != nil && (!ok || !IsUnscopedLocalPlatformAdmin(user)) {
+	// Check if user has admin-level list visibility via permission.
+	hasAdminView := false
+	if identity != nil {
+		if user, ok := identity.(UserIdentity); ok {
+			hasAdminView = s.authzService.Decide(ctx, AuthzRequest{
+				Principal:  principalContextForIdentity(user),
+				Credential: credentialContextForIdentity(user),
+				Resource:   Resource{Type: "group", ID: "hub"},
+				Action:     Action("list"),
+				Permission: "group.list",
+			}).Allowed
+		}
+	}
+	if hasAdminView {
+		// Admin view: direct store query without authorization filtering.
+		result, err := s.store.ListGroups(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, CursorBinding: cursorBinding})
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		groupItems, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+	} else if identity != nil {
+		// Authenticated non-admin: use authorizedList for policy-enforced filtering.
 		result, err := authorizedList(ctx, identity, cursor, limit, func(ctx context.Context, cursor string, limit int) (authorizedCandidatePage[store.Group], error) {
 			page, err := s.store.ListGroups(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, SkipTotalCount: true, CursorBinding: cursorBinding})
 			if err != nil {
@@ -135,12 +159,8 @@ func (s *Server) listGroups(w http.ResponseWriter, r *http.Request) {
 		}
 		groupItems, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
 	} else {
-		result, err := s.store.ListGroups(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, CursorBinding: cursorBinding})
-		if err != nil {
-			writeErrorFromErr(w, err, "")
-			return
-		}
-		groupItems, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+		// Unauthenticated: return empty list (no identity to authorize against).
+		groupItems = []store.Group{}
 	}
 	groups := make([]GroupWithCapabilities, 0, len(groupItems))
 	if identity == nil {
@@ -564,7 +584,13 @@ func (s *Server) addGroupMember(w http.ResponseWriter, r *http.Request, group *s
 		}
 	} else {
 		isResourceOwner := group.OwnerID != "" && group.OwnerID == userIdent.ID()
-		isPlatformAdmin := IsUnscopedLocalPlatformAdmin(userIdent)
+		isPlatformAdmin := s.authzService.Decide(ctx, AuthzRequest{
+			Principal:  principalContextForIdentity(userIdent),
+			Credential: credentialContextForIdentity(userIdent),
+			Resource:   Resource{Type: "group", ID: "hub"},
+			Action:     Action("update"),
+			Permission: "group.update",
+		}).Allowed
 		if !isResourceOwner && !isPlatformAdmin {
 			callerMembership, err := s.store.GetGroupMembership(ctx, groupID, store.GroupMemberTypeUser, userIdent.ID())
 			switch req.Role {
@@ -706,7 +732,30 @@ func (s *Server) addGroupMember(w http.ResponseWriter, r *http.Request, group *s
 		member.AddedBy = identity.ID()
 	}
 
+	// Quota enforcement: check members-per-group limit before addition.
+	if s.quotaService != nil {
+		membershipID := fmt.Sprintf("%s:%s:%s", groupID, member.MemberType, member.MemberID)
+		if err := s.quotaService.CheckAndReserve(ctx, "max_members_per_group", groupID, "group", groupID, membershipID); err != nil {
+			if errors.Is(err, store.ErrQuotaExceeded) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota exceeded: max_members_per_group", nil)
+				return
+			}
+			if errors.Is(err, ErrQuotaLockContention) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota check temporarily unavailable, please retry", nil)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "quota check failed", nil)
+			return
+		}
+	}
+
 	if err := s.store.AddGroupMember(ctx, member); err != nil {
+		if s.quotaService != nil {
+			membershipID := fmt.Sprintf("%s:%s:%s", groupID, member.MemberType, member.MemberID)
+			s.quotaService.Release(ctx, "max_members_per_group", membershipID)
+		}
 		if err == store.ErrAlreadyExists {
 			Conflict(w, "Member already exists in this group")
 			return
@@ -825,6 +874,12 @@ func (s *Server) removeGroupMember(w http.ResponseWriter, r *http.Request, group
 	if err := s.store.RemoveGroupMember(ctx, group.ID, memberType, memberID); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
+	}
+
+	// Release quota reservation for the removed member (best-effort).
+	if s.quotaService != nil {
+		membershipID := fmt.Sprintf("%s:%s:%s", group.ID, memberType, memberID)
+		s.quotaService.Release(ctx, "max_members_per_group", membershipID)
 	}
 
 	s.emitMutationAudit(r.Context(), &store.MutationAuditRecord{

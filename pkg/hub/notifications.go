@@ -25,6 +25,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
@@ -492,6 +493,20 @@ func (nd *NotificationDispatcher) createInboxMessage(ctx context.Context, sub *s
 		CreatedAt:   time.Now(),
 	}
 
+	// Phase 5 dual-write: resolve-or-create DM conversation for inbox notification messages.
+	// SubscriberID may be a slug or federated identity rather than a UUID;
+	// DMConversationKey requires valid UUIDs for both parties.
+	if _, parseErr := uuid.Parse(sub.SubscriberID); parseErr != nil {
+		nd.log.Warn("skipping DM conversation resolution for inbox message: subscriber ID not a UUID",
+			"subscriber_id", sub.SubscriberID, "notification_id", notif.ID)
+	} else {
+		convResult := messaging.ResolveOrCreateDMConversation(ctx, nd.store, nd.store, nd.log,
+			"agent", agent.ID, "user", sub.SubscriberID)
+		if convResult != nil {
+			storeMsg.ConversationID = convResult.ConversationID
+		}
+	}
+
 	if err := nd.store.CreateMessage(ctx, storeMsg); err != nil {
 		nd.log.Error("Failed to persist inbox message for notification",
 			"notificationID", notif.ID, "subscriberID", sub.SubscriberID, "error", err)
@@ -650,6 +665,26 @@ func (cn *ChatNotifier) NotifyDMReceived(ctx context.Context, recipientUserID st
 		return
 	}
 
+	// F2: resolve agent display name. After the B5 auth-derivation
+	// override, the broker path sets SenderName to the raw UUID (the
+	// agent ID). Resolve it to the human-readable Name (preferred) or
+	// Slug (fallback) for the notification text. The guard ensures we
+	// only look up when SenderName IS the UUID — other callers
+	// (handlers_agent_messaging.go:353, handlers_chat_v2.go:1293)
+	// already pass a proper label and must not be clobbered. This also
+	// avoids a pointless GetAgent call on the user-to-user DM path.
+	// On lookup failure, fall back to the current label — display
+	// resolution must never drop a notification.
+	if msg.SenderID != "" && msg.SenderName == msg.SenderID {
+		if agent, err := cn.store.GetAgent(ctx, msg.SenderID); err == nil {
+			if agent.Name != "" {
+				senderName = agent.Name
+			} else if agent.Slug != "" {
+				senderName = agent.Slug
+			}
+		}
+	}
+
 	message := formatChatNotification(ChatNotificationDMReceived, senderName, "", msg.Preview)
 
 	notif := cn.buildChatNotification(recipientUserID, ChatNotificationDMReceived, message, msg.ProjectID)
@@ -661,7 +696,10 @@ func (cn *ChatNotifier) NotifyDMReceived(ctx context.Context, recipientUserID st
 	}
 
 	// A DM has no thread name; make sure a stale one cannot ride along.
+	// Also propagate the resolved slug (if any) so the SSE event payload
+	// carries the human-readable name, not the raw UUID.
 	dmMsg := msg
+	dmMsg.SenderName = senderName
 	dmMsg.ConversationName = ""
 	cn.events.PublishChatNotification(ctx, notif, dmMsg)
 	cn.log.Info("DM notification created",

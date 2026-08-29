@@ -63,6 +63,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
 )
@@ -445,6 +446,18 @@ func (s *Server) handleCreateThread(w http.ResponseWriter, r *http.Request, proj
 		return
 	}
 
+	// Validate defaultAgent when provided: length and resolution are checked
+	// by validateDefaultAgent (single source of truth — DEF-31).
+	// Trim first so whitespace-only input is treated as "no default agent"
+	// (matching the PATCH/clear behavior).
+	body.DefaultAgent = strings.TrimSpace(body.DefaultAgent)
+	if body.DefaultAgent != "" {
+		if err := s.validateDefaultAgent(r.Context(), projectID, body.DefaultAgent); err != nil {
+			ValidationError(w, err.Error(), nil)
+			return
+		}
+	}
+
 	topicID := uuid.New().String()
 	now := time.Now().UTC()
 	topic := WebChatTopic{
@@ -576,7 +589,18 @@ func (s *Server) handleTopicPatch(w http.ResponseWriter, r *http.Request, topicI
 	}
 
 	if body.DefaultAgent != nil {
-		updates.DefaultAgent = body.DefaultAgent
+		// Validate defaultAgent: clearing (empty string) is always allowed;
+		// setting a value must resolve to a non-deleted agent in this project.
+		// Length and resolution are checked by validateDefaultAgent (single
+		// source of truth — DEF-31).
+		da := strings.TrimSpace(*body.DefaultAgent)
+		if da != "" {
+			if err := s.validateDefaultAgent(r.Context(), topic.ProjectID, da); err != nil {
+				ValidationError(w, err.Error(), nil)
+				return
+			}
+		}
+		updates.DefaultAgent = &da
 	}
 
 	if updates.Name == nil && updates.DefaultAgent == nil {
@@ -649,6 +673,36 @@ func (s *Server) handleTopicDelete(w http.ResponseWriter, r *http.Request, topic
 	s.events.PublishChatTopicEvent(r.Context(), topic.ProjectID, "deleted", *topic)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// validateDefaultAgent checks that the given identifier (slug or UUID) is a
+// valid length and resolves to a non-deleted agent within the specified project.
+// Returns nil on success or a user-facing error describing the validation failure.
+//
+// All defaultAgent format and length validation lives here so that create and
+// patch call sites share a single rule set — two copies of a validation rule
+// drift, and the drift is the bug (DEF-31).
+func (s *Server) validateDefaultAgent(ctx context.Context, projectID, agentRef string) error {
+	// Length gate: reject unreasonably long identifiers before hitting the DB.
+	if len([]rune(agentRef)) > 200 {
+		return fmt.Errorf("defaultAgent identifier is too long")
+	}
+
+	// Try slug lookup first (project-scoped, excludes soft-deleted).
+	a, err := s.store.GetAgentBySlug(ctx, projectID, agentRef)
+	if err == nil && a != nil {
+		return nil // found by slug in this project, not deleted
+	}
+
+	// Fall back to UUID lookup.
+	a, err = s.store.GetAgent(ctx, agentRef)
+	if err != nil || a == nil {
+		return fmt.Errorf("defaultAgent %q not found in this project", agentRef)
+	}
+	if a.ProjectID != projectID || !a.DeletedAt.IsZero() {
+		return fmt.Errorf("defaultAgent %q not found in this project", agentRef)
+	}
+	return nil
 }
 
 // ClearTopicDefaultAgent drops the default-agent binding from every topic in
@@ -939,6 +993,16 @@ func (s *Server) handleConversationSend(w http.ResponseWriter, r *http.Request, 
 			if err != nil || defaultAgent == nil {
 				// Fall back to lookup by ID in case the value is a UUID.
 				defaultAgent, err = s.store.GetAgent(ctx, topic.DefaultAgent)
+				// Scope the fallback: reject agents from other projects or
+				// soft-deleted agents. GetAgent is a bare primary-key fetch
+				// with no project or deletion filter, so without this guard
+				// a UUID naming an agent in another project (or a deleted
+				// agent) would bind successfully — DEF-31.
+				if err == nil && defaultAgent != nil {
+					if defaultAgent.ProjectID != projectID || !defaultAgent.DeletedAt.IsZero() {
+						defaultAgent = nil
+					}
+				}
 			}
 			if err == nil && defaultAgent != nil {
 				msgID := s.sendAgentRouted(w, r, key, projectID, user, content, senderLabel, []*store.Agent{defaultAgent}, mentionNames, nil, attachmentRefs, now, body.ReplyToID)
@@ -1052,6 +1116,34 @@ func (s *Server) sendAgentRouted(w http.ResponseWriter, r *http.Request, key, pr
 		}
 	}
 
+	// Phase 3 msg-authz: Check message authorization on the primary agent.
+	// Replaces the ActionAttach check — chat v2 is purely messaging, not PTY/attach.
+	// Authorization runs BEFORE validation (B-2): authorizeAgentMessage depends
+	// only on user and primaryAgent (both resolved above). An unauthorized user
+	// must receive the enriched 403 with {reason, senderMode, recipientMode}
+	// (#1382), not a 400 from the validator.
+	allowed, reason := s.authorizeAgentMessage(ctx, user, primaryAgent, false)
+	if !allowed {
+		slog.Warn("chat v2 message authorization denied",
+			"user", user.ID(),
+			"target_agent", primaryAgent.ID,
+			"reason", reason,
+		)
+		writeError(w, http.StatusForbidden, ErrCodeMessageDenied, "Message delivery denied", map[string]interface{}{
+			"reason":        mapReasonToCode(reason),
+			"senderMode":    "user",
+			"recipientMode": primaryAgent.MessageMode,
+		})
+		return ""
+	}
+
+	// Validate through the messaging choke point (AC-8).
+	// Runs after authorization so unauthorized users see 403, not 400.
+	if err := messaging.ValidateLegacyMessage(msg); err != nil {
+		ValidationError(w, err.Error(), nil)
+		return ""
+	}
+
 	// Persist the message.
 	storeMsg := &store.Message{
 		ID:            api.NewUUID(),
@@ -1067,6 +1159,25 @@ func (s *Server) sendAgentRouted(w http.ResponseWriter, r *http.Request, key, pr
 		ThreadID:      key,
 		DispatchState: store.MessageDispatchDispatched,
 		CreatedAt:     now,
+	}
+	// B15 dual-write: resolve-or-create conversation for web chat user→agent messages.
+	{
+		var convResult *messaging.ConversationResult
+		if key != "" {
+			var threadOpts []messaging.ThreadConversationOption
+			s.mu.RLock()
+			wcs := s.webChatStore
+			s.mu.RUnlock()
+			if wcs != nil {
+				threadOpts = append(threadOpts, messaging.WithTopicLookup(wcs))
+			}
+			convResult = messaging.ResolveOrCreateThreadConversation(ctx, s.store, s.messageLog, key, projectID, threadOpts...)
+		} else if user.ID() != "" && primaryAgent.ID != "" {
+			convResult = messaging.ResolveOrCreateDMConversation(ctx, s.store, s.store, s.messageLog, "user", user.ID(), "agent", primaryAgent.ID)
+		}
+		if convResult != nil {
+			storeMsg.ConversationID = convResult.ConversationID
+		}
 	}
 	if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
 		s.messageLog.Error("Failed to persist agent-routed message", "error", err)
@@ -1126,6 +1237,22 @@ func (s *Server) sendAgentRouted(w http.ResponseWriter, r *http.Request, key, pr
 	// Handle additional mentioned agents (fan-out).
 	if len(agents) > 1 {
 		for _, mentionAgent := range agents[1:] {
+			// Phase 3 msg-authz: Check message authorization on each mentioned agent.
+			// Replaces the ActionAttach check — chat v2 mention fan-out is messaging.
+			mentionAllowed, _ := s.authorizeAgentMessage(ctx, user, mentionAgent, false)
+			if !mentionAllowed {
+				s.messageLog.Warn("User lacks message authorization for mentioned agent",
+					"user", user.ID(), "agent", mentionAgent.Slug)
+				// Update the MentionResult so the client sees the skip.
+				for i, mr := range mentionResults {
+					if strings.EqualFold(mr.Slug, mentionAgent.Slug) {
+						mentionResults[i].Status = "unauthorized"
+						mentionResults[i].Error = "insufficient permissions"
+						break
+					}
+				}
+				continue
+			}
 			mentionMsg := messages.NewMention(msg.Sender, "agent:"+mentionAgent.Slug, content, msg.Recipient)
 			mentionMsg.SenderID = msg.SenderID
 			mentionMsg.RecipientID = mentionAgent.ID
@@ -1149,6 +1276,25 @@ func (s *Server) sendAgentRouted(w http.ResponseWriter, r *http.Request, key, pr
 				ThreadID:      key,
 				DispatchState: store.MessageDispatchDispatched,
 				CreatedAt:     now,
+			}
+			// B15 dual-write: resolve-or-create conversation for web chat mention fan-out.
+			{
+				var convResult *messaging.ConversationResult
+				if key != "" {
+					var threadOpts []messaging.ThreadConversationOption
+					s.mu.RLock()
+					mentionWcs := s.webChatStore
+					s.mu.RUnlock()
+					if mentionWcs != nil {
+						threadOpts = append(threadOpts, messaging.WithTopicLookup(mentionWcs))
+					}
+					convResult = messaging.ResolveOrCreateThreadConversation(ctx, s.store, s.messageLog, key, projectID, threadOpts...)
+				} else if user.ID() != "" && mentionAgent.ID != "" {
+					convResult = messaging.ResolveOrCreateDMConversation(ctx, s.store, s.store, s.messageLog, "user", user.ID(), "agent", mentionAgent.ID)
+				}
+				if convResult != nil {
+					mentionStoreMsg.ConversationID = convResult.ConversationID
+				}
 			}
 			if err := s.store.CreateMessage(ctx, mentionStoreMsg); err != nil {
 				s.messageLog.Error("Failed to persist mention message", "slug", mentionAgent.Slug, "error", err)
@@ -1241,6 +1387,25 @@ func (s *Server) sendHumanToHuman(w http.ResponseWriter, r *http.Request, key, p
 		ThreadID:      key,
 		DispatchState: store.MessageDispatchDispatched,
 		CreatedAt:     now,
+	}
+	// B15 dual-write: resolve-or-create conversation for human-to-human messages.
+	{
+		var convResult *messaging.ConversationResult
+		if key != "" {
+			var threadOpts []messaging.ThreadConversationOption
+			s.mu.RLock()
+			h2hWcs := s.webChatStore
+			s.mu.RUnlock()
+			if h2hWcs != nil {
+				threadOpts = append(threadOpts, messaging.WithTopicLookup(h2hWcs))
+			}
+			convResult = messaging.ResolveOrCreateThreadConversation(ctx, s.store, s.messageLog, key, msgProjectID, threadOpts...)
+		} else if user.ID() != "" && recipientID != "" {
+			convResult = messaging.ResolveOrCreateDMConversation(ctx, s.store, s.store, s.messageLog, "user", user.ID(), "user", recipientID)
+		}
+		if convResult != nil {
+			storeMsg.ConversationID = convResult.ConversationID
+		}
 	}
 
 	if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
@@ -1601,9 +1766,46 @@ func (s *Server) handleConversationHistory(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	filter := store.MessageFilter{
-		Channel:  "web",
-		ThreadID: key,
+	// Phase 8 read-switch: when ConversationReadSwitch is ON, resolve the
+	// conversation and query by ConversationID instead of Channel+ThreadID.
+	var filter store.MessageFilter
+	if ops := s.GetOperationalSettings(); ops != nil && ops.ConversationReadSwitch() {
+		var convResult *messaging.ConversationResult
+		if isDM {
+			// DM key format: dm:<kind>:<id>:<kind>:<id> — exactly 5 parts.
+			// Strict parse (B-3): never tolerate or normalise a DM key on the
+			// derivation path. A 7-part key silently deriving from the first 5
+			// would be an access path error after the S4 read-switch.
+			parts := strings.Split(key, ":")
+			if len(parts) == 5 {
+				convResult = messaging.ResolveDMConversationForRead(ctx, s.store, s.messageLog, parts[1], parts[2], parts[3], parts[4])
+			}
+		} else {
+			// Thread key — look up the topic to get the projectID for the external_ref.
+			if wcs != nil {
+				if topic, err := wcs.GetTopic(ctx, key); err == nil && topic != nil {
+					convResult = messaging.ResolveThreadConversationForRead(ctx, s.store, s.messageLog, key, topic.ProjectID)
+				}
+			}
+		}
+		if convResult != nil {
+			filter = store.MessageFilter{
+				ConversationID: convResult.ConversationID,
+			}
+		} else {
+			// Conversation not found — fall back to old path so we don't
+			// return an empty result for data written before dual-write.
+			messaging.DivergenceMetrics.IncFallback()
+			filter = store.MessageFilter{
+				Channel:  "web",
+				ThreadID: key,
+			}
+		}
+	} else {
+		filter = store.MessageFilter{
+			Channel:  "web",
+			ThreadID: key,
+		}
 	}
 	// Support visibility filter.
 	if vis := q["visibility"]; len(vis) > 0 {

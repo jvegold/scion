@@ -22,8 +22,11 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerjointoken"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokersecret"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatlinkcode"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/conversation"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/conversationparticipant"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/decisionaudit"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/delegationedge"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/entitlementbinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/envvar"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/gcpserviceaccount"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubinstallation"
@@ -37,9 +40,11 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/invitecode"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/lifecyclehook"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/lifecyclehookagentphase"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/limitdefinition"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/maintenanceoperation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/maintenanceoperationrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/message"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/messageaddressee"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/mutationaudit"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/noncecache"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notification"
@@ -61,6 +66,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillversion"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/subscriptiontemplate"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/template"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/usagereservation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/user"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/useraccesstoken"
 )
@@ -133,8 +139,11 @@ func checkColumn(t, c string) error {
 			brokerjointoken.Table:          brokerjointoken.ValidColumn,
 			brokersecret.Table:             brokersecret.ValidColumn,
 			chatlinkcode.Table:             chatlinkcode.ValidColumn,
+			conversation.Table:             conversation.ValidColumn,
+			conversationparticipant.Table:  conversationparticipant.ValidColumn,
 			decisionaudit.Table:            decisionaudit.ValidColumn,
 			delegationedge.Table:           delegationedge.ValidColumn,
+			entitlementbinding.Table:       entitlementbinding.ValidColumn,
 			envvar.Table:                   envvar.ValidColumn,
 			gcpserviceaccount.Table:        gcpserviceaccount.ValidColumn,
 			githubresolutioncache.Table:    githubresolutioncache.ValidColumn,
@@ -148,9 +157,11 @@ func checkColumn(t, c string) error {
 			invitecode.Table:               invitecode.ValidColumn,
 			lifecyclehook.Table:            lifecyclehook.ValidColumn,
 			lifecyclehookagentphase.Table:  lifecyclehookagentphase.ValidColumn,
+			limitdefinition.Table:          limitdefinition.ValidColumn,
 			maintenanceoperation.Table:     maintenanceoperation.ValidColumn,
 			maintenanceoperationrun.Table:  maintenanceoperationrun.ValidColumn,
 			message.Table:                  message.ValidColumn,
+			messageaddressee.Table:         messageaddressee.ValidColumn,
 			mutationaudit.Table:            mutationaudit.ValidColumn,
 			noncecache.Table:               noncecache.ValidColumn,
 			notification.Table:             notification.ValidColumn,
@@ -172,6 +183,7 @@ func checkColumn(t, c string) error {
 			skillversion.Table:             skillversion.ValidColumn,
 			subscriptiontemplate.Table:     subscriptiontemplate.ValidColumn,
 			template.Table:                 template.ValidColumn,
+			usagereservation.Table:         usagereservation.ValidColumn,
 			user.Table:                     user.ValidColumn,
 			useraccesstoken.Table:          useraccesstoken.ValidColumn,
 		})

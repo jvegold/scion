@@ -64,6 +64,9 @@ const (
 	// fetched or yielded nothing usable (see handleSkillsDiscoverDirectory).
 	ErrCodeDiscoverFailed = "discover_failed"
 
+	// Message authorization error codes
+	ErrCodeMessageDenied = "message_denied"
+
 	// Delivery error codes
 	ErrCodeAgentNotFound   = "agent_not_found"
 	ErrCodeDeliveryFailed  = "delivery_failed"
@@ -77,6 +80,9 @@ const (
 	ErrCodeInvalidSignature = "invalid_signature"
 	ErrCodeClockSkew        = "clock_skew"
 	ErrCodeReplayDetected   = "replay_detected"
+
+	// Quota enforcement error codes
+	ErrCodeQuotaExceeded = "quota_exceeded"
 )
 
 // writeError writes a JSON error response.

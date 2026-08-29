@@ -41,6 +41,7 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/auth/me":                           "authenticated:user",
 	"/api/v1/auth/tokens":                       "authenticated:user-token",
 	"/api/v1/auth/tokens/":                      "authenticated:user-token",
+	"/api/v1/auth/scopes":                       "authenticated:user-token",
 	"/api/v1/auth/providers":                    "public:auth",
 	"/api/v1/auth/invite/redeem":                "public:invite",
 	"/api/v1/auth/cli/authorize":                "public:cli-oauth",
@@ -63,8 +64,8 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/gcp-service-accounts/":             "policy:gcp-service-account",
 	"/api/v1/skills":                            "policy:skill",
 	"/api/v1/skills/":                           "policy:skill",
-	"/api/v1/skill-registries":                  "policy:skill-registry",
-	"/api/v1/skill-registries/":                 "policy:skill-registry",
+	"/api/v1/skill-registries":                  "hub-admin:skill-registry",
+	"/api/v1/skill-registries/":                 "hub-admin:skill-registry",
 	"/api/v1/harness-configs":                   "policy:harness-config",
 	"/api/v1/harness-configs/":                  "policy:harness-config",
 	"/api/v1/pre-start-hooks":                   "policy:pre-start-hook",
@@ -180,6 +181,18 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/system/fs/mkdir":                   "workstation:filesystem",
 	"/api/v1/system/fs/validate-path":           "workstation:filesystem",
 	"/api/v1/authz/explain":                     "authenticated:authz-explain",
+	"/api/v1/admin/limits":                      "hub-admin:quota",
+	"/api/v1/admin/limits/":                     "hub-admin:quota",
+	"/api/v1/admin/entitlements/":               "hub-admin:quota",
+	"/api/v1/admin/usage":                       "hub-admin:quota",
+	"/api/v1/admin/usage/":                      "hub-admin:quota",
+	"/api/v1/usage/me":                          "authenticated:quota-usage",
+	// Role management (PR-C1)
+	"/api/v1/admin/roles":          "hub-admin:role",
+	"/api/v1/admin/roles/":         "hub-admin:role",
+	"/api/v1/admin/role-bindings":  "hub-admin:role_binding",
+	"/api/v1/admin/role-bindings/": "hub-admin:role_binding",
+	"/api/v1/admin/permissions":    "hub-admin:role",
 }
 
 func TestRegisteredRoutesHavePermissionClassification(t *testing.T) {
@@ -323,9 +336,12 @@ func TestRouteGuardsDenyUnauthorized(t *testing.T) {
 			wantStatus:     http.StatusUnauthorized,
 		},
 		// RouteHubAdmin: non-admin user → 403
+		// Uses a route without Permission (requireAdmin fallback) so this test
+		// works without an authzService. Permission-based routes are tested in
+		// TestRouteGuardOpsPermissions with a full server.
 		{
 			name:           "hub-admin route denies non-admin",
-			route:          "/api/v1/admin/scheduler",
+			route:          "/api/v1/admin/allow-list",
 			classification: RouteHubAdmin,
 			identity:       NewAuthenticatedUser("user-1", "user@example.com", "User", "member", "api"),
 			wantStatus:     http.StatusForbidden,
@@ -333,7 +349,7 @@ func TestRouteGuardsDenyUnauthorized(t *testing.T) {
 		// RouteHubAdmin: no identity → 401
 		{
 			name:           "hub-admin route denies unauthenticated",
-			route:          "/api/v1/admin/scheduler",
+			route:          "/api/v1/admin/allow-list",
 			classification: RouteHubAdmin,
 			identity:       nil,
 			wantStatus:     http.StatusUnauthorized,
@@ -370,13 +386,8 @@ func TestRouteGuardsDenyUnauthorized(t *testing.T) {
 	}
 }
 
-func TestHubAdminRoutesRejectScopedAdminUAT(t *testing.T) {
-	srv := &Server{config: DefaultServerConfig(), mux: http.NewServeMux()}
-	srv.registerRoutes()
-
-	admin := NewAuthenticatedUser("admin-uat", "admin-uat@example.com", "Admin UAT", "admin", "api")
-	scopedAdmin := NewScopedUserIdentity(admin, "project-1", []string{"agent:create", "project:read", "policy:manage"})
-
+// allHubAdminRoutes returns all routes classified as hub-admin, sorted.
+func allHubAdminRoutes() []string {
 	routes := make([]string, 0)
 	for route, classification := range routePermissionClassifications {
 		if strings.HasPrefix(classification, "hub-admin:") {
@@ -384,9 +395,28 @@ func TestHubAdminRoutesRejectScopedAdminUAT(t *testing.T) {
 		}
 	}
 	sort.Strings(routes)
+	return routes
+}
+
+func TestHubAdminRoutesRejectScopedAdminUAT(t *testing.T) {
+	srv := &Server{config: DefaultServerConfig(), mux: http.NewServeMux(), authzService: NewAuthzService(nil, nil)}
+	srv.registerRoutes()
+
+	admin := NewAuthenticatedUser("admin-uat", "admin-uat@example.com", "Admin UAT", "admin", "api")
+	scopedAdmin := NewScopedUserIdentity(admin, "project-1", []string{"agent:create", "project:read", "policy:manage"})
+
+	routes := allHubAdminRoutes()
 
 	for _, route := range routes {
 		t.Run(route, func(t *testing.T) {
+			// Skip routes that have Permission set — they require an authzService
+			// to exercise the Decide path. These are tested in
+			// TestRouteGuardOpsPermissions with a full server.
+			if meta, ok := routeMetadataTable[route]; ok && meta.Permission != "" {
+				t.Skipf("skipping permission-based route %s (tested in TestRouteGuardOpsPermissions)", route)
+				return
+			}
+
 			method, path, body := scopedAdminUATRouteRequest(route)
 			ctx, cancel := context.WithTimeout(contextWithIdentity(context.Background(), scopedAdmin), 200*time.Millisecond)
 			defer cancel()

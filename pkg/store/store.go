@@ -28,6 +28,7 @@ var (
 	ErrVersionConflict  = errors.New("version conflict")
 	ErrInvalidInput     = errors.New("invalid input")
 	ErrRevisionConflict = errors.New("revision conflict")
+	ErrQuotaExceeded    = errors.New("quota exceeded")
 
 	// ErrSuperAdminBindingRestricted is returned when a non-reconciler caller
 	// attempts to create a role binding for the super-admin role definition.
@@ -159,6 +160,9 @@ type Store interface {
 	// AgentSessionMetrics operations (Hub Metrics Reporting)
 	AgentSessionMetricsStore
 
+	// Conversation operations (Multi-Party Messaging)
+	ConversationStore
+
 	// Role operations (Permissions Foundation Phase 1E)
 	RoleStore
 
@@ -173,6 +177,9 @@ type Store interface {
 
 	// Mutation Audit operations (Authorization Mutation Audit Phase 1I)
 	MutationAuditStore
+
+	// Quota operations (Permissions Phase 2B — Limits/Quotas)
+	QuotaStore
 }
 
 // AgentStore defines agent-related persistence operations.
@@ -1319,6 +1326,16 @@ type MessageStore interface {
 	// PurgeOldMessages removes read messages older than readCutoff and
 	// unread messages older than unreadCutoff. Returns count removed.
 	PurgeOldMessages(ctx context.Context, readCutoff time.Time, unreadCutoff time.Time) (int, error)
+
+	// SetMessageConversationID updates the conversation_id on an existing
+	// message. Used by the Phase 4 backfill to link legacy messages to
+	// Conversation records. Returns ErrNotFound if the message doesn't exist.
+	SetMessageConversationID(ctx context.Context, messageID, conversationID string) error
+
+	// CountUnbackfilledMessages returns the number of messages with an empty
+	// conversation_id for the given project. When projectID is empty, counts
+	// across all projects.
+	CountUnbackfilledMessages(ctx context.Context, projectID string) (int, error)
 }
 
 // =============================================================================
@@ -1588,6 +1605,72 @@ type AgentSessionMetricsStore interface {
 }
 
 // =============================================================================
+// Conversations (Multi-Party Messaging)
+// =============================================================================
+
+// ConversationStore manages conversation, participant, and addressee persistence.
+type ConversationStore interface {
+	// CreateConversation creates a new conversation.
+	// Returns ErrAlreadyExists if a conversation with the same ID exists.
+	CreateConversation(ctx context.Context, conv *Conversation) error
+
+	// GetConversation retrieves a conversation by ID.
+	// Returns ErrNotFound if the conversation doesn't exist.
+	GetConversation(ctx context.Context, id string) (*Conversation, error)
+
+	// UpdateConversation updates an existing conversation.
+	// Returns ErrNotFound if the conversation doesn't exist.
+	UpdateConversation(ctx context.Context, conv *Conversation) error
+
+	// DeleteConversation soft-deletes a conversation by setting DeletedAt.
+	// Returns ErrNotFound if the conversation doesn't exist.
+	DeleteConversation(ctx context.Context, id string) error
+
+	// ListConversations returns conversations matching the filter.
+	ListConversations(ctx context.Context, filter ConversationFilter, opts ListOptions) (*ListResult[Conversation], error)
+
+	// GetConversationByExternalRef looks up a conversation by (surface, external_ref).
+	// Returns ErrNotFound if no matching active (non-deleted) conversation exists.
+	// This is the read-only counterpart of UpsertConversationByExternalRef.
+	GetConversationByExternalRef(ctx context.Context, surface, externalRef string) (*Conversation, error)
+
+	// UpsertConversationByExternalRef creates or updates a conversation keyed on (surface, external_ref).
+	// This is the idempotent broker-edge operation. Returns the conversation (created or existing).
+	// CRITICAL: this must be safe under concurrent calls — the UNIQUE partial index is the guard.
+	UpsertConversationByExternalRef(ctx context.Context, conv *Conversation) (*Conversation, error)
+
+	// AddParticipant adds a principal to a conversation.
+	// Returns ErrAlreadyExists if the participant already exists.
+	AddParticipant(ctx context.Context, p *ConversationParticipant) error
+
+	// EnsureParticipant ensures a participant row exists. If the participant
+	// already exists (active or soft-removed), the row is left untouched.
+	// Unlike AddParticipant, this does not clear left_at on existing rows.
+	EnsureParticipant(ctx context.Context, p *ConversationParticipant) error
+
+	// RemoveParticipant soft-removes a participant by setting LeftAt.
+	// Returns ErrNotFound if the participant doesn't exist.
+	RemoveParticipant(ctx context.Context, conversationID, principalKind, principalID string) error
+
+	// ListParticipants returns active participants of a conversation (where left_at IS NULL).
+	ListParticipants(ctx context.Context, conversationID string) ([]ConversationParticipant, error)
+
+	// GetConversationsForPrincipal returns conversations a principal participates in (active, left_at IS NULL).
+	GetConversationsForPrincipal(ctx context.Context, principalKind, principalID string) ([]Conversation, error)
+
+	// AddAddressee adds an addressee record to a message.
+	// Returns ErrAlreadyExists if the addressee already exists.
+	AddAddressee(ctx context.Context, a *MessageAddressee) error
+
+	// ListAddressees returns all addressees for a message.
+	ListAddressees(ctx context.Context, messageID string) ([]MessageAddressee, error)
+
+	// UpdateDeliveryState updates the delivery state of an addressee.
+	// Returns ErrNotFound if the addressee doesn't exist.
+	UpdateDeliveryState(ctx context.Context, id string, state string, failureReason *string) error
+}
+
+// =============================================================================
 // Role Definitions and Bindings (Permissions Foundation Phase 1E)
 // =============================================================================
 
@@ -1625,6 +1708,22 @@ type RoleStore interface {
 	// DeleteRoleBinding deletes a role binding by ID.
 	// Returns ErrNotFound if the role binding doesn't exist.
 	DeleteRoleBinding(ctx context.Context, id string) error
+
+	// UpdateRoleDefinition updates an existing role definition.
+	// Returns ErrNotFound if the role definition doesn't exist.
+	UpdateRoleDefinition(ctx context.Context, rd *RoleDefinition) (*RoleDefinition, error)
+
+	// DeleteRoleDefinition deletes a role definition by ID.
+	// Returns ErrNotFound if the role definition doesn't exist.
+	DeleteRoleDefinition(ctx context.Context, id string) error
+
+	// ListAllRoleBindings returns all role bindings (admin view).
+	// limit and offset control pagination. A limit of 0 defaults to 100.
+	// The maximum allowed limit is 1000.
+	ListAllRoleBindings(ctx context.Context, limit, offset int) ([]*RoleBinding, error)
+
+	// CountAllRoleBindings returns the total number of role bindings.
+	CountAllRoleBindings(ctx context.Context) (int, error)
 
 	// GetProjectMembership returns the project membership for a user in a project.
 	// Returns ErrNotFound if the user is not a member of the project.
@@ -1726,4 +1825,76 @@ type MutationAuditStore interface {
 	// DeleteMutationAuditsBefore removes mutation audit records older than the given time.
 	// Returns the number of records deleted.
 	DeleteMutationAuditsBefore(ctx context.Context, before time.Time) (int, error)
+}
+
+// =============================================================================
+// Quota Store (Permissions Phase 2B — Limits/Quotas)
+// =============================================================================
+
+// QuotaStore defines limit and quota persistence operations (Permissions Phase 2B).
+type QuotaStore interface {
+	// Limit definitions
+	// CreateLimitDefinition creates a new limit definition.
+	// Returns ErrAlreadyExists if a definition with the same name exists.
+	CreateLimitDefinition(ctx context.Context, def *LimitDefinition) (*LimitDefinition, error)
+
+	// GetLimitDefinition retrieves a limit definition by ID.
+	// Returns ErrNotFound if the definition doesn't exist.
+	GetLimitDefinition(ctx context.Context, id string) (*LimitDefinition, error)
+
+	// GetLimitDefinitionByName retrieves a limit definition by name.
+	// Returns ErrNotFound if the definition doesn't exist.
+	GetLimitDefinitionByName(ctx context.Context, name string) (*LimitDefinition, error)
+
+	// ListLimitDefinitions returns all limit definitions.
+	ListLimitDefinitions(ctx context.Context) ([]*LimitDefinition, error)
+
+	// UpdateLimitDefinition updates an existing limit definition.
+	// Returns ErrNotFound if the definition doesn't exist.
+	UpdateLimitDefinition(ctx context.Context, def *LimitDefinition) (*LimitDefinition, error)
+
+	// DeleteLimitDefinition deletes a limit definition by ID.
+	// Returns ErrNotFound if the definition doesn't exist.
+	DeleteLimitDefinition(ctx context.Context, id string) error
+
+	// Entitlement bindings
+	// CreateEntitlementBinding creates a new entitlement binding.
+	// Returns ErrAlreadyExists if the exact binding already exists.
+	CreateEntitlementBinding(ctx context.Context, binding *EntitlementBinding) (*EntitlementBinding, error)
+
+	// GetEntitlementBinding retrieves an entitlement binding by ID.
+	// Returns ErrNotFound if the binding doesn't exist.
+	GetEntitlementBinding(ctx context.Context, id string) (*EntitlementBinding, error)
+
+	// ListEntitlementBindings returns all entitlement bindings for a limit definition.
+	ListEntitlementBindings(ctx context.Context, limitDefinitionID string) ([]*EntitlementBinding, error)
+
+	// ListEntitlementBindingsForSubject returns all entitlement bindings for a given subject.
+	ListEntitlementBindingsForSubject(ctx context.Context, subjectType, subjectID string) ([]*EntitlementBinding, error)
+
+	// UpdateEntitlementBinding updates an existing entitlement binding.
+	// Returns ErrNotFound if the binding doesn't exist.
+	UpdateEntitlementBinding(ctx context.Context, binding *EntitlementBinding) (*EntitlementBinding, error)
+
+	// DeleteEntitlementBinding deletes an entitlement binding by ID.
+	// Returns ErrNotFound if the binding doesn't exist.
+	DeleteEntitlementBinding(ctx context.Context, id string) error
+
+	// Usage reservations
+	// CreateUsageReservation creates a new usage reservation.
+	CreateUsageReservation(ctx context.Context, reservation *UsageReservation) (*UsageReservation, error)
+
+	// CountActiveReservations counts non-released reservations for a specific
+	// limit, subject, and scope. Only reservations with released_at IS NULL are counted.
+	CountActiveReservations(ctx context.Context, limitDefinitionID, subjectID, scopeType, scopeID string) (int64, error)
+
+	// ReleaseReservation releases a reservation by setting released_at.
+	// The record is retained for auditing. Matches on limit_definition_id and resource_id.
+	ReleaseReservation(ctx context.Context, limitDefinitionID, resourceID string) error
+
+	// ReleaseReservationsByResource releases all reservations for a given resource ID.
+	ReleaseReservationsByResource(ctx context.Context, resourceID string) error
+
+	// ListActiveReservations returns active (non-released) reservations for a limit and scope.
+	ListActiveReservations(ctx context.Context, limitDefinitionID, scopeType, scopeID string) ([]*UsageReservation, error)
 }
