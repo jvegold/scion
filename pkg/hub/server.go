@@ -779,6 +779,11 @@ type Server struct {
 	// must nil-check before invoking; nil means quota enforcement is disabled.
 	quotaService *QuotaService
 
+	// B3-B6 boundary services — nil-safe; nil means boundary features are disabled.
+	previewService      *PreviewService      // B3 preview engine
+	governanceService   *GovernanceService   // B5 transactional governance
+	capabilitiesService *CapabilitiesService // B6 capabilities computation
+
 	// Per-sender token-bucket limiter for the chat send paths (#1054).
 	// Set once in New and read without the lock; nil-safe.
 	chatSendLimiter *chatSendLimiter
@@ -1281,6 +1286,9 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	auditEmitter := NewStoreDecisionAuditEmitter(s, logging.Subsystem("hub.decision-audit"))
 	srv.authzService.SetDecisionAuditEmitter(auditEmitter)
 
+	// Initialize B3-B6 boundary services (preview, governance, capabilities).
+	srv.initBoundaryServices()
+
 	// Wire the caller-permission checker for agent service-account assignment.
 	//
 	// GCP IAM check mode: read from config, default to "off" (Q1 ruling).
@@ -1353,30 +1361,23 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 			"mode", srv.hookIdentityCheckMode)
 	}
 
-	// Seed default policies and groups (idempotent)
-	seedDefaultPoliciesAndGroups(ctx, s)
+	// PG1: Reconcile built-in role definitions with curated, versioned
+	// permission lists. Roles are created if missing, or updated if the
+	// code revision is higher than the stored revision.
+	// Must run BEFORE seedDefaultGroupsAndBindings so the hub-member role exists.
+	reconcileBuiltInRoles(ctx, s)
 
-	// Backfill the per-project service-account assign policy onto projects
-	// that predate it (idempotent). Projects nobody touches never run
-	// createProjectMembersGroupAndPolicy again, so without this their members
-	// would silently lose assign when the gate moves to ActionAssign.
-	backfillProjectAssignPolicies(ctx, s)
-
-	// Backfill the "message" action into existing project member-create-agents
-	// policies. Projects created before msg-authz (PR #1371) lack this action,
-	// causing non-owner/non-admin members to be denied agent messaging.
-	backfillProjectMessageAction(ctx, s)
-
-	// Seed role definitions for the role-binding authorization model (Phase 1E).
-	// Must run after seedDefaultPoliciesAndGroups so the hub-members group exists.
-	seedRoleDefinitions(ctx, s)
+	// PG1: Seed the hub-members group and a system-scoped RoleBinding of the
+	// hub-member role to that group. This replaces ~13 individual seeded policies
+	// and the hub-member-create-projects policy with a single role binding.
+	seedDefaultGroupsAndBindings(ctx, s)
 
 	// Seed system limit definitions for the quota/limits subsystem (Phase 2B).
 	// Shipped with unlimited defaults (DefaultValue=0) per sponsor decision OQ-2.
 	seedLimitDefinitions(ctx, s)
 
 	// Backfill role bindings from existing User.Role and project group memberships.
-	// Must run after seedRoleDefinitions so the role definitions exist.
+	// Must run after reconcileBuiltInRoles so the role definitions exist.
 	if err := BackfillRoleBindings(ctx, s); err != nil {
 		slog.Warn("failed to backfill role bindings", "error", err)
 	}
@@ -3706,6 +3707,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/auth/validate", s.guarded("/api/v1/auth/validate", s.handleAuthValidate))
 	s.mux.HandleFunc("/api/v1/auth/logout", s.guarded("/api/v1/auth/logout", s.handleAuthLogout))
 	s.mux.HandleFunc("/api/v1/auth/me", s.guarded("/api/v1/auth/me", s.handleAuthMe))
+	s.mux.HandleFunc("/api/v1/auth/admin-status", s.guarded("/api/v1/auth/admin-status", s.handleAuthAdminStatus))
 	s.mux.HandleFunc("/api/v1/auth/tokens", s.guarded("/api/v1/auth/tokens", s.handleTokens))
 	s.mux.HandleFunc("/api/v1/auth/tokens/", s.guarded("/api/v1/auth/tokens/", s.handleTokenByID))
 	s.mux.HandleFunc("/api/v1/auth/scopes", s.guarded("/api/v1/auth/scopes", s.handleAuthScopes))
@@ -3783,7 +3785,7 @@ func (s *Server) registerRoutes() {
 	// Groups and Policies (Hub Permissions System)
 	s.mux.HandleFunc("/api/v1/groups", s.guarded("/api/v1/groups", s.handleGroups))
 	s.mux.HandleFunc("/api/v1/groups/", s.guarded("/api/v1/groups/", s.handleGroupRoutes))
-	// Policy routes: declarative guard enforces hub-admin; handler-local checks remain as defense-in-depth.
+	// CO1: Policy routes return 410 Gone. Authorization uses RoleBindings.
 	s.mux.HandleFunc("/api/v1/policies", s.guarded("/api/v1/policies", s.handlePolicies))
 	s.mux.HandleFunc("/api/v1/policies/", s.guarded("/api/v1/policies/", s.handlePolicyRoutes))
 
@@ -3853,6 +3855,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs/stream", s.guarded("/api/v1/admin/diagnostics/logs/stream", s.handleDiagnosticsLogsStream))
 	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs", s.guarded("/api/v1/admin/diagnostics/logs", s.handleDiagnosticsLogs))
 	s.mux.HandleFunc("/api/v1/admin/health/summary", s.guarded("/api/v1/admin/health/summary", s.handleHealthSummary))
+	s.mux.HandleFunc("/api/v1/admin/messaging/divergence", s.guarded("/api/v1/admin/messaging/divergence", s.handleAdminMessagingDivergence))
 	s.mux.HandleFunc("/api/v1/metrics/", s.guarded("/api/v1/metrics/", s.handleMetricsDashboard))
 	s.mux.HandleFunc("/api/v1/admin/metrics-dashboard", s.guarded("/api/v1/admin/metrics-dashboard", s.handleAdminMetricsDashboard)) // legacy backward-compat
 
@@ -3870,6 +3873,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/role-bindings", s.guarded("/api/v1/admin/role-bindings", s.handleAdminRoleBindings))
 	s.mux.HandleFunc("/api/v1/admin/role-bindings/", s.guarded("/api/v1/admin/role-bindings/", s.handleAdminRoleBindingByID))
 	s.mux.HandleFunc("/api/v1/admin/permissions", s.guarded("/api/v1/admin/permissions", s.handleAdminPermissions))
+	s.mux.HandleFunc("/api/v1/admin/access-constraints", s.guarded("/api/v1/admin/access-constraints", s.handleAdminAccessConstraints))
+	s.mux.HandleFunc("/api/v1/admin/access-constraints/", s.guarded("/api/v1/admin/access-constraints/", s.handleAdminAccessConstraintByID))
+	s.mux.HandleFunc("/api/v1/admin/access-constraint-previews", s.guarded("/api/v1/admin/access-constraint-previews", s.handleAdminAccessConstraintPreviews))
+	s.mux.HandleFunc("/api/v1/admin/access-constraint-previews/", s.guarded("/api/v1/admin/access-constraint-previews/", s.handleAdminAccessConstraintPreviews))
 
 	// Notification endpoints (user-facing)
 	s.mux.HandleFunc("/api/v1/notifications", s.guarded("/api/v1/notifications", s.handleNotifications))
@@ -4446,10 +4453,13 @@ func (s *Server) seedGitHubResolutionCacheSettings(ctx context.Context) error {
 // registered as a standalone plugin, or "" if not configured. Used to
 // conditionally register the Hub-driven sweep scheduler job.
 func (s *Server) getA2ABridgeExternalURL() string {
-	if s.pluginManager == nil {
+	s.mu.RLock()
+	mgr := s.pluginManager
+	s.mu.RUnlock()
+	if mgr == nil {
 		return ""
 	}
-	cfg := s.pluginManager.GetPluginConfig("broker", "a2a-bridge")
+	cfg := mgr.GetPluginConfig("broker", "a2a-bridge")
 	return cfg["external_url"]
 }
 

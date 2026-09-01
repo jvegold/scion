@@ -129,14 +129,11 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Phase 3 msg-authz: Enforce authorizeAgentMessage for user-identity senders.
-	// System/infrastructure senders (not user: or agent:) are system-plane
-	// messages (D8) — scheduled events, internal hub triggers relayed through
-	// broker transport. These bypass mode checks unconditionally; broker HMAC
-	// trust covers the infrastructure transport layer.
-	// Agent-to-agent via broker: documented as a known gap for follow-up — the
-	// broker path for agent-to-agent is less common than the direct API, and
-	// constructing an AgentIdentity from the broker request is non-trivial.
+	// Authorize the sender. Identity is resolved from the sender prefix:
+	// "user:" senders are looked up in the store; all other senders use the
+	// broker identity, whose Type()="broker" does not match any allowed
+	// sender type and is denied.
+	var senderIdentity Identity
 	if strings.HasPrefix(req.Message.Sender, "user:") {
 		senderEmail := strings.TrimPrefix(req.Message.Sender, "user:")
 		senderUser, err := s.store.GetUserByEmail(r.Context(), senderEmail)
@@ -157,26 +154,27 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		// Cache the resolved user ID so downstream DM-ownership and
 		// persistence blocks can reuse it without redundant DB lookups.
 		req.Message.SenderID = senderUser.ID
-
-		userIdent := NewAuthenticatedUser(senderUser.ID, senderUser.Email, senderUser.DisplayName, senderUser.Role, "integration")
-		allowed, reason := s.authorizeAgentMessage(r.Context(), userIdent, agent, false)
-		if !allowed {
-			log.Warn("broker inbound message authorization denied",
-				"sender", req.Message.Sender, "agent_slug", agentSlug, "reason", reason)
-			writeError(w, http.StatusForbidden, ErrCodeMessageDenied,
-				"Message delivery denied", map[string]interface{}{
-					"reason":        mapReasonToCode(reason),
-					"senderMode":    "user",
-					"recipientMode": agent.MessageMode,
-					"sender":        req.Message.Sender,
-					"agent_slug":    agentSlug,
-				})
-			return
-		}
+		senderIdentity = NewAuthenticatedUser(senderUser.ID, senderUser.Email, senderUser.DisplayName, senderUser.Role, "integration")
+	} else {
+		// Non-user senders use the broker identity (non-nil by the HMAC
+		// check above). Its Type()="broker" is not an allowed sender type,
+		// so authorizeAgentMessage denies it.
+		senderIdentity = broker
 	}
-	// else: system-plane (D8) or agent-sender — no authorizeAgentMessage check.
-	// System messages are unconditionally exempt. Agent-to-agent via broker
-	// relies on broker HMAC trust (known gap documented above).
+	allowed, reason := s.authorizeAgentMessage(r.Context(), senderIdentity, agent, false)
+	if !allowed {
+		log.Warn("broker inbound message authorization denied",
+			"sender", req.Message.Sender, "agent_slug", agentSlug, "reason", reason)
+		writeError(w, http.StatusForbidden, ErrCodeMessageDenied,
+			"Message delivery denied", map[string]interface{}{
+				"reason":        mapReasonToCode(reason),
+				"senderMode":    senderIdentity.Type(),
+				"recipientMode": agent.MessageMode,
+				"sender":        req.Message.Sender,
+				"agent_slug":    agentSlug,
+			})
+		return
+	}
 
 	// Ownership check: verify the DM key IDs match the actual participants.
 	// The agent in the DM key must match the resolved agent; the user must
@@ -361,6 +359,16 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		}
 		if convResult != nil {
 			storeMsg.ConversationID = convResult.ConversationID
+			// DEF-41: structural pre-placement. This check is inert
+			// while B10 holds: convResult is non-nil only when
+			// attribution succeeded, and ent.Conversation.ID is a
+			// uuid.UUID that always renders non-empty. It becomes
+			// load-bearing at Tranche G, when derivation failure
+			// becomes fatal and this call moves outside the nil guard.
+			if err := messaging.ValidateAttributed(storeMsg.ConversationID); err != nil {
+				writeError(w, http.StatusBadRequest, ErrCodeValidationError, err.Error(), nil)
+				return
+			}
 		}
 		// Always log divergence — even when convResult is nil, that is a divergence signal.
 		oldRouting := messaging.OldRoutingFromMessage(senderUserID, agent.ID, storeMsg.ThreadID)
@@ -393,15 +401,18 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 	// Record reply-affinity context so that the agent's next untagged reply
 	// can be routed back to the channel the user last spoke from (AC22).
 	// Only record for user-identity senders with a known channel.
-	if s.webChatStore != nil && req.Message.Channel != "" && strings.HasPrefix(req.Message.Sender, "user:") {
+	s.mu.RLock()
+	wcsAffinity := s.webChatStore
+	s.mu.RUnlock()
+	if wcsAffinity != nil && req.Message.Channel != "" && strings.HasPrefix(req.Message.Sender, "user:") {
 		if senderUserID != "" {
-			if err := s.webChatStore.RecordChannel(r.Context(), senderUserID, agent.ProjectID, agent.ID, req.Message.Channel, now); err != nil {
+			if err := wcsAffinity.RecordChannel(r.Context(), senderUserID, agent.ProjectID, agent.ID, req.Message.Channel, now); err != nil {
 				log.Error("Failed to record conversation context for broker inbound",
 					"user_id", senderUserID, "agent_id", agent.ID, "channel", req.Message.Channel, "error", err)
 			}
 			// Update the thread watermark so the Phase 5 thread rail reflects
 			// inbound broker messages (last_activity_at / last_message_id).
-			if err := s.webChatStore.TouchThread(r.Context(), senderUserID, agent.ProjectID, agent.ID, storeMsg.ID, now); err != nil {
+			if err := wcsAffinity.TouchThread(r.Context(), senderUserID, agent.ProjectID, agent.ID, storeMsg.ID, now); err != nil {
 				log.Error("Failed to update thread watermark for broker inbound",
 					"user_id", senderUserID, "agent_id", agent.ID, "error", err)
 			}

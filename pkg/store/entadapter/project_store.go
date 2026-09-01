@@ -108,7 +108,6 @@ func entProjectToStore(p *ent.Project) *store.Project {
 		Updated:     p.Updated,
 		CreatedBy:   p.CreatedBy,
 		OwnerID:     p.OwnerID,
-		Visibility:  p.Visibility,
 	}
 	if p.GitRemote != nil {
 		sp.GitRemote = *p.GitRemote
@@ -153,9 +152,6 @@ func (s *ProjectStore) CreateProject(ctx context.Context, p *store.Project) erro
 		SetCreatedBy(p.CreatedBy).
 		SetOwnerID(p.OwnerID)
 
-	if p.Visibility != "" {
-		create.SetVisibility(p.Visibility)
-	}
 	if p.GitRemote != "" {
 		create.SetGitRemote(p.GitRemote)
 	}
@@ -191,9 +187,6 @@ func (s *ProjectStore) CreateProject(ctx context.Context, p *store.Project) erro
 
 	p.Created = created.Created
 	p.Updated = created.Updated
-	if p.Visibility == "" {
-		p.Visibility = created.Visibility
-	}
 	return nil
 }
 
@@ -295,8 +288,7 @@ func (s *ProjectStore) UpdateProject(ctx context.Context, p *store.Project) erro
 	update := s.client.Project.UpdateOneID(uid).
 		SetName(p.Name).
 		SetSlug(p.Slug).
-		SetOwnerID(p.OwnerID).
-		SetVisibility(p.Visibility)
+		SetOwnerID(p.OwnerID)
 
 	if p.GitRemote != "" {
 		update.SetGitRemote(p.GitRemote)
@@ -394,9 +386,6 @@ func (s *ProjectStore) ListProjects(ctx context.Context, filter store.ProjectFil
 	if filter.ExcludeOwnerID != "" {
 		query.Where(project.OwnerIDNEQ(filter.ExcludeOwnerID))
 	}
-	if filter.Visibility != "" {
-		query.Where(project.VisibilityEQ(filter.Visibility))
-	}
 	if filter.GitRemote != "" {
 		query.Where(project.GitRemoteEQ(filter.GitRemote))
 	} else if filter.GitRemotePrefix != "" {
@@ -431,6 +420,28 @@ func (s *ProjectStore) ListProjects(ctx context.Context, filter store.ProjectFil
 			query.Where(projectLabelContains(store.LabelTemplate, "true"))
 		} else {
 			query.Where(projectLabelNotContains(store.LabelTemplate, "true"))
+		}
+	}
+
+	// AuthorizedProjectIDs: scope-aware authorization filter applied at the SQL
+	// level so pagination and totals reflect only the authorized set.
+	// Fail-closed: if all IDs fail UUID parsing, match nothing rather than
+	// passing an empty set to IDIn (which may produce invalid SQL or no filter).
+	if filter.AuthorizedProjectIDs != nil {
+		if len(filter.AuthorizedProjectIDs) == 0 {
+			// Empty authorized set: no projects visible.
+			query.Where(project.IDEQ(uuid.Nil))
+		} else {
+			ids, err := parseUUIDs(filter.AuthorizedProjectIDs)
+			if err != nil {
+				return nil, err
+			}
+			if len(ids) > 0 {
+				query.Where(project.IDIn(ids...))
+			} else {
+				// All IDs failed UUID parsing: fail closed — no projects visible.
+				query.Where(project.IDEQ(uuid.Nil))
+			}
 		}
 	}
 

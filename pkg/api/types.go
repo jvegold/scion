@@ -842,7 +842,7 @@ func ClassifyEnvKey(classifications map[string]EnvKind, key string) (EnvKind, bo
 type GitCloneConfig struct {
 	URL    string `json:"url"`              // HTTPS clone URL (without credentials)
 	Branch string `json:"branch,omitempty"` // Branch to clone (default: main)
-	Depth  int    `json:"depth,omitempty"`  // Clone depth (default: 1, 0 = full)
+	Depth  *int   `json:"depth,omitempty"`  // Clone depth (nil/omitted = shallow depth 1, 0 = full clone, >0 = that depth)
 }
 
 type gitCloneContextKey struct{}
@@ -1006,7 +1006,7 @@ type StatusEvent struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// Visibility constants for agent and project access control.
+// Visibility constants for resource access control (skills, templates, harness configs).
 const (
 	VisibilityPrivate = "private" // Only the owner can access
 	VisibilityTeam    = "team"    // Team members can access
@@ -1029,9 +1029,8 @@ type ProjectInfo struct {
 	Updated time.Time `json:"updated,omitempty"` // Last modification timestamp
 
 	// Ownership
-	CreatedBy  string `json:"createdBy,omitempty"`  // User/system that created the project
-	OwnerID    string `json:"ownerId,omitempty"`    // Current owner user ID
-	Visibility string `json:"visibility,omitempty"` // Access level: private, team, public
+	CreatedBy string `json:"createdBy,omitempty"` // User/system that created the project
+	OwnerID   string `json:"ownerId,omitempty"`   // Current owner user ID
 
 	// Metadata
 	Labels      map[string]string `json:"labels,omitempty"`

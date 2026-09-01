@@ -82,7 +82,7 @@ func Spec() []TableFixture {
 				"git_remote": "https://github.com/example/platform.git",
 				"labels":     unicodeJSON, "annotations": `{"note":"primary"}`,
 				"created_at": baseTime, "updated_at": baseTime,
-				"owner_id": userID, "visibility": "private",
+				"owner_id": userID,
 			},
 			{ // minimal row: nullable optionals (git_remote, labels, owner...) left NULL
 				"id": "11111111-1111-1111-1111-1111111111aa", "name": "Minimal Project",
@@ -149,6 +149,17 @@ func Spec() []TableFixture {
 			{
 				"id":       "6f000000-0000-0000-0000-000000000002",
 				"group_id": groupID, "agent_id": agentID, "role": "member", "added_at": baseTime,
+			},
+		}},
+		{Table: "access_constraints", Rows: []row{
+			{
+				"id": "ac100000-0000-0000-0000-000000000001", "name": "fixture-max-perms",
+				"subject_kind": "principal", "subject_principal_type": "user",
+				"subject_principal_id": userID,
+				"scope_type":           "system", "scope_id": "",
+				"maximum_permissions": `["agent.read","agent.list"]`,
+				"disabled":            false,
+				"created":             baseTime, "updated": baseTime,
 			},
 		}},
 		{Table: "access_policies", Rows: []row{

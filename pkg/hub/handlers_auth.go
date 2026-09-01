@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -604,6 +605,70 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 		Email:       user.Email(),
 		DisplayName: user.DisplayName(),
 		Role:        user.Role(),
+	})
+}
+
+// AdminStatusResponse is the response for GET /api/v1/auth/admin-status.
+type AdminStatusResponse struct {
+	IsAdmin      bool     `json:"isAdmin"`
+	IsSuperAdmin bool     `json:"isSuperAdmin"`
+	Permissions  []string `json:"permissions"`
+}
+
+// handleAuthAdminStatus handles GET /api/v1/auth/admin-status.
+// Returns whether the current user has hub-admin or super-admin capabilities,
+// along with their effective system-scoped permission IDs.
+// This is used by the frontend to decide whether to show admin navigation,
+// which admin sections are visible, and to allow access to admin routes.
+func (s *Server) handleAuthAdminStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		MethodNotAllowed(w)
+		return
+	}
+
+	user := GetUserIdentityFromContext(r.Context())
+	if user == nil {
+		Unauthorized(w)
+		return
+	}
+
+	isSuperAdmin := IsUnscopedLocalPlatformAdmin(user)
+
+	var perms []string
+	if isSuperAdmin {
+		// Super-admin has all permissions — populate from registry so the
+		// frontend shows all UI elements without a separate code path.
+		perms = allPermissionIDs()
+	} else if s.authzService != nil {
+		// Resolve effective permissions from all system-scoped role bindings
+		// for this user. This handles both the built-in hub-admin role and
+		// any custom roles with partial permissions.
+		effective, err := s.authzService.getEffectivePermissions(
+			r.Context(),
+			store.RoleBindingPrincipalUser, user.ID(),
+			store.RoleScopeSystem, "",
+		)
+		if err != nil {
+			slog.Error("failed to resolve effective permissions for admin-status",
+				"user_id", user.ID(), "error", err)
+			InternalError(w)
+			return
+		}
+		perms = effective
+	}
+
+	// Ensure JSON serializes as [] rather than null when there are no permissions.
+	if perms == nil {
+		perms = []string{}
+	} else {
+		sort.Strings(perms)
+	}
+
+	writeJSON(w, http.StatusOK, AdminStatusResponse{
+		IsAdmin:      isSuperAdmin || len(perms) > 0,
+		IsSuperAdmin: isSuperAdmin,
+		Permissions:  perms,
 	})
 }
 
@@ -1621,13 +1686,20 @@ func (s *Server) handleAuthScopes(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	manageScopes := permissions.UATManageScopes()
-	aliases := []AuthScopeAlias{
-		{
-			ID:          permissions.UATScopeAgentManage,
-			Description: "All agent management operations",
-			ExpandsTo:   manageScopes,
-		},
+	// Build aliases dynamically from the manage alias registry.
+	aliasKeys := make([]string, 0, len(permissions.UATManageAliases))
+	for alias := range permissions.UATManageAliases {
+		aliasKeys = append(aliasKeys, alias)
+	}
+	sort.Strings(aliasKeys)
+	aliases := make([]AuthScopeAlias, 0, len(aliasKeys))
+	for _, alias := range aliasKeys {
+		resource := permissions.UATManageAliases[alias]
+		aliases = append(aliases, AuthScopeAlias{
+			ID:          alias,
+			Description: fmt.Sprintf("All %s management operations", resource),
+			ExpandsTo:   permissions.UATManageScopesFor(resource),
+		})
 	}
 
 	writeJSON(w, http.StatusOK, AuthScopesResponse{

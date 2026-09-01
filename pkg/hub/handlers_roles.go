@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -46,11 +47,13 @@ type updateRoleDefinitionRequest struct {
 
 // createRoleBindingRequest is the payload for POST /api/v1/admin/role-bindings.
 type createRoleBindingRequest struct {
-	RoleDefinitionID string `json:"roleDefinitionId"`
-	PrincipalType    string `json:"principalType"`
-	PrincipalID      string `json:"principalId"`
-	ScopeType        string `json:"scopeType"`
-	ScopeID          string `json:"scopeId"`
+	RoleDefinitionID string     `json:"roleDefinitionId"`
+	PrincipalType    string     `json:"principalType"`
+	PrincipalID      string     `json:"principalId"`
+	ScopeType        string     `json:"scopeType"`
+	ScopeID          string     `json:"scopeId"`
+	NotBefore        *time.Time `json:"notBefore,omitempty"`
+	ExpiresAt        *time.Time `json:"expiresAt,omitempty"`
 }
 
 // listRoleDefinitionsResponse wraps the list result for the API.
@@ -59,10 +62,18 @@ type listRoleDefinitionsResponse struct {
 	TotalCount int                     `json:"totalCount"`
 }
 
+// RoleBindingInfo is a role binding enriched with human-friendly display info.
+type RoleBindingInfo struct {
+	store.RoleBinding
+	PrincipalDisplayName string `json:"principalDisplayName,omitempty"`
+	ScopeDisplayName     string `json:"scopeDisplayName,omitempty"`
+	CreatedByDisplayName string `json:"createdByDisplayName,omitempty"`
+}
+
 // listRoleBindingsResponse wraps the list result for the API.
 type listRoleBindingsResponse struct {
-	Items      []*store.RoleBinding `json:"items"`
-	TotalCount int                  `json:"totalCount"`
+	Items      []RoleBindingInfo `json:"items"`
+	TotalCount int               `json:"totalCount"`
 }
 
 // listPermissionsResponse wraps the permissions registry for the API.
@@ -401,9 +412,10 @@ func (s *Server) deleteRoleDefinition(w http.ResponseWriter, r *http.Request, id
 // ---------------------------------------------------------------------------
 
 func (s *Server) listRoleBindings(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	limit, offset := parsePaginationParams(r)
 
-	bindings, err := s.store.ListAllRoleBindings(r.Context(), limit, offset)
+	bindings, err := s.store.ListAllRoleBindings(ctx, limit, offset)
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
@@ -412,14 +424,33 @@ func (s *Server) listRoleBindings(w http.ResponseWriter, r *http.Request) {
 		bindings = []*store.RoleBinding{}
 	}
 
-	total, err := s.store.CountAllRoleBindings(r.Context())
+	total, err := s.store.CountAllRoleBindings(ctx)
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
 	}
 
+	// Enrich bindings with human-friendly display names.
+	enriched := make([]RoleBindingInfo, 0, len(bindings))
+	for i, b := range bindings {
+		if b == nil {
+			slog.Warn("nil role binding in list result, skipping", "index", i)
+			continue
+		}
+		info := RoleBindingInfo{RoleBinding: *b}
+		info.PrincipalDisplayName = s.resolveGroupMemberDisplayName(ctx, b.PrincipalType, b.PrincipalID)
+		info.CreatedByDisplayName = s.resolveGroupMemberDisplayName(ctx, store.GroupMemberTypeUser, b.CreatedBy)
+		if b.ScopeType == store.RoleScopeProject && b.ScopeID != "" {
+			project, err := s.store.GetProject(ctx, b.ScopeID)
+			if err == nil && project != nil {
+				info.ScopeDisplayName = project.Name
+			}
+		}
+		enriched = append(enriched, info)
+	}
+
 	writeJSON(w, http.StatusOK, listRoleBindingsResponse{
-		Items:      bindings,
+		Items:      enriched,
 		TotalCount: total,
 	})
 }
@@ -455,20 +486,72 @@ func (s *Server) createRoleBinding(w http.ResponseWriter, r *http.Request, user 
 		BadRequest(w, "principalType is required")
 		return
 	}
-	if req.PrincipalType != store.RoleBindingPrincipalUser && req.PrincipalType != store.RoleBindingPrincipalAgent {
-		BadRequest(w, "principalType must be \"user\" or \"agent\"")
+	if req.PrincipalType != store.RoleBindingPrincipalUser && req.PrincipalType != store.RoleBindingPrincipalAgent && req.PrincipalType != store.RoleBindingPrincipalGroup {
+		BadRequest(w, "principalType must be \"user\", \"agent\", or \"group\"")
 		return
 	}
 	if req.PrincipalID == "" {
 		BadRequest(w, "principalId is required")
 		return
 	}
+
+	// Resolve email to UUID for user principals (mirrors addGroupMember pattern).
+	if req.PrincipalType == store.RoleBindingPrincipalUser && strings.Contains(req.PrincipalID, "@") {
+		resolvedUser, err := s.store.GetUserByEmail(r.Context(), req.PrincipalID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				BadRequest(w, "user not found with email: "+req.PrincipalID)
+				return
+			}
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		if resolvedUser == nil {
+			BadRequest(w, "user not found with email: "+req.PrincipalID)
+			return
+		}
+		req.PrincipalID = resolvedUser.ID
+	}
+
+	// Verify group exists for group principals.
+	// Try UUID first, fall back to slug lookup (mirrors email→UUID for users).
+	if req.PrincipalType == store.RoleBindingPrincipalGroup {
+		g, err := s.store.GetGroup(r.Context(), req.PrincipalID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				g, err = s.store.GetGroupBySlug(r.Context(), req.PrincipalID)
+				if err != nil {
+					if errors.Is(err, store.ErrNotFound) {
+						BadRequest(w, "group not found: "+req.PrincipalID)
+					} else {
+						writeErrorFromErr(w, err, "")
+					}
+					return
+				}
+			} else {
+				writeErrorFromErr(w, err, "")
+				return
+			}
+		}
+		req.PrincipalID = g.ID
+	}
+
 	if req.ScopeType != store.RoleScopeSystem && req.ScopeType != store.RoleScopeProject {
 		BadRequest(w, "scopeType must be \"system\" or \"project\"")
 		return
 	}
 	if req.ScopeType == store.RoleScopeProject && req.ScopeID == "" {
 		BadRequest(w, "scope_id is required when scope_type is 'project'")
+		return
+	}
+
+	// Validate lifecycle fields.
+	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
+		BadRequest(w, "expiresAt must be in the future")
+		return
+	}
+	if req.NotBefore != nil && req.ExpiresAt != nil && !req.ExpiresAt.After(*req.NotBefore) {
+		BadRequest(w, "expiresAt must be after notBefore")
 		return
 	}
 
@@ -493,6 +576,8 @@ func (s *Server) createRoleBinding(w http.ResponseWriter, r *http.Request, user 
 		PrincipalID:      req.PrincipalID,
 		ScopeType:        req.ScopeType,
 		ScopeID:          req.ScopeID,
+		NotBefore:        req.NotBefore,
+		ExpiresAt:        req.ExpiresAt,
 		CreatedBy:        user.ID(),
 	}
 
@@ -522,8 +607,10 @@ func (s *Server) createRoleBinding(w http.ResponseWriter, r *http.Request, user 
 }
 
 func (s *Server) deleteRoleBinding(w http.ResponseWriter, r *http.Request, id string, user UserIdentity) {
+	ctx := r.Context()
+
 	// Verify the binding exists before deleting.
-	_, err := s.store.GetRoleBinding(r.Context(), id)
+	binding, err := s.store.GetRoleBinding(ctx, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			NotFound(w, "Role Binding")
@@ -533,7 +620,38 @@ func (s *Server) deleteRoleBinding(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
-	if err := s.store.DeleteRoleBinding(r.Context(), id); err != nil {
+	// PM1: last-owner protection — cannot delete the last direct-user
+	// project-owner binding. Every project must retain at least one.
+	//
+	// Known limitation (O2): The count-then-delete sequence is not
+	// transactional, so two concurrent deletions of different owner bindings
+	// could both pass the check and leave the project with zero owners.
+	// Risk is low (requires simultaneous admin operations on the same
+	// project) and is mitigated by the offline recovery command (RC1)
+	// which can detect and repair orphaned projects. This matches the
+	// AC1 TOCTOU pattern accepted elsewhere in the authorization layer.
+	if binding.ScopeType == store.RoleScopeProject && binding.PrincipalType == store.RoleBindingPrincipalUser {
+		roleDef, rdErr := s.store.GetRoleDefinitionByName(ctx, store.ProjectRoleOwner, store.RoleScopeProject)
+		if rdErr != nil {
+			slog.Error("last-owner check: failed to look up project-owner role definition", "error", rdErr)
+			writeErrorFromErr(w, rdErr, "")
+			return
+		}
+		if binding.RoleDefinitionID == roleDef.ID {
+			ownerCount, countErr := s.countDirectOwnerBindings(ctx, binding.ScopeID)
+			if countErr != nil {
+				writeErrorFromErr(w, countErr, "")
+				return
+			}
+			if ownerCount <= 1 {
+				writeError(w, http.StatusConflict, "LAST_OWNER",
+					"Cannot remove the last project owner — every project must retain at least one direct user owner", nil)
+				return
+			}
+		}
+	}
+
+	if err := s.store.DeleteRoleBinding(ctx, id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			NotFound(w, "Role Binding")
 			return
@@ -549,7 +667,8 @@ func (s *Server) deleteRoleBinding(w http.ResponseWriter, r *http.Request, id st
 }
 
 func (s *Server) listBindingsForUser(w http.ResponseWriter, r *http.Request, userID string) {
-	bindings, err := s.store.ListRoleBindingsForPrincipal(r.Context(), store.RoleBindingPrincipalUser, userID)
+	ctx := r.Context()
+	bindings, err := s.store.ListRoleBindingsForPrincipal(ctx, store.RoleBindingPrincipalUser, userID)
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
@@ -557,9 +676,29 @@ func (s *Server) listBindingsForUser(w http.ResponseWriter, r *http.Request, use
 	if bindings == nil {
 		bindings = []*store.RoleBinding{}
 	}
+
+	// Enrich bindings with human-friendly display names.
+	enriched := make([]RoleBindingInfo, 0, len(bindings))
+	for i, b := range bindings {
+		if b == nil {
+			slog.Warn("nil role binding in list result, skipping", "index", i)
+			continue
+		}
+		info := RoleBindingInfo{RoleBinding: *b}
+		info.PrincipalDisplayName = s.resolveGroupMemberDisplayName(ctx, b.PrincipalType, b.PrincipalID)
+		info.CreatedByDisplayName = s.resolveGroupMemberDisplayName(ctx, store.GroupMemberTypeUser, b.CreatedBy)
+		if b.ScopeType == store.RoleScopeProject && b.ScopeID != "" {
+			project, err := s.store.GetProject(ctx, b.ScopeID)
+			if err == nil && project != nil {
+				info.ScopeDisplayName = project.Name
+			}
+		}
+		enriched = append(enriched, info)
+	}
+
 	writeJSON(w, http.StatusOK, listRoleBindingsResponse{
-		Items:      bindings,
-		TotalCount: len(bindings),
+		Items:      enriched,
+		TotalCount: len(enriched),
 	})
 }
 

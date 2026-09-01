@@ -173,21 +173,15 @@ func TestScopedAdmin_HubAdminDeniedMaintenanceOperations(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, rec.Code, "hub-admin should be denied maintenance operations")
 }
 
-func TestScopedAdmin_HubAdminAccessesDiagnosticsLogsViaReadAllPolicy(t *testing.T) {
+func TestScopedAdmin_HubAdminDeniedDiagnosticsLogs(t *testing.T) {
 	srv, _, hubAdmin, _ := setupScopedAdminTest(t)
 
 	// GET /api/v1/admin/diagnostics/logs — permission: hub.diagnostics.read (NOT in hub-admin role)
-	// NOTE: The route guard action is "read" and the hub-member-read-all seeded policy
-	// grants read+list on * to all hub members. This means diagnostics/logs (action=read)
-	// is accessible via policy evaluation even though it is not in the hub-admin role.
-	// The test documents the actual behavior.
-	//
-	// When Cloud Logging is not configured (no GCP project ID), the handler
-	// returns 501 after passing authorization. Both 200 and 501 confirm the
-	// request was authorized; 403 would mean it was denied.
+	// CO1: The AK1 kernel only evaluates role bindings. The hub-admin role does
+	// not include hub.diagnostics.read, so this endpoint is correctly denied.
 	rec := doRequestAsUser(t, srv, hubAdmin, http.MethodGet, "/api/v1/admin/diagnostics/logs", nil)
-	assert.Contains(t, []int{http.StatusOK, http.StatusNotImplemented}, rec.Code,
-		"hub-admin should pass authorization for diagnostics/logs (200 when Cloud Logging is configured, 501 when not); got: %s", rec.Body.String())
+	assert.Equal(t, http.StatusForbidden, rec.Code,
+		"hub-admin should be denied diagnostics/logs (hub.diagnostics.read not in hub-admin role)")
 }
 
 func TestScopedAdmin_HubAdminDeniedAdminModeToggle(t *testing.T) {
@@ -207,36 +201,30 @@ func TestScopedAdmin_HubAdminDeniedAuthReset(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, rec.Code, "hub-admin should be denied auth reset")
 }
 
-func TestScopedAdmin_HubAdminAccessesPolicyListViaReadAllPolicy(t *testing.T) {
+func TestScopedAdmin_HubAdminPolicyAPIReturnsGone(t *testing.T) {
 	srv, _, hubAdmin, _ := setupScopedAdminTest(t)
 
-	// GET /api/v1/policies — RouteHubAdmin, permission: policy.read (NOT in hub-admin role)
-	// NOTE: The route guard action is "read" and the hub-member-read-all seeded policy
-	// grants read+list on * to all hub members. Policy listing (action=read) is therefore
-	// accessible via policy evaluation. Policy CREATION (action=create via handler-level
-	// CanDelegate with GrantTypePolicy) remains super-admin-only.
+	// CO1: The Policy API is removed. All callers receive 410 Gone.
 	rec := doRequestAsUser(t, srv, hubAdmin, http.MethodGet, "/api/v1/policies", nil)
-	assert.Equal(t, http.StatusOK, rec.Code,
-		"hub-admin should access policy listing via hub-member-read-all policy (action=read)")
+	assert.Equal(t, http.StatusGone, rec.Code,
+		"policy list should return 410 Gone under CO1")
 }
 
 func TestScopedAdmin_HubAdminDeniedPolicyCreate(t *testing.T) {
 	srv, _, hubAdmin, _ := setupScopedAdminTest(t)
 
-	// POST /api/v1/policies — The route guard passes (metadata action=read matches
-	// hub-member-read-all policy). The handler enforces policy.create permission
-	// via its own Decide call (handlers_policies.go), which denies non-super-admins.
+	// CO1: The Policy API is removed. All callers receive 410 Gone.
 	rec := doRequestAsUser(t, srv, hubAdmin, http.MethodPost, "/api/v1/policies", map[string]interface{}{
 		"name":        "test-policy",
 		"description": "test",
 		"rules":       []interface{}{},
 	})
-	assert.Equal(t, http.StatusForbidden, rec.Code, "hub-admin should be denied policy create")
+	assert.Equal(t, http.StatusGone, rec.Code, "policy create should return 410 Gone under CO1")
 }
 
 // Verify that a regular member (no role binding) is denied admin endpoints
-// whose actions are NOT covered by the hub-member-read-all policy (read/list).
-// Endpoints with action=read are accessible to all hub members via that policy.
+// whose actions are NOT covered by per-type hub-member-read policies (read/list).
+// Endpoints with action=read are accessible to all hub members via those policies.
 
 func TestScopedAdmin_RegularMemberDeniedWriteAdminEndpoints(t *testing.T) {
 	srv, _, _, member := setupScopedAdminTest(t)
@@ -263,30 +251,49 @@ func TestScopedAdmin_RegularMemberDeniedWriteAdminEndpoints(t *testing.T) {
 }
 
 // Verify that read-action admin endpoints ARE accessible to regular hub members
-// via the hub-member-read-all seeded policy (read+list on * resource type).
+// via the per-type hub-member-read-* policies seeded policy (read+list on each resource type).
 
 func TestScopedAdmin_RegularMemberAllowedReadAdminEndpoints(t *testing.T) {
 	srv, _, _, member := setupScopedAdminTest(t)
 
-	// Endpoints where action=read — hub-member-read-all policy grants these.
-	tests := []struct {
-		name string
-		path string
-	}{
-		{"roles", "/api/v1/admin/roles"},
-		{"role-bindings", "/api/v1/admin/role-bindings"},
-		{"server-config", "/api/v1/admin/server-config"},
-		{"health-summary", "/api/v1/admin/health/summary"},
-		{"permissions", "/api/v1/admin/permissions"},
-	}
+	// CO1: Hub members access admin endpoints only through role bindings.
+	// The hub-member role includes role.read and role_binding.read but NOT
+	// hub.config.read or hub.health.read.
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			rec := doRequestAsUser(t, srv, member, http.MethodGet, tt.path, nil)
-			assert.Equal(t, http.StatusOK, rec.Code,
-				"hub member should access %s via hub-member-read-all policy (action=read)", tt.path)
-		})
-	}
+	t.Run("allowed_via_hub_member_role", func(t *testing.T) {
+		// Endpoints whose permissions are in the hub-member role.
+		for _, tt := range []struct {
+			name string
+			path string
+		}{
+			{"roles", "/api/v1/admin/roles"},
+			{"role-bindings", "/api/v1/admin/role-bindings"},
+			{"permissions", "/api/v1/admin/permissions"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				rec := doRequestAsUser(t, srv, member, http.MethodGet, tt.path, nil)
+				assert.Equal(t, http.StatusOK, rec.Code,
+					"hub member should access %s via hub-member role binding", tt.path)
+			})
+		}
+	})
+
+	t.Run("denied_without_hub_admin_role", func(t *testing.T) {
+		// Endpoints whose permissions are NOT in the hub-member role.
+		for _, tt := range []struct {
+			name string
+			path string
+		}{
+			{"server-config", "/api/v1/admin/server-config"},
+			{"health-summary", "/api/v1/admin/health/summary"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				rec := doRequestAsUser(t, srv, member, http.MethodGet, tt.path, nil)
+				assert.Equal(t, http.StatusForbidden, rec.Code,
+					"hub member should be denied %s (requires hub-admin role)", tt.path)
+			})
+		}
+	})
 }
 
 // ==========================================================================
@@ -338,7 +345,7 @@ func setupProjectScopedAdminTest(t *testing.T) (*Server, store.Store, *store.Use
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, projectX))
-	srv.createProjectMembersGroupAndPolicy(ctx, projectX)
+	srv.createProjectMembersGroup(ctx, projectX)
 
 	// Create project Y (unbound project)
 	projectY := &store.Project{
@@ -351,7 +358,7 @@ func setupProjectScopedAdminTest(t *testing.T) (*Server, store.Store, *store.Use
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, projectY))
-	srv.createProjectMembersGroupAndPolicy(ctx, projectY)
+	srv.createProjectMembersGroup(ctx, projectY)
 
 	// Create project-admin role binding for projectAdmin in project X only
 	projectAdminRoleDef, err := s.GetRoleDefinitionByName(ctx, store.ProjectRoleAdmin, store.RoleScopeProject)
@@ -396,7 +403,7 @@ func TestScopedAdmin_ProjectAdminDeniedHubLevelWriteOperations(t *testing.T) {
 	srv, _, projectAdmin, _, _ := setupProjectScopedAdminTest(t)
 
 	// A project-scoped admin should NOT be able to perform hub-level write operations.
-	// Read-action endpoints are accessible to all hub members via hub-member-read-all policy,
+	// Read-action endpoints are accessible to all hub members via per-type hub-member-read-* policies policy,
 	// but write/execute/update operations require specific permissions the project-admin lacks.
 	tests := []struct {
 		name   string
@@ -421,25 +428,42 @@ func TestScopedAdmin_ProjectAdminDeniedHubLevelWriteOperations(t *testing.T) {
 func TestScopedAdmin_ProjectAdminAllowedHubReadOperations(t *testing.T) {
 	srv, _, projectAdmin, _, _ := setupProjectScopedAdminTest(t)
 
-	// Project-scoped admin is also a hub member, so the hub-member-read-all
-	// policy grants read access to hub-level admin endpoints.
-	tests := []struct {
-		name string
-		path string
-	}{
-		{"server-config (action=read)", "/api/v1/admin/server-config"},
-		{"roles (action=read)", "/api/v1/admin/roles"},
-		{"health-summary (action=read)", "/api/v1/admin/health/summary"},
-		{"role-bindings (action=read)", "/api/v1/admin/role-bindings"},
-	}
+	// CO1: Project-scoped admin is also a hub member. The hub-member role
+	// includes role.read and role_binding.read but NOT hub.config.read or
+	// hub.health.read. Only endpoints whose permissions are in the hub-member
+	// role are accessible.
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			rec := doRequestAsUser(t, srv, projectAdmin, http.MethodGet, tt.path, nil)
-			assert.Equal(t, http.StatusOK, rec.Code,
-				"project admin (hub member) should access %s via hub-member-read-all policy", tt.path)
-		})
-	}
+	t.Run("allowed_via_hub_member_role", func(t *testing.T) {
+		for _, tt := range []struct {
+			name string
+			path string
+		}{
+			{"roles (action=read)", "/api/v1/admin/roles"},
+			{"role-bindings (action=read)", "/api/v1/admin/role-bindings"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				rec := doRequestAsUser(t, srv, projectAdmin, http.MethodGet, tt.path, nil)
+				assert.Equal(t, http.StatusOK, rec.Code,
+					"project admin (hub member) should access %s via hub-member role binding", tt.path)
+			})
+		}
+	})
+
+	t.Run("denied_without_hub_admin_role", func(t *testing.T) {
+		for _, tt := range []struct {
+			name string
+			path string
+		}{
+			{"server-config (action=read)", "/api/v1/admin/server-config"},
+			{"health-summary (action=read)", "/api/v1/admin/health/summary"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				rec := doRequestAsUser(t, srv, projectAdmin, http.MethodGet, tt.path, nil)
+				assert.Equal(t, http.StatusForbidden, rec.Code,
+					"project admin should be denied %s (requires hub-admin role)", tt.path)
+			})
+		}
+	})
 }
 
 // ==========================================================================
@@ -538,7 +562,7 @@ func TestScopedAdmin_HubAdminCanCreateProjectScopedBinding(t *testing.T) {
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroupAndPolicy(ctx, project)
+	srv.createProjectMembersGroup(ctx, project)
 
 	// Look up project-admin role definition
 	projectAdminDef, err := s.GetRoleDefinitionByName(ctx, store.ProjectRoleAdmin, store.RoleScopeProject)
@@ -579,7 +603,7 @@ func TestScopedAdmin_CombinedHubAndProjectRoles(t *testing.T) {
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroupAndPolicy(ctx, project)
+	srv.createProjectMembersGroup(ctx, project)
 
 	// Hub-admin should still access hub-level endpoints
 	rec := doRequestAsUser(t, srv, hubAdmin, http.MethodGet, "/api/v1/admin/roles", nil)
@@ -629,18 +653,19 @@ func TestScopedAdmin_CustomNarrowRole(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Read-action admin endpoints are accessible to all hub members via
-	// hub-member-read-all policy, regardless of role bindings.
+	// CO1: Admin endpoints are accessible only through role bindings.
+	// hub.config.read is NOT in the hub-member role, so server-config is denied.
 	rec := doRequestAsUser(t, srv, narrowUser, http.MethodGet, "/api/v1/admin/server-config", nil)
-	assert.Equal(t, http.StatusOK, rec.Code,
-		"narrow-role user (hub member) should access server config via hub-member-read-all")
+	assert.Equal(t, http.StatusForbidden, rec.Code,
+		"narrow-role user should be denied server-config (hub.config.read not in hub-member role)")
 
+	// role.read IS in the hub-member role, so roles endpoint is allowed.
 	rec = doRequestAsUser(t, srv, narrowUser, http.MethodGet, "/api/v1/admin/roles", nil)
 	assert.Equal(t, http.StatusOK, rec.Code,
-		"narrow-role user (hub member) should access roles via hub-member-read-all")
+		"narrow-role user (hub member) should access roles via hub-member role binding")
 
 	// But non-read-action admin endpoints should be denied — the narrow role
-	// doesn't include the required permissions, and hub-member-read-all
+	// doesn't include the required permissions, and per-type hub-member-read-* policies
 	// only covers read+list.
 	rec = doRequestAsUser(t, srv, narrowUser, http.MethodGet, "/api/v1/skill-registries", nil)
 	assert.Equal(t, http.StatusForbidden, rec.Code,
@@ -672,26 +697,22 @@ func TestScopedAdmin_CustomNarrowRole(t *testing.T) {
 func TestScopedAdmin_HubAdminDeniedPolicyAuthoring(t *testing.T) {
 	srv, _, hubAdmin, _ := setupScopedAdminTest(t)
 
-	t.Run("policy_list_allowed_via_read_all", func(t *testing.T) {
-		// GET /api/v1/policies — action=read passes via hub-member-read-all policy.
-		// Policy listing is safe to expose to hub members; it is the create/update/delete
-		// operations that remain super-admin-only (enforced by CanDelegate GrantTypePolicy).
+	// CO1: The Policy API is removed. All callers receive 410 Gone.
+
+	t.Run("policy_list_returns_gone", func(t *testing.T) {
 		rec := doRequestAsUser(t, srv, hubAdmin, http.MethodGet, "/api/v1/policies", nil)
-		assert.Equal(t, http.StatusOK, rec.Code,
-			"hub-admin should access policy listing via hub-member-read-all (action=read)")
+		assert.Equal(t, http.StatusGone, rec.Code,
+			"policy list should return 410 Gone under CO1")
 	})
 
-	t.Run("policy_create_denied", func(t *testing.T) {
-		// POST /api/v1/policies — the route guard passes (action=read from metadata),
-		// but the handler itself enforces super-admin-only policy creation via a
-		// Decide check for policy.create permission, which is not in the hub-admin role.
+	t.Run("policy_create_returns_gone", func(t *testing.T) {
 		rec := doRequestAsUser(t, srv, hubAdmin, http.MethodPost, "/api/v1/policies", map[string]interface{}{
 			"name":        "escalation-policy",
 			"description": "should be denied",
 			"rules":       []interface{}{},
 		})
-		assert.Equal(t, http.StatusForbidden, rec.Code,
-			"hub-admin should be denied policy create")
+		assert.Equal(t, http.StatusGone, rec.Code,
+			"policy create should return 410 Gone under CO1")
 	})
 }
 
@@ -704,9 +725,9 @@ func TestScopedAdmin_HubAdminDeniedPolicyAuthoring(t *testing.T) {
 
 func TestScopedAdmin_SuperAdminBypassPreserved(t *testing.T) {
 	srv, s := testServer(t)
-	ctx := context.Background()
 
-	// Create a super-admin user
+	// CO1: Create a super-admin user with a role binding. The AK1 kernel
+	// requires role bindings — the User.Role field alone is not sufficient.
 	superAdmin := &store.User{
 		ID:          tid("user-super-admin-test"),
 		Email:       "superadmin@test.com",
@@ -715,9 +736,11 @@ func TestScopedAdmin_SuperAdminBypassPreserved(t *testing.T) {
 		Status:      "active",
 		Created:     time.Now(),
 	}
-	require.NoError(t, s.CreateUser(ctx, superAdmin))
+	createTestUserWithRole(t, s, superAdmin.ID, superAdmin.Email,
+		store.UserRoleAdmin, store.SystemRoleSuperAdmin)
 
-	// Super-admin should access everything including super-admin-only endpoints
+	// Super-admin should access everything including super-admin-only endpoints.
+	// Note: /api/v1/policies returns 410 Gone under CO1 (API removed).
 	tests := []struct {
 		name   string
 		method string
@@ -728,7 +751,6 @@ func TestScopedAdmin_SuperAdminBypassPreserved(t *testing.T) {
 		{"health-summary", http.MethodGet, "/api/v1/admin/health/summary"},
 		{"maintenance", http.MethodGet, "/api/v1/admin/maintenance"},
 		{"diagnostics", http.MethodGet, "/api/v1/admin/diagnostics/logs"},
-		{"policies", http.MethodGet, "/api/v1/policies"},
 	}
 
 	for _, tt := range tests {
@@ -742,6 +764,13 @@ func TestScopedAdmin_SuperAdminBypassPreserved(t *testing.T) {
 				"super-admin should NOT be unauthorized for %s", tt.path)
 		})
 	}
+
+	// CO1: Policy API returns 410 Gone for all callers.
+	t.Run("policies", func(t *testing.T) {
+		rec := doRequestAsUser(t, srv, superAdmin, http.MethodGet, "/api/v1/policies", nil)
+		assert.Equal(t, http.StatusGone, rec.Code,
+			"policy API should return 410 Gone under CO1")
+	})
 }
 
 // ==========================================================================
@@ -769,7 +798,7 @@ func TestScopedAdmin_CanDelegateMixedPermissions(t *testing.T) {
 
 	t.Run("one_unheld_permission_denied", func(t *testing.T) {
 		// Mix of held + unheld: user.read (held) + hub.admin_mode.update (not held,
-		// and action=update is NOT granted by the hub-member-read-all policy).
+		// and action=update is NOT granted by the per-type hub-member-read-* policies policy).
 		rec := doRequestAsUser(t, srv, hubAdmin, http.MethodPost, "/api/v1/admin/roles", createRoleDefinitionRequest{
 			Name:        "mixed-perm-denied",
 			Description: "Mix of held and unheld permissions",

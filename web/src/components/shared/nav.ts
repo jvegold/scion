@@ -25,6 +25,11 @@ import { customElement, property, state } from 'lit/decorators.js';
 
 import type { User } from '../../shared/types.js';
 import { apiFetch } from '../../client/api.js';
+import {
+  type AdminStatus,
+  hasAnyPermission,
+  NAV_PERMISSION_MAP,
+} from '../../lib/admin-permissions.js';
 
 interface NavItem {
   path: string;
@@ -71,6 +76,7 @@ const ADMIN_SCOPEABLE_ITEMS: NavItem[] = [
   { path: '/admin/groups', label: 'Groups', icon: 'diagram-3' },
   { path: '/admin/roles', label: 'Roles', icon: 'shield-lock' },
   { path: '/admin/role-bindings', label: 'Role Bindings', icon: 'link-45deg' },
+  { path: '/admin/access-boundaries', label: 'Access Boundaries', icon: 'shield-check' },
   { path: '/admin/quotas', label: 'Quotas', icon: 'speedometer2' },
   { path: '/health', label: 'Health', icon: 'heart-pulse' },
   { path: '/admin/skill-registries', label: 'Skill Registries', icon: 'cloud-arrow-down' },
@@ -112,12 +118,12 @@ export class ScionNav extends LitElement {
   hideCollapse = false;
 
   /**
-   * Whether the current user has admin capabilities (hub-admin or super-admin).
-   * Detected by probing an admin endpoint — the backend enforces access control,
-   * so showing the nav is purely a UX convenience.
+   * The current user's admin status including per-resource permissions.
+   * null when the user is not an admin or status has not been checked yet.
+   * The nav uses this to show only the admin items the user has permissions for.
    */
   @state()
-  private hasAdminCapabilities = false;
+  private adminStatus: AdminStatus | null = null;
 
   /** Tracks the user ID for which admin capabilities were last checked. */
   private adminCheckUserId: string | null = null;
@@ -129,13 +135,13 @@ export class ScionNav extends LitElement {
   }
 
   /**
-   * Detect whether the current user has admin capabilities by probing
-   * the admin roles endpoint. A 200 response indicates admin access
-   * (the route guard passes); any other status means no admin access.
+   * Detect whether the current user has admin capabilities by calling
+   * the dedicated admin-status endpoint, which returns explicit boolean
+   * flags for hub-admin and super-admin status plus a permissions array.
    *
    * Super-admin users are detected directly via `user.role === 'admin'`
-   * and skip this probe. For hub-admin users (who have admin role bindings
-   * but not the super-admin role), the probe determines nav visibility.
+   * and skip the API call. For hub-admin and custom-role users, the
+   * endpoint determines which nav items are visible.
    */
   private async checkAdminCapabilities(): Promise<void> {
     const userId = this.user?.id ?? null;
@@ -144,29 +150,43 @@ export class ScionNav extends LitElement {
     if (userId === this.adminCheckUserId) return;
     this.adminCheckUserId = userId;
 
-    // Super-admins always have admin capabilities
+    // Super-admins always have admin capabilities — create an AdminStatus
+    // with isSuperAdmin: true so hasAnyPermission() short-circuits.
     if (this.user?.role === 'admin') {
-      this.hasAdminCapabilities = true;
+      this.adminStatus = { isAdmin: true, isSuperAdmin: true, permissions: [] };
       return;
     }
 
     // No user = no admin access
     if (!this.user) {
-      this.hasAdminCapabilities = false;
+      this.adminStatus = null;
       return;
     }
 
-    // Probe an admin-guarded endpoint to detect hub-admin status.
-    // The backend enforces authorization — a 200 means the user is permitted.
+    // Call the dedicated admin-status endpoint to detect admin status
+    // and retrieve per-resource permissions.
     try {
-      const res = await apiFetch('/api/v1/admin/roles');
+      const res = await apiFetch('/api/v1/auth/admin-status');
       // Only apply result if user hasn't changed during the fetch
       if (this.adminCheckUserId === userId) {
-        this.hasAdminCapabilities = res.ok;
+        if (res.ok) {
+          const data = await res.json();
+          if (data.isAdmin === true) {
+            this.adminStatus = {
+              isAdmin: true,
+              isSuperAdmin: data.isSuperAdmin === true,
+              permissions: Array.isArray(data.permissions) ? data.permissions : [],
+            };
+          } else {
+            this.adminStatus = null;
+          }
+        } else {
+          this.adminStatus = null;
+        }
       }
     } catch {
       if (this.adminCheckUserId === userId) {
-        this.hasAdminCapabilities = false;
+        this.adminStatus = null;
       }
     }
   }
@@ -435,12 +455,22 @@ export class ScionNav extends LitElement {
             </div>
           `
         )}
-        ${this.hasAdminCapabilities
+        ${this.adminStatus?.isAdmin &&
+        (isSuperAdmin ||
+          ADMIN_SCOPEABLE_ITEMS.some(
+            (item) =>
+              NAV_PERMISSION_MAP[item.path] &&
+              hasAnyPermission(this.adminStatus, NAV_PERMISSION_MAP[item.path])
+          ))
           ? html`
               <div class="nav-section admin-section">
                 <div class="nav-section-title">Admin</div>
                 <ul class="nav-list">
-                  ${ADMIN_SCOPEABLE_ITEMS.map(
+                  ${ADMIN_SCOPEABLE_ITEMS.filter(
+                    (item) =>
+                      NAV_PERMISSION_MAP[item.path] &&
+                      hasAnyPermission(this.adminStatus, NAV_PERMISSION_MAP[item.path])
+                  ).map(
                     (item) => html`
                       <li class="nav-item">
                         <a

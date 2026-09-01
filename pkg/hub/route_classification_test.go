@@ -37,6 +37,7 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/auth/token":                        "public:auth",
 	"/api/v1/auth/refresh":                      "public:auth",
 	"/api/v1/auth/validate":                     "public:auth",
+	"/api/v1/auth/admin-status":                 "authenticated:user",
 	"/api/v1/auth/logout":                       "authenticated:user",
 	"/api/v1/auth/me":                           "authenticated:user",
 	"/api/v1/auth/tokens":                       "authenticated:user-token",
@@ -79,8 +80,8 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/metrics/session/":                  "authenticated:session-metrics",
 	"/api/v1/groups":                            "policy:group",
 	"/api/v1/groups/":                           "policy:group",
-	"/api/v1/policies":                          "hub-admin:policy",
-	"/api/v1/policies/":                         "hub-admin:policy",
+	"/api/v1/policies":                          "authenticated:policy-gone",
+	"/api/v1/policies/":                         "authenticated:policy-gone",
 	"/api/v1/users/me/groups":                   "authenticated:principal",
 	"/api/v1/principals/":                       "authenticated:principal",
 	"/api/v1/users/me/injected-skills":          "authenticated:injected-skills",
@@ -121,6 +122,7 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/admin/diagnostics/logs/stream":     "hub-admin:diagnostics",
 	"/api/v1/admin/diagnostics/logs":            "hub-admin:diagnostics",
 	"/api/v1/admin/health/summary":              "hub-admin:health",
+	"/api/v1/admin/messaging/divergence":        "hub-admin:diagnostics",
 	"/api/v1/metrics/":                          "hub-admin:metrics-dashboard",
 	"/api/v1/admin/metrics-dashboard":           "hub-admin:metrics-dashboard",
 	"/api/v1/notifications":                     "authenticated:notifications",
@@ -193,6 +195,14 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/admin/role-bindings":  "hub-admin:role_binding",
 	"/api/v1/admin/role-bindings/": "hub-admin:role_binding",
 	"/api/v1/admin/permissions":    "hub-admin:role",
+
+	// Access Constraints (AC1)
+	"/api/v1/admin/access-constraints":  "hub-admin:access_constraint",
+	"/api/v1/admin/access-constraints/": "hub-admin:access_constraint",
+
+	// Access Constraint Previews (B7)
+	"/api/v1/admin/access-constraint-previews":  "hub-admin:access_constraint",
+	"/api/v1/admin/access-constraint-previews/": "hub-admin:access_constraint",
 }
 
 func TestRegisteredRoutesHavePermissionClassification(t *testing.T) {

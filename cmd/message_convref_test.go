@@ -414,3 +414,177 @@ func TestBackwardCompat_BareAgentName(t *testing.T) {
 	assert.Equal(t, "old-agent-name", (*sent)[0].AgentName)
 	assert.Equal(t, "hello world", (*sent)[0].Message)
 }
+
+// TestSendMessageViaConversation_ValidationBeforeResolve verifies DEF-48:
+// a message that fails validation must NOT trigger ResolveConversation.
+// Before this fix, validation ran after resolve, orphaning the row on failure.
+func TestSendMessageViaConversation_ValidationBeforeResolve(t *testing.T) {
+	orig := saveMessageTestState()
+	defer orig.restore()
+
+	projectID := "proj-convref-val-before-resolve"
+	server, sent, resolves, _ := newConvRefMockHubServer(t, projectID)
+	defer server.Close()
+
+	client, err := hubclient.New(server.URL)
+	require.NoError(t, err)
+
+	hubCtx := &HubContext{
+		Client:    client,
+		Endpoint:  server.URL,
+		ProjectID: projectID,
+	}
+
+	ref := &messaging.Reference{
+		Kind:  messaging.RefAgent,
+		Value: "builder",
+		Raw:   "@builder",
+	}
+
+	// Send an empty message body — ValidateLegacyMessage rejects this because
+	// "msg field is required" when there are no attachments.
+	err = sendMessageViaConversation(hubCtx, ref, "", false, false)
+	require.Error(t, err, "empty message must fail validation")
+	assert.Contains(t, err.Error(), "validation failed")
+
+	// DEF-48 AC-D-4: ResolveConversation must NOT have been called.
+	// Before this fix, resolve ran first (potentially creating a row),
+	// and validation failure afterward orphaned it.
+	assert.Len(t, *resolves, 0, "ResolveConversation must not be called when validation fails (DEF-48)")
+	assert.Len(t, *sent, 0, "no messages should be sent when validation fails")
+}
+
+// TestSendMessageViaConversation_EmailPreconditionBeforeResolve verifies DEF-48
+// for the @email path: when SCION_AGENT_NAME is unset (human CLI context),
+// the precondition must fail before ResolveConversation runs.
+func TestSendMessageViaConversation_EmailPreconditionBeforeResolve(t *testing.T) {
+	orig := saveMessageTestState()
+	defer orig.restore()
+
+	// Explicitly unset SCION_AGENT_NAME to simulate human CLI context.
+	t.Setenv("SCION_AGENT_NAME", "")
+
+	projectID := "proj-convref-email-precond"
+	server, sent, resolves, outbound := newConvRefMockHubServer(t, projectID)
+	defer server.Close()
+
+	client, err := hubclient.New(server.URL)
+	require.NoError(t, err)
+
+	hubCtx := &HubContext{
+		Client:    client,
+		Endpoint:  server.URL,
+		ProjectID: projectID,
+	}
+
+	ref := &messaging.Reference{
+		Kind:  messaging.RefEmail,
+		Value: "user@example.com",
+		Raw:   "@user@example.com",
+	}
+
+	err = sendMessageViaConversation(hubCtx, ref, "should fail before resolve", false, false)
+	require.Error(t, err, "email ref without agent context must fail")
+	assert.Contains(t, err.Error(), "only supported from within an agent container")
+
+	// DEF-48: ResolveConversation must NOT have been called.
+	assert.Len(t, *resolves, 0, "ResolveConversation must not be called when email precondition fails (DEF-48)")
+	assert.Len(t, *sent, 0, "no agent messages should be sent")
+	assert.Len(t, *outbound, 0, "no outbound messages should be sent")
+}
+
+// TestSendMessageViaConversation_EmailThreadIDWithoutChannel verifies that
+// --thread-id without --channel does NOT cause a false rejection on the @email
+// path. The @email path drops both fields (they are not in OutboundMessageRequest
+// as constructed), so the thread_id-requires-channel rule must not fire.
+// DEF-51 Direction 1: false rejection.
+func TestSendMessageViaConversation_EmailThreadIDWithoutChannel(t *testing.T) {
+	orig := saveMessageTestState()
+	defer orig.restore()
+	restoreFlags := resetMessageFlags()
+	defer restoreFlags()
+
+	// Set thread-id without channel — would fail ValidateLegacyMessage if
+	// those CLI flags leaked into the validation probe.
+	msgThreadID = "some-thread"
+	msgChannel = ""
+
+	t.Setenv("SCION_AGENT_NAME", "test-sender-agent")
+
+	projectID := "proj-convref-email-threadid"
+	server, sent, resolves, outbound := newConvRefMockHubServer(t, projectID)
+	defer server.Close()
+
+	client, err := hubclient.New(server.URL)
+	require.NoError(t, err)
+
+	hubCtx := &HubContext{
+		Client:    client,
+		Endpoint:  server.URL,
+		ProjectID: projectID,
+	}
+
+	ref := &messaging.Reference{
+		Kind:  messaging.RefEmail,
+		Value: "user@example.com",
+		Raw:   "@user@example.com",
+	}
+
+	err = sendMessageViaConversation(hubCtx, ref, "hello with thread", false, false)
+	require.NoError(t, err, "thread-id without channel must not be rejected on @email path")
+
+	// Resolve was called (message is valid, send proceeds).
+	assert.Len(t, *resolves, 1, "ResolveConversation should be called for valid email message")
+	assert.Len(t, *outbound, 1, "outbound message should be delivered")
+	assert.Len(t, *sent, 0, "no agent messages should be sent on email path")
+}
+
+// TestSendMessageViaConversation_EmailEmptyMsgBeforeResolve verifies DEF-51:
+// an empty message body on the @email path must fail validation before
+// ResolveConversation runs, even when --attach is set. The @email path drops
+// attachments, so the empty-body waiver (which requires attachments) must not
+// apply — the validated probe must reflect the sent envelope.
+// DEF-51 Direction 2: missed rejection.
+func TestSendMessageViaConversation_EmailEmptyMsgBeforeResolve(t *testing.T) {
+	orig := saveMessageTestState()
+	defer orig.restore()
+	restoreFlags := resetMessageFlags()
+	defer restoreFlags()
+
+	// Set attachments via CLI flag — buildStructuredMessage would include
+	// them, but the @email OutboundMessageRequest does not carry them.
+	msgAttach = []string{"/workspace/x.png"}
+
+	t.Setenv("SCION_AGENT_NAME", "test-sender-agent")
+
+	projectID := "proj-convref-email-empty-msg"
+	server, sent, resolves, outbound := newConvRefMockHubServer(t, projectID)
+	defer server.Close()
+
+	client, err := hubclient.New(server.URL)
+	require.NoError(t, err)
+
+	hubCtx := &HubContext{
+		Client:    client,
+		Endpoint:  server.URL,
+		ProjectID: projectID,
+	}
+
+	ref := &messaging.Reference{
+		Kind:  messaging.RefEmail,
+		Value: "user@example.com",
+		Raw:   "@user@example.com",
+	}
+
+	// Empty message body with attachments — ValidateLegacyMessage waives
+	// empty-body when attachments are present, but the @email path does not
+	// send attachments. The probe must reflect the sent envelope.
+	err = sendMessageViaConversation(hubCtx, ref, "", false, false)
+	require.Error(t, err, "empty message on @email path must fail validation")
+	assert.Contains(t, err.Error(), "validation failed")
+
+	// DEF-51: ResolveConversation must NOT have been called.
+	assert.Len(t, *resolves, 0, "ResolveConversation must not be called when email validation fails (DEF-51)")
+	assert.Len(t, *sent, 0, "no agent messages should be sent")
+	assert.Len(t, *outbound, 0, "no outbound messages should be sent")
+}

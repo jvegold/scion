@@ -672,11 +672,68 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 		PrintUsingHub(hubCtx.Endpoint)
 	}
 
+	// @email precondition: SCION_AGENT_NAME depends only on the environment
+	// and nothing computed by this function. Evaluate it before any I/O
+	// (resolveSenderIdentity makes a network call) so a guaranteed failure
+	// does not waste a round trip.
+	var emailSenderAgent string
+	if ref.Kind == messaging.RefEmail {
+		emailSenderAgent = os.Getenv("SCION_AGENT_NAME")
+		if emailSenderAgent == "" {
+			return fmt.Errorf("sending messages to users via @<email> is only supported from within an agent container (SCION_AGENT_NAME not set)")
+		}
+	}
+
 	sender := resolveSenderIdentity(hubCtx)
 
 	projectID, err := GetProjectID(hubCtx)
 	if err != nil {
 		return wrapHubError(err)
+	}
+
+	// DEF-48: For @agent references, build and validate the message before
+	// resolving the conversation. ResolveConversation can CREATE a row, and
+	// if validation fails afterward, the row survives with no message —
+	// orphaning it. buildStructuredMessage does not need ConversationID, and
+	// ValidateLegacyMessage does not check it (DEF-41), so the message is
+	// fully validatable before resolution.
+	var agentMsg *messages.StructuredMessage
+	if ref.Kind == messaging.RefAgent {
+		agentMsg = buildStructuredMessage(sender, "agent:"+ref.Value, message)
+		if err := messaging.ValidateLegacyMessage(agentMsg); err != nil {
+			return fmt.Errorf("message validation failed: %w", err)
+		}
+	}
+
+	// DEF-51: for @email references, construct the OutboundMessageRequest
+	// before resolve and validate it through the legacy choke point. The
+	// probe is derived from outMsg's actual fields — not from
+	// buildStructuredMessage — so the validated envelope matches the sent
+	// envelope by construction. Fields the @email path does not send
+	// (Channel, ThreadID, Attachments) are zero in both outMsg and probe,
+	// which closes two divergence directions:
+	//   - thread_id-without-channel cannot fire (no false rejection)
+	//   - empty-msg-with-attachments cannot pass (no missed rejection)
+	// Metadata.conversation_id is set after resolve; it is not validated.
+	var outMsg *hubclient.OutboundMessageRequest
+	if ref.Kind == messaging.RefEmail {
+		outMsg = &hubclient.OutboundMessageRequest{
+			Recipient: "user:" + ref.Value,
+			Msg:       message,
+			Type:      "instruction",
+			Urgent:    interrupt,
+		}
+		probe := &messages.StructuredMessage{
+			Version:   messages.Version,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Sender:    emailSenderAgent,
+			Recipient: outMsg.Recipient,
+			Msg:       outMsg.Msg,
+			Type:      outMsg.Type,
+		}
+		if err := messaging.ValidateLegacyMessage(probe); err != nil {
+			return fmt.Errorf("message validation failed: %w", err)
+		}
 	}
 
 	if !isJSONOutput() {
@@ -711,12 +768,8 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 	// the conversation_id set.
 	if ref.Kind == messaging.RefAgent {
 		agentSvc := hubCtx.Client.ProjectAgents(projectID)
-		msg := buildStructuredMessage(sender, "agent:"+ref.Value, message)
-		msg.ConversationID = resolveResp.ConversationID
-		if err := messaging.ValidateLegacyMessage(msg); err != nil {
-			return fmt.Errorf("message validation failed: %w", err)
-		}
-		if _, err := agentSvc.SendStructuredMessage(ctx, ref.Value, msg, interrupt, false, wake); err != nil {
+		agentMsg.ConversationID = resolveResp.ConversationID
+		if _, err := agentSvc.SendStructuredMessage(ctx, ref.Value, agentMsg, interrupt, false, wake); err != nil {
 			return wrapHubError(fmt.Errorf("failed to send message to agent '%s' via Hub: %w", ref.Value, err))
 		}
 		if !isJSONOutput() {
@@ -725,26 +778,12 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 		return nil
 	}
 
-	// For conv:<uuid> and #<thread> references, the conversation is resolved
-	// but we don't know which agent to deliver to. The message is persisted
-	// with the conversation_id. For threads, delivery depends on the
-	// conversation's default agent (if any).
-	//
-	// For @<email> references, route as outbound user message with conversation_id.
+	// @email send: outMsg was constructed and validated before resolve
+	// (DEF-51). Set the conversation_id that resolve produced and send.
 	if ref.Kind == messaging.RefEmail {
-		senderAgent := os.Getenv("SCION_AGENT_NAME")
-		if senderAgent == "" {
-			return fmt.Errorf("sending messages to users via @<email> is only supported from within an agent container (SCION_AGENT_NAME not set)")
-		}
+		outMsg.Metadata = map[string]string{"conversation_id": resolveResp.ConversationID}
 		agentSvc := hubCtx.Client.ProjectAgents(projectID)
-		outMsg := &hubclient.OutboundMessageRequest{
-			Recipient: "user:" + ref.Value,
-			Msg:       message,
-			Type:      "instruction",
-			Urgent:    interrupt,
-			Metadata:  map[string]string{"conversation_id": resolveResp.ConversationID},
-		}
-		if err := agentSvc.SendOutboundMessage(ctx, senderAgent, outMsg); err != nil {
+		if err := agentSvc.SendOutboundMessage(ctx, emailSenderAgent, outMsg); err != nil {
 			return wrapHubError(fmt.Errorf("failed to send message to %s: %w", ref.Raw, err))
 		}
 		if !isJSONOutput() {

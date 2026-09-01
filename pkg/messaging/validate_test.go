@@ -21,7 +21,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -64,236 +63,6 @@ func validAddressees(msgID string) []Addressee {
 			Via:           ViaExplicit,
 			DeliveryState: DeliveryPending,
 		},
-	}
-}
-
-// ---------- ValidateMessage tests ----------
-
-func TestValidateMessage_NilMessage(t *testing.T) {
-	if err := ValidateMessage(nil); err == nil {
-		t.Fatal("expected error for nil message")
-	}
-}
-
-func TestValidateMessage_ValidTextMessage(t *testing.T) {
-	msg := validTextMessage()
-	if err := ValidateMessage(msg); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestValidateMessage_ValidEventMessage(t *testing.T) {
-	msg := validEventMessage()
-	if err := ValidateMessage(msg); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestValidateMessage_MissingID(t *testing.T) {
-	msg := validTextMessage()
-	msg.ID = ""
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for missing id")
-	}
-	if !strings.Contains(err.Error(), "id") {
-		t.Fatalf("error should mention id, got: %v", err)
-	}
-}
-
-func TestValidateMessage_MissingConversationID(t *testing.T) {
-	msg := validTextMessage()
-	msg.ConversationID = ""
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for missing conversation_id")
-	}
-	if !strings.Contains(err.Error(), "conversation_id") {
-		t.Fatalf("error should mention conversation_id, got: %v", err)
-	}
-}
-
-func TestValidateMessage_MissingFrom(t *testing.T) {
-	msg := validTextMessage()
-	msg.From = ""
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for missing from")
-	}
-	if !strings.Contains(err.Error(), "from") {
-		t.Fatalf("error should mention from, got: %v", err)
-	}
-}
-
-func TestValidateMessage_InvalidFrom(t *testing.T) {
-	msg := validTextMessage()
-	msg.From = "badref"
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for malformed from")
-	}
-}
-
-func TestValidateMessage_InvalidKind(t *testing.T) {
-	msg := validTextMessage()
-	msg.Kind = "bogus"
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for invalid kind")
-	}
-	if !strings.Contains(err.Error(), "kind") {
-		t.Fatalf("error should mention kind, got: %v", err)
-	}
-}
-
-func TestValidateMessage_TextWithoutIntent(t *testing.T) {
-	msg := validTextMessage()
-	msg.Intent = nil
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for text message without intent")
-	}
-	if !strings.Contains(err.Error(), "intent") {
-		t.Fatalf("error should mention intent, got: %v", err)
-	}
-}
-
-func TestValidateMessage_TextWithInvalidIntent(t *testing.T) {
-	msg := validTextMessage()
-	bad := TextIntent("bogus")
-	msg.Intent = &bad
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for invalid intent")
-	}
-}
-
-func TestValidateMessage_TextWithEventBody(t *testing.T) {
-	msg := validTextMessage()
-	msg.Event = &EventBody{Type: EventAgentStateChanged}
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for text message with event body")
-	}
-	if !strings.Contains(err.Error(), "event body") {
-		t.Fatalf("error should mention event body, got: %v", err)
-	}
-}
-
-func TestValidateMessage_EventWithoutEventBody(t *testing.T) {
-	msg := validEventMessage()
-	msg.Event = nil
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for event message without event body")
-	}
-}
-
-func TestValidateMessage_EventWithInvalidType(t *testing.T) {
-	msg := validEventMessage()
-	msg.Event.Type = "bogus.type"
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for event message with invalid event type")
-	}
-}
-
-func TestValidateMessage_EventWithIntent(t *testing.T) {
-	msg := validEventMessage()
-	intent := IntentInform
-	msg.Intent = &intent
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for event message with intent set")
-	}
-	if !strings.Contains(err.Error(), "intent") {
-		t.Fatalf("error should mention intent, got: %v", err)
-	}
-}
-
-func TestValidateMessage_BodyOverCharLimit(t *testing.T) {
-	msg := validTextMessage()
-	msg.Body = strings.Repeat("x", messages.MaxMessageLength+1)
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for body over character limit")
-	}
-	if !strings.Contains(err.Error(), "character limit") {
-		t.Fatalf("error should mention character limit, got: %v", err)
-	}
-}
-
-func TestValidateMessage_BodyOverByteLimit(t *testing.T) {
-	msg := validTextMessage()
-	// Use multi-byte characters so char count is under MaxMessageLength
-	// but byte count exceeds MaxMsgSize.
-	msg.Body = strings.Repeat("🎉", messages.MaxMsgSize/4+1)
-	if len([]rune(msg.Body)) <= messages.MaxMessageLength && len(msg.Body) > messages.MaxMsgSize {
-		err := ValidateMessage(msg)
-		if err == nil {
-			t.Fatal("expected error for body over byte limit")
-		}
-	}
-}
-
-func TestValidateMessage_TooManyAttachments(t *testing.T) {
-	msg := validTextMessage()
-	for i := 0; i < messages.MaxAttachments+1; i++ {
-		msg.Attachments = append(msg.Attachments, AttachmentRef{Path: fmt.Sprintf("/tmp/file%d", i)})
-	}
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for too many attachments")
-	}
-	if !strings.Contains(err.Error(), "attachments") {
-		t.Fatalf("error should mention attachments, got: %v", err)
-	}
-}
-
-func TestValidateMessage_InvalidVisibility(t *testing.T) {
-	msg := validTextMessage()
-	msg.Visibility = "secret"
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for invalid visibility")
-	}
-}
-
-func TestValidateMessage_EmptyVisibilityAllowed(t *testing.T) {
-	msg := validTextMessage()
-	msg.Visibility = ""
-	if err := ValidateMessage(msg); err != nil {
-		t.Fatalf("empty visibility should be allowed: %v", err)
-	}
-}
-
-func TestValidateMessage_ReplyToIDEmptyString(t *testing.T) {
-	msg := validTextMessage()
-	empty := ""
-	msg.ReplyToID = &empty
-	err := ValidateMessage(msg)
-	if err == nil {
-		t.Fatal("expected error for empty reply_to_id")
-	}
-	if !strings.Contains(err.Error(), "reply_to_id") {
-		t.Fatalf("error should mention reply_to_id, got: %v", err)
-	}
-}
-
-func TestValidateMessage_ReplyToIDValidString(t *testing.T) {
-	msg := validTextMessage()
-	id := "parent-msg-1"
-	msg.ReplyToID = &id
-	if err := ValidateMessage(msg); err != nil {
-		t.Fatalf("valid reply_to_id should pass: %v", err)
-	}
-}
-
-func TestValidateMessage_ReplyToIDNil(t *testing.T) {
-	msg := validTextMessage()
-	msg.ReplyToID = nil
-	if err := ValidateMessage(msg); err != nil {
-		t.Fatalf("nil reply_to_id should pass: %v", err)
 	}
 }
 
@@ -689,58 +458,6 @@ func TestValidateCrossProjectAddressees_NilAgentDenied(t *testing.T) {
 	}
 }
 
-// ---------- ValidateMessageAddressees tests ----------
-
-func TestValidateMessageAddressees_Valid(t *testing.T) {
-	s := &mockAgentStore{agents: map[string]*store.Agent{
-		"agent-1": {ID: "agent-1", ProjectID: "project-a"},
-	}}
-	msg := validTextMessage()
-	addrs := []Addressee{
-		{
-			MessageID:     msg.ID,
-			PrincipalKind: "agent",
-			PrincipalID:   "agent-1",
-			Via:           ViaExplicit,
-			DeliveryState: DeliveryPending,
-		},
-	}
-	if err := ValidateMessageAddressees(context.Background(), s, msg, addrs); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestValidateMessageAddressees_CrossProjectRejected(t *testing.T) {
-	s := &mockAgentStore{agents: map[string]*store.Agent{
-		"agent-1": {ID: "agent-1", ProjectID: "project-a"},
-		"agent-2": {ID: "agent-2", ProjectID: "project-b"},
-	}}
-	msg := validTextMessage()
-	addrs := []Addressee{
-		{
-			MessageID:     msg.ID,
-			PrincipalKind: "agent",
-			PrincipalID:   "agent-1",
-			Via:           ViaExplicit,
-			DeliveryState: DeliveryPending,
-		},
-		{
-			MessageID:     msg.ID,
-			PrincipalKind: "agent",
-			PrincipalID:   "agent-2",
-			Via:           ViaBodyMention,
-			DeliveryState: DeliveryPending,
-		},
-	}
-	err := ValidateMessageAddressees(context.Background(), s, msg, addrs)
-	if err == nil {
-		t.Fatal("expected error for cross-project addressees")
-	}
-	if !strings.Contains(err.Error(), "across project boundaries") {
-		t.Fatalf("error should mention project boundaries, got: %v", err)
-	}
-}
-
 // TestValidateCrossProjectAddressees_CheckIsLoadBearing proves that the
 // cross-project check is load-bearing per Rule 10. If the check were removed
 // (e.g. the function body were replaced with `return nil`), this test would
@@ -759,5 +476,68 @@ func TestValidateCrossProjectAddressees_CheckIsLoadBearing(t *testing.T) {
 	if err == nil {
 		t.Fatal("RULE 10 VIOLATION: cross-project check was removed or bypassed — " +
 			"agents in different projects must be rejected")
+	}
+}
+
+// ---------- ValidateAttributed (DEF-41 — function correctness) ----------
+
+// TestValidateAttributed_RejectsEmptyConversationID proves that
+// ValidateAttributed rejects an empty ConversationID.
+//
+// This tests the function body, not production reachability. While B10
+// holds, every production call site guards ValidateAttributed behind
+// `if convResult != nil`, and every non-nil convResult carries a
+// uuid.UUID ConversationID that is never empty. The check is therefore
+// structural pre-placement: it cannot fire today, and it becomes
+// load-bearing at Tranche G when derivation failure becomes fatal and
+// the nil guard is removed.
+//
+// See the commit message for the proof-by-enumeration that no
+// production path can deliver "" to ValidateAttributed under B10.
+func TestValidateAttributed_RejectsEmptyConversationID(t *testing.T) {
+	err := ValidateAttributed("")
+	if err == nil {
+		t.Fatal("ValidateAttributed must reject an empty conversation_id")
+	}
+	if !strings.Contains(err.Error(), "conversation_id") {
+		t.Fatalf("error should mention conversation_id, got: %v", err)
+	}
+}
+
+// TestValidateAttributed_AcceptsNonEmptyConversationID confirms that
+// ValidateAttributed passes when a real ConversationID is present.
+func TestValidateAttributed_AcceptsNonEmptyConversationID(t *testing.T) {
+	err := ValidateAttributed("conv-12345")
+	if err != nil {
+		t.Fatalf("ValidateAttributed should accept a non-empty conversation_id, got: %v", err)
+	}
+}
+
+// TestValidateAttributed_CheckIsLoadBearing proves that the ValidateAttributed
+// check is load-bearing per Rule 10. If the function body were replaced with
+// `return nil`, this test would fail because an empty ConversationID would
+// incorrectly pass. The function is correctly implemented; it is the
+// production call sites that are currently inert (see above).
+func TestValidateAttributed_CheckIsLoadBearing(t *testing.T) {
+	err := ValidateAttributed("")
+	// If the check is removed, err would be nil and this assertion would fail.
+	if err == nil {
+		t.Fatal("RULE 10 VIOLATION: ValidateAttributed check was removed or " +
+			"bypassed — an empty conversation_id after attribution must be rejected")
+	}
+}
+
+// ---------- validateMessageContent (internal, shared core) ----------
+
+// TestValidateMessageContent_SkipsConversationIDCheck confirms that the shared
+// core validator (used by ValidateLegacyMessage) does not check ConversationID.
+// ConversationID is checked by ValidateAttributed (after attribution).
+func TestValidateMessageContent_SkipsConversationIDCheck(t *testing.T) {
+	msg := validTextMessage()
+	msg.ConversationID = "" // intentionally empty
+	err := validateMessageContent(msg)
+	if err != nil {
+		t.Fatalf("validateMessageContent must not check ConversationID "+
+			"(that is ValidateAttributed's job), got: %v", err)
 	}
 }

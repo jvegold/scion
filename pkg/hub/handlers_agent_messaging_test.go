@@ -73,10 +73,9 @@ func TestOutboundMessage_RateLimitsFloodingAgent(t *testing.T) {
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Name:       "flood-project",
-		Slug:       "flood-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Name: "flood-project",
+		Slug: "flood-project",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -156,10 +155,9 @@ func TestOutboundMessage_UnknownTypeIsChargedAsAgentTraffic(t *testing.T) {
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Name:       "type-project",
-		Slug:       "type-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Name: "type-project",
+		Slug: "type-project",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -208,10 +206,9 @@ func TestOutboundMessage_TranscriptMirrorDoesNotStarveAgentMessages(t *testing.T
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Name:       "mirror-project",
-		Slug:       "mirror-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Name: "mirror-project",
+		Slug: "mirror-project",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -279,10 +276,9 @@ func TestAgentMessage_B5_SpoofedSenderDoesNotDeriveConversationKey(t *testing.T)
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Name:       "b5-security-project",
-		Slug:       "b5-security-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Name: "b5-security-project",
+		Slug: "b5-security-project",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -409,7 +405,6 @@ func TestBroadcast_B5F1_SpoofedSenderDoesNotDeriveConversationKey(t *testing.T) 
 
 	project := &store.Project{
 		ID: api.NewUUID(), Name: "b5-f1-broadcast", Slug: "b5-f1-broadcast",
-		Visibility: store.VisibilityPrivate,
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -536,7 +531,6 @@ func TestBroadcast_B5F1b_BroadcastedForcedTrueServerSide(t *testing.T) {
 
 	project := &store.Project{
 		ID: api.NewUUID(), Name: "b5-bcast-flag", Slug: "b5-bcast-flag",
-		Visibility: store.VisibilityPrivate,
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -633,7 +627,6 @@ func TestBroadcast_R1_BroadcastingAgentDoesNotReceiveOwnMessage(t *testing.T) {
 
 	project := &store.Project{
 		ID: api.NewUUID(), Name: "r1-selfskip", Slug: "r1-selfskip",
-		Visibility: store.VisibilityPrivate,
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -739,7 +732,6 @@ func TestBroadcast_B5F1a_SenderOverrideStoresAuthIdentity(t *testing.T) {
 
 	project := &store.Project{
 		ID: api.NewUUID(), Name: "b5-f1a", Slug: "b5-f1a",
-		Visibility: store.VisibilityPrivate,
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -762,14 +754,14 @@ func TestBroadcast_B5F1a_SenderOverrideStoresAuthIdentity(t *testing.T) {
 
 	// Give the attacker minimum project membership so the ActionAttach authz
 	// check added by #1347 passes and broadcastDirect actually runs.
-	// Setting CreatedBy makes createProjectMembersGroupAndPolicy add the
+	// Setting CreatedBy makes createProjectMembersGroup add the
 	// attacker as the group owner, which grants sufficient project access.
 	ensureHubMembership(ctx, s, attacker.ID)
 	project.CreatedBy = attacker.ID
 	if err := s.UpdateProject(ctx, project); err != nil {
 		t.Fatalf("UpdateProject (set CreatedBy): %v", err)
 	}
-	srv.createProjectMembersGroupAndPolicy(ctx, project)
+	srv.createProjectMembersGroup(ctx, project)
 
 	agent := &store.Agent{
 		ID: api.NewUUID(), Name: "a1", Slug: "a1",
@@ -844,7 +836,6 @@ func TestBroadcast_B5F1c_SelfSkipUsesAuthNotSender(t *testing.T) {
 
 	project := &store.Project{
 		ID: api.NewUUID(), Name: "b5-f1c", Slug: "b5-f1c",
-		Visibility: store.VisibilityPrivate,
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -932,7 +923,6 @@ func TestBroker_R2_FanOutGlobalSelfSkipBySenderID(t *testing.T) {
 
 	projectA := &store.Project{
 		ID: api.NewUUID(), Name: "r2-pa", Slug: "r2-pa",
-		Visibility: store.VisibilityPrivate,
 	}
 	if err := s.CreateProject(ctx, projectA); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -1018,7 +1008,6 @@ func TestBroker_R3b_WarnOnEmptySenderID(t *testing.T) {
 
 	project := &store.Project{
 		ID: api.NewUUID(), Name: "r3b", Slug: "r3b",
-		Visibility: store.VisibilityPrivate,
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
 
@@ -1105,10 +1094,9 @@ func def11Setup(t *testing.T) (srv *Server, s store.Store, projectID, agentSlug,
 	agentSlug = "def11-agent"
 
 	if err := s.CreateProject(ctx, &store.Project{
-		ID:         projectID,
-		Name:       "def11-project",
-		Slug:       "def11-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   projectID,
+		Name: "def11-project",
+		Slug: "def11-project",
 	}); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
@@ -1162,7 +1150,12 @@ func TestDEF11_PreResolvedConversation_PopulatesExternalRef(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a conversation with a known ExternalRef.
-	extRef := testDirectMessageExternalRef(userID, agentID)
+	// DEF-49: use the kind-encoded key format so the authorization
+	// check can parse it. The authenticated user is DevUserID.
+	extRef, err := messages.DMConversationKey("user", userID, "agent", agentID)
+	if err != nil {
+		t.Fatalf("DMConversationKey: %v", err)
+	}
 	conv := &store.Conversation{
 		Kind:        "direct",
 		Surface:     "native",
@@ -1227,7 +1220,12 @@ func TestDEF11_PreResolvedConversation_DivergenceMatch(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a conversation matching the sender/agent DM pair.
-	extRef := testDirectMessageExternalRef(userID, agentID)
+	// DEF-49: use the kind-encoded key format so the authorization
+	// check can parse it. The authenticated user is DevUserID.
+	extRef, err := messages.DMConversationKey("user", userID, "agent", agentID)
+	if err != nil {
+		t.Fatalf("DMConversationKey: %v", err)
+	}
 	conv := &store.Conversation{
 		Kind:        "direct",
 		Surface:     "native",
@@ -1272,15 +1270,14 @@ func TestDEF11_PreResolvedConversation_DivergenceMatch(t *testing.T) {
 }
 
 // TestDEF11_PreResolvedConversation_LookupFailure verifies that when a
-// pre-resolved ConversationID does not exist in the store, the handler records
-// a fallback with reason "conv-lookup-failed" — not a plain
-// "routing-type-mismatch". The Fallback flag on DivergenceEntry routes the
-// event to the fallback counter only, leaving mismatches at zero.
+// pre-resolved ConversationID does not exist in the store, the handler denies
+// the request (DEF-49: fail closed on nonexistent conversation).
+//
+// Before DEF-49 this recorded a "conv-lookup-failed" divergence fallback and
+// proceeded. After DEF-49, both lookup-failure cases deny, and the
+// "conv-lookup-failed" divergence entry is dead code (removed per AC-D-7).
 func TestDEF11_PreResolvedConversation_LookupFailure(t *testing.T) {
 	srv, _, projectID, agentSlug, _, userID := def11Setup(t)
-
-	beforeFallbacks := messaging.DivergenceMetrics.Fallbacks()
-	beforeMismatches := messaging.DivergenceMetrics.Mismatches()
 
 	// Use a non-existent conversation ID.
 	rec := doRequest(t, srv, http.MethodPost,
@@ -1297,20 +1294,10 @@ func TestDEF11_PreResolvedConversation_LookupFailure(t *testing.T) {
 				ConversationID: "nonexistent-conv-id",
 			},
 		})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 (message delivery is non-fatal), got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	afterFallbacks := messaging.DivergenceMetrics.Fallbacks()
-	afterMismatches := messaging.DivergenceMetrics.Mismatches()
-
-	if afterFallbacks-beforeFallbacks < 1 {
-		t.Errorf("expected Fallbacks delta >= 1 (conv-lookup-failed recorded), got %d",
-			afterFallbacks-beforeFallbacks)
-	}
-	if afterMismatches-beforeMismatches != 0 {
-		t.Errorf("expected Mismatches delta == 0 (fallback must not register as mismatch), got %d",
-			afterMismatches-beforeMismatches)
+	// DEF-49: nonexistent conversation_id is now denied with 400.
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (DEF-49: nonexistent conversation denied), got %d: %s",
+			rec.Code, rec.Body.String())
 	}
 }
 
@@ -1332,10 +1319,9 @@ func TestDEF19_GroupRecipient_FullHandlerPath(t *testing.T) {
 	anchorSlug := agentSlugA
 
 	if err := s.CreateProject(ctx, &store.Project{
-		ID:         projectID,
-		Name:       "def19-project",
-		Slug:       "def19-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   projectID,
+		Name: "def19-project",
+		Slug: "def19-project",
 	}); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
@@ -1432,20 +1418,37 @@ func TestDEF19_GroupRecipient_FullHandlerPath(t *testing.T) {
 	}
 }
 
-// TestDEF11_PreResolvedConversation_GenuineDisagreement verifies that the
-// divergence comparison is active and can detect a real mismatch when the
-// stored ExternalRef does not agree with the old-model routing.
-func TestDEF11_PreResolvedConversation_GenuineDisagreement(t *testing.T) {
+// TestDEF49_DivergenceMismatch_AuthorizedButWrongAgent verifies that the
+// divergence comparison detects a real routing mismatch on the pre-resolved
+// path, even when DEF-49 authorization passes.
+//
+// The authenticated user (DevUserID) is named in the conversation's DM key
+// (one of the two slots), so authorization succeeds. But the conversation
+// names a *different* agent than the one the message is addressed to, so
+// OldRoutingFromMessage (which uses the addressed agent's ID) disagrees with
+// the conversation's ExternalRef — producing a "dm-routing-mismatch".
+//
+// This is the coverage successor for the original
+// TestDEF11_PreResolvedConversation_GenuineDisagreement, which was deleted
+// because DEF-49 turned it into a duplicate of the non-membership negative
+// test (AC-D-7).
+func TestDEF49_DivergenceMismatch_AuthorizedButWrongAgent(t *testing.T) {
 	srv, s, projectID, agentSlug, _, userID := def11Setup(t)
 	ctx := context.Background()
 
-	// Create a conversation with an ExternalRef that does NOT match the
-	// sender/agent pair used in the message (different principals).
-	wrongRef := testDirectMessageExternalRef("wrong-id-x", "wrong-id-y")
+	// Create a conversation keyed to (DevUserID, otherAgentID).
+	// DevUserID occupies one slot, so DEF-49 direct authorization passes.
+	// But the message is addressed to agentSlug (agentID), not otherAgentID,
+	// so the divergence comparison will disagree.
+	otherAgentID := tid("def49-divergence-other-agent")
+	divergentRef, err := messages.DMConversationKey("user", userID, "agent", otherAgentID)
+	if err != nil {
+		t.Fatalf("DMConversationKey: %v", err)
+	}
 	conv := &store.Conversation{
 		Kind:        "direct",
 		Surface:     "native",
-		ExternalRef: wrongRef,
+		ExternalRef: divergentRef,
 		DriftState:  "active",
 	}
 	created, err := s.UpsertConversationByExternalRef(ctx, conv)
@@ -1455,28 +1458,369 @@ func TestDEF11_PreResolvedConversation_GenuineDisagreement(t *testing.T) {
 
 	beforeMismatches := messaging.DivergenceMetrics.Mismatches()
 
-	// Post a message referencing the wrong conversation.
+	// Post a message to agentSlug with the divergent conversation.
 	rec := doRequest(t, srv, http.MethodPost,
 		"/api/v1/projects/"+projectID+"/agents/"+agentSlug+"/message",
 		MessageRequest{
 			StructuredMessage: &messages.StructuredMessage{
 				Version:        messages.Version,
 				Timestamp:      time.Now().UTC().Format(time.RFC3339),
-				Sender:         "user:def11",
+				Sender:         "user:def49-divergence",
 				SenderID:       userID,
 				Recipient:      "agent:" + agentSlug,
-				Msg:            "DEF11 AC-4 test",
+				Msg:            "DEF49 divergence mismatch test",
 				Type:           messages.TypeInstruction,
 				ConversationID: created.ID,
 			},
 		})
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 200 (authorized but divergent), got %d: %s",
+			rec.Code, rec.Body.String())
 	}
 
 	afterMismatches := messaging.DivergenceMetrics.Mismatches()
 	if afterMismatches-beforeMismatches < 1 {
-		t.Errorf("expected Mismatches delta >= 1 (genuine disagreement), got %d",
+		t.Errorf("expected Mismatches delta >= 1 (dm-routing-mismatch), got %d",
 			afterMismatches-beforeMismatches)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// DEF-49 — caller-supplied conversation_id authorization
+// ---------------------------------------------------------------------------
+//
+// AC-D-8: Three negative tests, one per facet, each reachable on main today
+// (expected RED on upstream/main, GREEN after the fix).
+//
+// AC-D-9: One positive test proving the legitimate scion message @agent path
+// still works (expected GREEN on both main and after the fix).
+
+// def49Setup creates a project, two agents (attacker and target), a user
+// (the legitimate sender, DevUserID), and a dispatcher so the handler
+// doesn't fail with 503. It returns everything needed to exercise the
+// caller-supplied conversation_id authorization path.
+func def49Setup(t *testing.T) (srv *Server, s store.Store, projectID string, targetAgent *store.Agent, userID string) {
+	t.Helper()
+	srv, s = testServer(t)
+	ctx := context.Background()
+
+	projectID = tid("def49-project")
+	if err := s.CreateProject(ctx, &store.Project{
+		ID:   projectID,
+		Name: "def49-project",
+		Slug: "def49-project",
+	}); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	brokerID := tid("def49-broker")
+	if err := s.CreateRuntimeBroker(ctx, &store.RuntimeBroker{
+		ID:     brokerID,
+		Name:   "def49-broker",
+		Slug:   "def49-broker",
+		Status: store.BrokerStatusOnline,
+	}); err != nil {
+		t.Fatalf("CreateRuntimeBroker: %v", err)
+	}
+	if err := s.AddProjectProvider(ctx, &store.ProjectProvider{
+		ProjectID:  projectID,
+		BrokerID:   brokerID,
+		BrokerName: "def49-broker",
+		Status:     store.BrokerStatusOnline,
+	}); err != nil {
+		t.Fatalf("AddProjectProvider: %v", err)
+	}
+
+	targetAgent = &store.Agent{
+		ID:              tid("def49-target-agent"),
+		Name:            "def49-target-agent",
+		Slug:            "def49-target-agent",
+		ProjectID:       projectID,
+		RuntimeBrokerID: brokerID,
+		Phase:           "running",
+		Visibility:      store.VisibilityPrivate,
+	}
+	if err := s.CreateAgent(ctx, targetAgent); err != nil {
+		t.Fatalf("CreateAgent (target): %v", err)
+	}
+
+	userID = DevUserID
+	_ = s.CreateUser(ctx, &store.User{
+		ID:          userID,
+		Email:       "dev@localhost",
+		DisplayName: "Development User",
+	})
+
+	srv.SetDispatcher(&recordingDispatcher{})
+	return srv, s, projectID, targetAgent, userID
+}
+
+// TestDEF49_NonMembership_DirectConversation verifies that an authenticated
+// user cannot attribute a message to a direct conversation whose DM key
+// does not name them (AC-D-8 facet a, AC-INGRESS-1 violation).
+//
+// RED on upstream/main: the if-branch accepts any caller-supplied
+// conversation_id without checking the authenticated sender.
+// GREEN after DEF-49: denied with 403.
+func TestDEF49_NonMembership_DirectConversation(t *testing.T) {
+	srv, s, _, targetAgent, _ := def49Setup(t)
+	ctx := context.Background()
+
+	// Create two uninvolved users whose DM conversation the attacker
+	// (dev user) should NOT be able to write into.
+	otherUserA := &store.User{
+		ID:          tid("def49-other-user-a"),
+		Email:       "other-a@example.com",
+		DisplayName: "Other A",
+	}
+	if err := s.CreateUser(ctx, otherUserA); err != nil {
+		t.Fatalf("CreateUser (otherA): %v", err)
+	}
+
+	// Build a DM key between otherUserA and the target agent.
+	// The dev user (DevUserID) is NOT a participant.
+	dmKey, err := messages.DMConversationKey("user", otherUserA.ID, "agent", targetAgent.ID)
+	if err != nil {
+		t.Fatalf("DMConversationKey: %v", err)
+	}
+	conv := &store.Conversation{
+		Kind:        "direct",
+		Surface:     "native",
+		ExternalRef: dmKey,
+		DriftState:  "active",
+	}
+	created, err := s.UpsertConversationByExternalRef(ctx, conv)
+	if err != nil {
+		t.Fatalf("UpsertConversationByExternalRef: %v", err)
+	}
+
+	// Send a message as the dev user (DevUserID), claiming to belong to
+	// that conversation. The dev user is NOT named in the DM key.
+	rec := doRequest(t, srv, http.MethodPost,
+		"/api/v1/projects/"+targetAgent.ProjectID+"/agents/"+targetAgent.Slug+"/message",
+		MessageRequest{
+			StructuredMessage: &messages.StructuredMessage{
+				Version:        messages.Version,
+				Timestamp:      time.Now().UTC().Format(time.RFC3339),
+				Sender:         "user:dev",
+				SenderID:       DevUserID,
+				Recipient:      "agent:" + targetAgent.Slug,
+				Msg:            "DEF49 non-membership test",
+				Type:           messages.TypeInstruction,
+				ConversationID: created.ID,
+			},
+		})
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("DEF-49 facet (a): expected 403 Forbidden for non-member "+
+			"direct conversation attribution, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+}
+
+// TestDEF49_NonExistent_ConversationID verifies that an authenticated user
+// cannot attribute a message to a conversation ID that does not exist in the
+// store (AC-D-8 facet b).
+//
+// RED on upstream/main: the if-branch sets lookupFailed=true and proceeds.
+// GREEN after DEF-49: denied with 400.
+func TestDEF49_NonExistent_ConversationID(t *testing.T) {
+	srv, _, _, targetAgent, _ := def49Setup(t)
+
+	// Use a valid-looking UUID that does not correspond to any conversation.
+	fakeConvID := tid("def49-nonexistent-conv")
+
+	rec := doRequest(t, srv, http.MethodPost,
+		"/api/v1/projects/"+targetAgent.ProjectID+"/agents/"+targetAgent.Slug+"/message",
+		MessageRequest{
+			StructuredMessage: &messages.StructuredMessage{
+				Version:        messages.Version,
+				Timestamp:      time.Now().UTC().Format(time.RFC3339),
+				Sender:         "user:dev",
+				SenderID:       DevUserID,
+				Recipient:      "agent:" + targetAgent.Slug,
+				Msg:            "DEF49 nonexistent conversation test",
+				Type:           messages.TypeInstruction,
+				ConversationID: fakeConvID,
+			},
+		})
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("DEF-49 facet (b): expected 400 Bad Request for nonexistent "+
+			"conversation_id, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+}
+
+// TestDEF49_CrossProject_GroupConversation verifies that an authenticated
+// user cannot attribute a message to a group conversation that belongs to a
+// different project than the target agent (AC-D-8 facet c).
+//
+// RED on upstream/main: the if-branch accepts any conversation_id regardless
+// of project. GREEN after DEF-49: denied with 403.
+func TestDEF49_CrossProject_GroupConversation(t *testing.T) {
+	srv, s, _, targetAgent, _ := def49Setup(t)
+	ctx := context.Background()
+
+	// Create a second project that the target agent does NOT belong to.
+	otherProjectID := tid("def49-other-project")
+	if err := s.CreateProject(ctx, &store.Project{
+		ID:   otherProjectID,
+		Name: "def49-other-project",
+		Slug: "def49-other-project",
+	}); err != nil {
+		t.Fatalf("CreateProject (other): %v", err)
+	}
+
+	// Create a group conversation in the OTHER project.
+	conv := &store.Conversation{
+		Kind:        "group",
+		Surface:     "native",
+		ExternalRef: "group:" + otherProjectID + ":general",
+		ProjectID:   &otherProjectID,
+		DriftState:  "active",
+	}
+	created, err := s.UpsertConversationByExternalRef(ctx, conv)
+	if err != nil {
+		t.Fatalf("UpsertConversationByExternalRef: %v", err)
+	}
+
+	// Send a message to the target agent (in the first project), claiming
+	// the conversation belongs to the other project.
+	rec := doRequest(t, srv, http.MethodPost,
+		"/api/v1/projects/"+targetAgent.ProjectID+"/agents/"+targetAgent.Slug+"/message",
+		MessageRequest{
+			StructuredMessage: &messages.StructuredMessage{
+				Version:        messages.Version,
+				Timestamp:      time.Now().UTC().Format(time.RFC3339),
+				Sender:         "user:dev",
+				SenderID:       DevUserID,
+				Recipient:      "agent:" + targetAgent.Slug,
+				Msg:            "DEF49 cross-project test",
+				Type:           messages.TypeInstruction,
+				ConversationID: created.ID,
+			},
+		})
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("DEF-49 facet (c): expected 403 Forbidden for cross-project "+
+			"group conversation attribution, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+}
+
+// TestDEF49_LegitimatePreResolved_DirectConversation verifies that the
+// legitimate scion message @agent path — where the CLI resolves the
+// conversation and supplies the id — is still accepted after the DEF-49
+// authorization check (AC-D-9).
+//
+// The authenticated user (DevUserID) sends a message with a pre-resolved
+// conversation_id for a direct conversation whose DM key DOES name them.
+// Expected: 200 OK (or 503 if dispatcher is missing, but we set one).
+func TestDEF49_LegitimatePreResolved_DirectConversation(t *testing.T) {
+	srv, s, _, targetAgent, userID := def49Setup(t)
+	ctx := context.Background()
+
+	// Create a direct conversation between the authenticated user (DevUserID)
+	// and the target agent — exactly what `scion message @agent` would produce.
+	dmKey, err := messages.DMConversationKey("user", userID, "agent", targetAgent.ID)
+	if err != nil {
+		t.Fatalf("DMConversationKey: %v", err)
+	}
+	conv := &store.Conversation{
+		Kind:        "direct",
+		Surface:     "native",
+		ExternalRef: dmKey,
+		DriftState:  "active",
+	}
+	created, err := s.UpsertConversationByExternalRef(ctx, conv)
+	if err != nil {
+		t.Fatalf("UpsertConversationByExternalRef: %v", err)
+	}
+
+	// Send a message with the pre-resolved ConversationID — the legitimate path.
+	rec := doRequest(t, srv, http.MethodPost,
+		"/api/v1/projects/"+targetAgent.ProjectID+"/agents/"+targetAgent.Slug+"/message",
+		MessageRequest{
+			StructuredMessage: &messages.StructuredMessage{
+				Version:        messages.Version,
+				Timestamp:      time.Now().UTC().Format(time.RFC3339),
+				Sender:         "user:dev",
+				SenderID:       userID,
+				Recipient:      "agent:" + targetAgent.Slug,
+				Msg:            "DEF49 legitimate pre-resolved test",
+				Type:           messages.TypeInstruction,
+				ConversationID: created.ID,
+			},
+		})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DEF-49 AC-D-9: expected 200 OK for legitimate pre-resolved "+
+			"conversation_id (the scion message @agent path), got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	// Verify the message was persisted in the correct conversation.
+	msgResult, err := s.ListMessages(ctx, store.MessageFilter{
+		ConversationID: created.ID,
+	}, store.ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListMessages: %v", err)
+	}
+	if len(msgResult.Items) == 0 {
+		t.Error("expected at least one message persisted in the conversation")
+	}
+}
+
+// TestDEF49_GroupConversation_UnsetProjectID verifies that a group
+// conversation with an unset project ID (nil or the zero UUID) is
+// denied even when the agent has a real project ID. This prevents the
+// "two unset IDs compare equal" class of bug (see isUnsetProjectID in
+// validate.go:136).
+func TestDEF49_GroupConversation_UnsetProjectID(t *testing.T) {
+	srv, s, _, targetAgent, _ := def49Setup(t)
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name      string
+		projectID *string // nil or a zero-value UUID pointer
+	}{
+		{"nil project ID", nil},
+		{"zero UUID", strPtr("00000000-0000-0000-0000-000000000000")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conv := &store.Conversation{
+				Kind:        "group",
+				Surface:     "native",
+				ExternalRef: "group:unset-" + tc.name + ":general",
+				ProjectID:   tc.projectID,
+				DriftState:  "active",
+			}
+			created, err := s.UpsertConversationByExternalRef(ctx, conv)
+			if err != nil {
+				t.Fatalf("UpsertConversationByExternalRef: %v", err)
+			}
+
+			rec := doRequest(t, srv, http.MethodPost,
+				"/api/v1/projects/"+targetAgent.ProjectID+"/agents/"+targetAgent.Slug+"/message",
+				MessageRequest{
+					StructuredMessage: &messages.StructuredMessage{
+						Version:        messages.Version,
+						Timestamp:      time.Now().UTC().Format(time.RFC3339),
+						Sender:         "user:dev",
+						SenderID:       DevUserID,
+						Recipient:      "agent:" + targetAgent.Slug,
+						Msg:            "DEF49 unset project test",
+						Type:           messages.TypeInstruction,
+						ConversationID: created.ID,
+					},
+				})
+
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("expected 403 for conversation with unset project ID (%s), got %d: %s",
+					tc.name, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func strPtr(s string) *string { return &s }

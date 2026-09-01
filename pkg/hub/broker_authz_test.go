@@ -42,10 +42,9 @@ func setupBroadcastProject(t *testing.T, srv *Server, s store.Store) *store.Proj
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Slug:       "authz-bcast",
-		Name:       "authz-bcast",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Slug: "authz-bcast",
+		Name: "authz-bcast",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -143,7 +142,7 @@ func TestBroadcast_UserWithProjectAttach(t *testing.T) {
 		t.Fatalf("CreateUser: %v", err)
 	}
 	ensureHubMembership(ctx, s, userID)
-	srv.createProjectMembersGroupAndPolicy(ctx, project, userID)
+	srv.createProjectMembersGroup(ctx, project, userID)
 	if err := srv.createProjectOwnerRoleBinding(ctx, project.ID, userID); err != nil {
 		t.Fatalf("createProjectOwnerRoleBinding: %v", err)
 	}
@@ -242,10 +241,9 @@ func setupChatAgent(t *testing.T, srv *Server, s store.Store) (*store.Project, *
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Slug:       "chat-authz",
-		Name:       "chat-authz",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Slug: "chat-authz",
+		Name: "chat-authz",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -320,7 +318,7 @@ func TestSendAgentRouted_WithAttach(t *testing.T) {
 		t.Fatalf("CreateUser: %v", err)
 	}
 	ensureHubMembership(ctx, s, userID)
-	srv.createProjectMembersGroupAndPolicy(ctx, project, userID)
+	srv.createProjectMembersGroup(ctx, project, userID)
 	if err := srv.createProjectOwnerRoleBinding(ctx, project.ID, userID); err != nil {
 		t.Fatalf("createProjectOwnerRoleBinding: %v", err)
 	}
@@ -350,10 +348,9 @@ func TestSendAgentRouted_MentionSkippedWithoutAttach(t *testing.T) {
 	seedRoleDefinitions(ctx, s)
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Slug:       "mention-authz",
-		Name:       "mention-authz",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Slug: "mention-authz",
+		Name: "mention-authz",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("CreateProject: %v", err)
@@ -397,7 +394,7 @@ func TestSendAgentRouted_MentionSkippedWithoutAttach(t *testing.T) {
 		t.Fatalf("CreateUser: %v", err)
 	}
 	ensureHubMembership(ctx, s, userID)
-	srv.createProjectMembersGroupAndPolicy(ctx, project, userID)
+	srv.createProjectMembersGroup(ctx, project, userID)
 	if err := srv.createProjectOwnerRoleBinding(ctx, project.ID, userID); err != nil {
 		t.Fatalf("createProjectOwnerRoleBinding: %v", err)
 	}
