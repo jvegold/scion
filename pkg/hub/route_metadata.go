@@ -866,6 +866,10 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Pattern: "/api/v1/broker/inbound", RouteID: "broker.inbound",
 		Classification: RouteBrokerHMAC,
 	},
+	"/api/v1/broker/callback": {
+		Pattern: "/api/v1/broker/callback", RouteID: "broker.callback",
+		Classification: RouteBrokerHMAC,
+	},
 	"/api/v1/broker/projects": {
 		Pattern: "/api/v1/broker/projects", RouteID: "broker.projects",
 		Classification: RouteBrokerHMAC,
@@ -888,6 +892,10 @@ var routeMetadataTable = map[string]RouteMetadata{
 	},
 	"POST /api/v1/agent/identity-token": {
 		Pattern: "POST /api/v1/agent/identity-token", RouteID: "agent.identityToken",
+		Classification: RouteAgentToken,
+	},
+	"POST /api/v1/agent/secrets": {
+		Pattern: "POST /api/v1/agent/secrets", RouteID: "agent.secretFetch",
 		Classification: RouteAgentToken,
 	},
 

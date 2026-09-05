@@ -3823,6 +3823,9 @@ func (s *Server) registerRoutes() {
 	// Broker plugin inbound message delivery
 	s.mux.HandleFunc("/api/v1/broker/inbound", s.guarded("/api/v1/broker/inbound", s.handleBrokerInbound))
 
+	// Broker plugin callback delivery (interactive card responses, action acks)
+	s.mux.HandleFunc("/api/v1/broker/callback", s.guarded("/api/v1/broker/callback", s.handleBrokerCallback))
+
 	// Broker plugin project listing (fresh list for /setup flows)
 	s.mux.HandleFunc("/api/v1/broker/projects", s.guarded("/api/v1/broker/projects", s.handleBrokerProjects))
 
@@ -3918,6 +3921,9 @@ func (s *Server) registerRoutes() {
 	// GCP identity endpoints (agent token auth)
 	s.mux.HandleFunc("/api/v1/agent/gcp-token", s.guarded("/api/v1/agent/gcp-token", s.handleAgentGCPToken))
 	s.mux.HandleFunc("/api/v1/agent/gcp-identity-token", s.guarded("/api/v1/agent/gcp-identity-token", s.handleAgentGCPIdentityToken))
+
+	// Agent self-service secret fetch (agent token auth)
+	s.mux.HandleFunc("POST /api/v1/agent/secrets", s.guarded("POST /api/v1/agent/secrets", s.handleAgentSecretFetch))
 
 	// Public settings endpoint (no auth required for telemetry default, etc.)
 	s.mux.HandleFunc("/api/v1/settings/public", s.guarded("/api/v1/settings/public", s.handlePublicSettings))
